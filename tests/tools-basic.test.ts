@@ -13,10 +13,10 @@ import { listLibraries } from "../src/tools/libraries.js";
 import { refreshIndex } from "../src/tools/refresh.js";
 import { isEngineError } from "../src/errors.js";
 
-let dir: string, qp: QueryProcess, mgr: IndexManager;
+let dir: string, mdb: string, qp: QueryProcess, mgr: IndexManager;
 beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), "edj-basic-"));
-  const mdb = makeLibrary(dir, { tracks: 400 });
+  mdb = makeLibrary(dir, { tracks: 400 });
   const lib = readLibraryInfo(mdb);
   if (isEngineError(lib)) throw new Error("fixture library unreadable");
   qp = new QueryProcess(mdb, null, 5000);
@@ -53,17 +53,38 @@ describe("get_tracks", () => {
     expect(r.detail).toContain("Recognised fields:");
   });
 
-  it("projects only requested fields with correct values", async () => {
-    const r = await getTracks(qp, { ids: [1, 2], fields: ["id", "artist", "title"] });
+  it("projects only requested fields with correct values from both Track and derived tables", async () => {
+    // Get expected values by querying the main database directly for track id 1
+    const testDb = new DatabaseSync(`file:${mdb}?mode=ro`, { readOnly: true });
+    let expectedArtist: string | null, expectedTitle: string | null;
+    try {
+      const mainRow = testDb.prepare("SELECT artist, title FROM Track WHERE id = 1").get() as any;
+      expectedArtist = mainRow?.artist ?? null;
+      expectedTitle = mainRow?.title ?? null;
+    } finally {
+      testDb.close();
+    }
+
+    // Query through getTracks with fields from both sources
+    const r = await getTracks(qp, { ids: [1], fields: ["id", "artist", "title", "bpm", "camelot"] });
     expect(isEngineError(r)).toBe(false);
     if (isEngineError(r)) return;
-    expect(r.tracks.length).toBe(2);
-    for (const track of r.tracks) {
-      expect(Object.keys(track)).toEqual(["id", "artist", "title"]);
-      expect(track.id).toBeDefined();
-      expect(track.artist).toBeDefined();
-      expect(track.title).toBeDefined();
-    }
+
+    expect(r.tracks.length).toBe(1);
+    const track = r.tracks[0]!;
+
+    // Verify exact keys present, no more, no less
+    expect(Object.keys(track).sort()).toEqual(["artist", "bpm", "camelot", "id", "title"].sort());
+
+    // Verify values from Track table match the source
+    expect(track.id).toBe(1);
+    expect(track.artist).toBe(expectedArtist);
+    expect(track.title).toBe(expectedTitle);
+
+    // Verify that derived fields (bpm, camelot) are populated
+    // These come from track_derived table via different SQL expressions
+    expect(track.bpm).toBeDefined();
+    expect(track.camelot).toBeDefined();
   });
 });
 
