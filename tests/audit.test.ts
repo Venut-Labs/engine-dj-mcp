@@ -124,6 +124,27 @@ describe("audit_library", () => {
     if (!isEngineError(r)) return;
     expect(r.error).toBe("invalid_argument");
   });
+
+  it("rejects an explicit empty checks array instead of silently auditing nothing", async () => {
+    // Omitting checks already means "run everything", so an empty array has
+    // no coherent second meaning — and { checks: [] } would otherwise read
+    // to a model exactly like a clean bill of health on an unexamined
+    // library. This must fail, not fall through the unknown-name filter
+    // (which an empty array trivially passes) into an empty result.
+    const r = await auditLibrary(qp, mdb, { checks: [] });
+    expect(isEngineError(r)).toBe(true);
+    if (!isEngineError(r)) return;
+    expect(r.error).toBe("invalid_argument");
+    expect(r.message.toLowerCase()).toContain("empty");
+  });
+
+  it("omitting checks entirely still runs all ten, distinguishing it from an empty array", async () => {
+    const r = await auditLibrary(qp, mdb, {});
+    expect(isEngineError(r)).toBe(false);
+    if (isEngineError(r)) return;
+    expect(r.checks.length).toBe(AUDIT_CHECKS.length);
+    expect(r.checks.map((c) => c.name).sort()).toEqual([...AUDIT_CHECKS].sort());
+  });
 });
 
 describe("audit_library — each check against an independently computed truth", () => {

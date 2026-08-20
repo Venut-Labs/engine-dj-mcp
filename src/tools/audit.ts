@@ -69,6 +69,17 @@ export async function auditLibrary(
     return err("invalid_argument", "checks must be an array of check names");
   }
 
+  // Distinguish "omitted" from "explicitly empty" before defaulting:
+  // omitting checks already means "run everything", so an empty array
+  // carries no coherent second meaning, and returning { checks: [] } would
+  // read to a model exactly like a clean bill of health on a library nobody
+  // examined.
+  if (parsed.data.checks && parsed.data.checks.length === 0) {
+    return err("invalid_argument", "checks cannot be an empty array", {
+      detail: "An empty list has no meaningful result; omit checks entirely to run every check.",
+    });
+  }
+
   const requested = parsed.data.checks ?? [...AUDIT_CHECKS];
   // A check name is not a value that flows into SQL — it only ever selects
   // which fixed query text runs — but an unrecognised one must still be
