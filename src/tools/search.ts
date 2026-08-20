@@ -1,5 +1,6 @@
 // src/tools/search.ts
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import { err, isEngineError, type EngineError } from "../errors.js";
 import { camelotNeighbours } from "../semantics.js";
 import type { QueryProcess } from "../proc/query-client.js";
@@ -9,8 +10,9 @@ const MAX_LIMIT = 200;
 /**
  * include_total costs ~19x a page (measured: 3.3 ms vs 0.2 ms at 50k tracks),
  * so it is opt-in, and capped rather than exact: a model needs the order of
- * magnitude, not a precise count. Above the cap the total reads as "1000",
- * meaning "at least this many" rather than an exact figure.
+ * magnitude, not a precise count. Above the cap, total is reported as 1000
+ * with total_capped: true, meaning "at least this many" rather than an exact
+ * figure — a caller cannot otherwise tell a capped 1000 from a genuine one.
  */
 const TOTAL_CAP = 1000;
 
@@ -97,32 +99,60 @@ function epochExpr(value: string): { sql: string; param: string } {
  * (`col:term`), and unbalanced quotes are a hard syntax error, not a
  * no-match. A person's search text is not an FTS5 query program, so each
  * whitespace-separated token is wrapped as its own quoted phrase (embedded
- * `"` doubled) before it reaches MATCH. That makes the operator words inert
- * literal tokens instead of syntax, keeps the query always well-formed, and
- * still lets tokens combine with FTS5's implicit AND — a trailing `*` still
- * works as a prefix match since it survives inside the quotes.
+ * `"` doubled) before it reaches MATCH — that makes the operator words inert
+ * literal tokens instead of syntax, and keeps the query always well-formed
+ * (confirmed by execution: unquoted `Jean-Michel` and `D'Angelo` both raise
+ * real FTS5 syntax errors; quoted, both match).
+ *
+ * A trailing `*` must stay *outside* the closing quote: FTS5 only treats `*`
+ * as the prefix operator when it immediately follows an unquoted phrase
+ * boundary, so `"hypno*"` searches for the literal three-character string
+ * `hypno*` (almost always zero matches) while `"hypno"*` performs the
+ * intended prefix match. Confirmed by execution — see task-11-report.md.
  */
 function sanitizeFtsQuery(q: string): string {
   return q
     .trim()
     .split(/\s+/)
     .filter(Boolean)
-    .map((token) => `"${token.replace(/"/g, '""')}"`)
+    .map((token) => {
+      const isPrefix = token.endsWith("*") && token.length > 1;
+      const core = isPrefix ? token.slice(0, -1) : token;
+      const quoted = `"${core.replace(/"/g, '""')}"`;
+      return isPrefix ? `${quoted}*` : quoted;
+    })
     .join(" ");
 }
 
-function encodeCursor(rank: number | null, rowid: number): string {
-  return Buffer.from(JSON.stringify([rank, rowid])).toString("base64url");
+/**
+ * A cursor encodes a resume point in one specific ordering — (rank, rowid)
+ * under relevance order, or (id, id) otherwise. That tuple means nothing
+ * outside the query that produced it: applying it to a search with a
+ * different filter set, or crossing between FTS-ordered and id-ordered
+ * search, compares the wrong kind of value against the wrong column and
+ * pages silently wrong rather than erroring. The fingerprint is a hash over
+ * the normalised filter SQL, its bound values, and whether the search is
+ * FTS-ordered, so a cursor can be checked against the call it's used with
+ * and rejected outright on a mismatch instead of silently mispaging.
+ */
+function queryFingerprint(useFts: boolean, filterWhere: string[], filterParams: unknown[]): string {
+  const shape = JSON.stringify({ fts: useFts, where: filterWhere, params: filterParams });
+  return createHash("sha256").update(shape).digest("base64url").slice(0, 16);
 }
 
-function decodeCursor(cursor: string): [number | null, number] | null {
+function encodeCursor(rank: number | null, rowid: number, fingerprint: string): string {
+  return Buffer.from(JSON.stringify([rank, rowid, fingerprint])).toString("base64url");
+}
+
+function decodeCursor(cursor: string): [number | null, number, string] | null {
   try {
     const v = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
-    if (!Array.isArray(v) || v.length !== 2) return null;
-    const [rank, row] = v;
+    if (!Array.isArray(v) || v.length !== 3) return null;
+    const [rank, row, fingerprint] = v;
     if (rank !== null && typeof rank !== "number") return null;
     if (typeof row !== "number") return null;
-    return [rank, row];
+    if (typeof fingerprint !== "string") return null;
+    return [rank, row, fingerprint];
   } catch {
     return null;
   }
@@ -131,7 +161,10 @@ function decodeCursor(cursor: string): [number | null, number] | null {
 export async function searchTracks(
   qp: QueryProcess,
   raw: SearchInput,
-): Promise<{ tracks: Record<string, unknown>[]; total?: number; next_cursor?: string } | EngineError> {
+): Promise<
+  | { tracks: Record<string, unknown>[]; total?: number; total_capped?: boolean; next_cursor?: string }
+  | EngineError
+> {
   const input = SearchInput.parse(raw);
 
   const requestedFields = input.fields ?? [...DEFAULT_FIELDS];
@@ -149,7 +182,8 @@ export async function searchTracks(
 
   // Filters that scope the result set as a whole (independent of where a
   // page cursor currently sits), so include_total can reuse them without
-  // the count shrinking as a caller pages further in.
+  // the count shrinking as a caller pages further in, and so the cursor
+  // fingerprint below is independent of pagination position too.
   const filterWhere: string[] = [];
   const filterParams: unknown[] = [];
 
@@ -255,12 +289,21 @@ export async function searchTracks(
   const orderKey = useFts ? "rank" : "t.id";
   const rowKey = useFts ? "f.rowid" : "t.id";
 
+  const fingerprint = queryFingerprint(useFts, filterWhere, filterParams);
+
   const pageWhere = [...filterWhere];
   const pageParams = [...filterParams];
 
   if (input.cursor) {
     const cur = decodeCursor(input.cursor);
     if (!cur) return err("invalid_argument", "Malformed cursor");
+    if (cur[2] !== fingerprint) {
+      return err(
+        "invalid_argument",
+        "This cursor belongs to a different search. Repeat the original search's " +
+          "q/bpm/key/rating/played/added/flags exactly, or start a new search without a cursor.",
+      );
+    }
     pageWhere.push(`(${orderKey}, ${rowKey}) > (?, ?)`);
     pageParams.push(cur[0], cur[1]);
   }
@@ -282,22 +325,25 @@ export async function searchTracks(
   let next_cursor: string | undefined;
   if (res.rows.length === limit) {
     const last = res.rows[res.rows.length - 1]!;
-    next_cursor = encodeCursor(last[idx.__rank!] as number | null, Number(last[idx.__row!]));
+    next_cursor = encodeCursor(last[idx.__rank!] as number | null, Number(last[idx.__row!]), fingerprint);
   }
 
   let total: number | undefined;
+  let total_capped: boolean | undefined;
   if (input.include_total) {
     const filterWhereSql = filterWhere.length ? `WHERE ${filterWhere.join(" AND ")}` : "";
     const countSql = `SELECT COUNT(*) AS c FROM (SELECT 1 ${from} ${filterWhereSql} LIMIT ?)`;
     const cres = await qp.run(countSql, [...filterParams, TOTAL_CAP + 1]);
     if (!isEngineError(cres) && cres.rows.length) {
-      total = Math.min(Number(cres.rows[0]![0]), TOTAL_CAP);
+      const raw = Number(cres.rows[0]![0]);
+      total_capped = raw > TOTAL_CAP;
+      total = Math.min(raw, TOTAL_CAP);
     }
   }
 
   return {
     tracks,
-    ...(total !== undefined ? { total } : {}),
+    ...(total !== undefined ? { total, total_capped } : {}),
     ...(next_cursor ? { next_cursor } : {}),
   };
 }
