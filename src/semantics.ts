@@ -8,7 +8,7 @@ import type { DatabaseSync } from "node:sqlite";
  * makes it 8B — the standard Camelot anchor.
  */
 export function camelotIndex(key: number | null): number | null {
-  if (key === null || key === undefined || key < 0 || key > 23) return null;
+  if (key === null || key === undefined || !Number.isFinite(key) || key < 0 || key > 23) return null;
   return (key + 15 - 2 * (key % 2)) % 24;
 }
 

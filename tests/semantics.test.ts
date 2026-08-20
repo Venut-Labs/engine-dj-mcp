@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { camelot, tempo, camelotNeighbours, keyDistance } from "../src/semantics.js";
+import { camelot, keyName, tempo, camelotNeighbours, keyDistance } from "../src/semantics.js";
 
 describe("camelot", () => {
   it("maps Engine key indices onto the Camelot wheel", () => {
@@ -16,10 +16,37 @@ describe("camelot", () => {
     expect(camelot(null)).toBeNull();
   });
 
+  it("returns null for NaN", () => {
+    expect(camelot(NaN)).toBeNull();
+  });
+
   it("is a bijection over the 24 wheel positions", () => {
     const labels = new Set<string>();
     for (let k = 0; k < 24; k++) labels.add(camelot(k)!);
     expect(labels.size).toBe(24);
+  });
+});
+
+describe("keyName", () => {
+  it("maps the four wheel anchors to their note names", () => {
+    expect(keyName(0)).toBe("C");
+    expect(keyName(1)).toBe("Am");
+    expect(keyName(2)).toBe("G");
+    expect(keyName(3)).toBe("Em");
+  });
+
+  it("returns null for an undetermined key", () => {
+    expect(keyName(-1)).toBeNull();
+    expect(keyName(null)).toBeNull();
+  });
+
+  it("produces 24 distinct note names for all 24 key indices", () => {
+    const names = new Set<string>();
+    for (let k = 0; k < 24; k++) {
+      const name = keyName(k);
+      if (name) names.add(name);
+    }
+    expect(names.size).toBe(24);
   });
 });
 
