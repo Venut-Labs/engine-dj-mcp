@@ -12,6 +12,7 @@ import { getTracks } from "../src/tools/tracks.js";
 import { listLibraries } from "../src/tools/libraries.js";
 import { refreshIndex } from "../src/tools/refresh.js";
 import { isEngineError } from "../src/errors.js";
+import { tempo, camelot } from "../src/semantics.js";
 
 let dir: string, mdb: string, qp: QueryProcess, mgr: IndexManager;
 beforeAll(async () => {
@@ -54,19 +55,27 @@ describe("get_tracks", () => {
   });
 
   it("projects only requested fields with correct values from both Track and derived tables", async () => {
-    // Get expected values by querying the main database directly for track id 1
+    // Get expected values by querying the main database directly
+    // Find a track with key != -1 so camelot label is non-null
     const testDb = new DatabaseSync(`file:${mdb}?mode=ro`, { readOnly: true });
-    let expectedArtist: string | null, expectedTitle: string | null;
+    let trackId = 1;
+    let expectedArtist: string | null, expectedTitle: string | null, expectedBpm: number | null, expectedCamelot: string | null;
     try {
-      const mainRow = testDb.prepare("SELECT artist, title FROM Track WHERE id = 1").get() as any;
+      // Find first track with key != -1 (camelot needs non-negative key)
+      const keyRow = testDb.prepare("SELECT id FROM Track WHERE key != -1 LIMIT 1").get() as any;
+      if (keyRow?.id) trackId = keyRow.id;
+
+      const mainRow = testDb.prepare("SELECT artist, title, bpmAnalyzed, bpm, key FROM Track WHERE id = ?").get(trackId) as any;
       expectedArtist = mainRow?.artist ?? null;
       expectedTitle = mainRow?.title ?? null;
+      expectedBpm = tempo(mainRow?.bpmAnalyzed ?? null, mainRow?.bpm ?? null);
+      expectedCamelot = camelot(mainRow?.key ?? null);
     } finally {
       testDb.close();
     }
 
     // Query through getTracks with fields from both sources
-    const r = await getTracks(qp, { ids: [1], fields: ["id", "artist", "title", "bpm", "camelot"] });
+    const r = await getTracks(qp, { ids: [trackId], fields: ["id", "artist", "title", "bpm", "camelot"] });
     expect(isEngineError(r)).toBe(false);
     if (isEngineError(r)) return;
 
@@ -77,14 +86,14 @@ describe("get_tracks", () => {
     expect(Object.keys(track).sort()).toEqual(["artist", "bpm", "camelot", "id", "title"].sort());
 
     // Verify values from Track table match the source
-    expect(track.id).toBe(1);
+    expect(track.id).toBe(trackId);
     expect(track.artist).toBe(expectedArtist);
     expect(track.title).toBe(expectedTitle);
 
-    // Verify that derived fields (bpm, camelot) are populated
-    // These come from track_derived table via different SQL expressions
-    expect(track.bpm).toBeDefined();
-    expect(track.camelot).toBeDefined();
+    // Verify derived table fields match expected values computed from Track fields
+    // bpm comes from tempo(bpmAnalyzed, bpm/100), camelot comes from key
+    expect(track.bpm).toBe(expectedBpm);
+    expect(track.camelot).toBe(expectedCamelot);
   });
 });
 
