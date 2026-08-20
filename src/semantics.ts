@@ -1,0 +1,76 @@
+import type { DatabaseSync } from "node:sqlite";
+
+/**
+ * Engine's own conversion, taken from the application binary:
+ *   CASE key WHEN -1 THEN NULL ELSE (key + 15 - 2 * (key % 2)) % 24 END
+ * The result is a wheel index: even `key` gives mode B, odd gives A, and the
+ * wheel number is floor(index / 2) + 1. key=0 is assumed to be C major, which
+ * makes it 8B — the standard Camelot anchor.
+ */
+export function camelotIndex(key: number | null): number | null {
+  if (key === null || key === undefined || key < 0 || key > 23) return null;
+  return (key + 15 - 2 * (key % 2)) % 24;
+}
+
+export function camelot(key: number | null): string | null {
+  const v = camelotIndex(key);
+  if (v === null) return null;
+  return `${Math.floor(v / 2) + 1}${v % 2 === 1 ? "B" : "A"}`;
+}
+
+const NAMES_B = ["B", "F#", "Db", "Ab", "Eb", "Bb", "F", "C", "G", "D", "A", "E"];
+const NAMES_A = ["Abm", "Ebm", "Bbm", "Fm", "Cm", "Gm", "Dm", "Am", "Em", "Bm", "F#m", "Dbm"];
+
+export function keyName(key: number | null): string | null {
+  const label = camelot(key);
+  if (!label) return null;
+  const { number, mode } = parseCamelot(label)!;
+  return mode === "B" ? NAMES_B[number - 1]! : NAMES_A[number - 1]!;
+}
+
+export function tempo(bpmAnalyzed: number | null, bpm: number | null): number | null {
+  if (bpmAnalyzed !== null && bpmAnalyzed !== undefined && bpmAnalyzed > 0) return bpmAnalyzed;
+  if (bpm !== null && bpm !== undefined && bpm > 0) return bpm / 100;
+  return null;
+}
+
+export function parseCamelot(label: string): { number: number; mode: "A" | "B" } | null {
+  const m = /^([1-9]|1[0-2])([AB])$/.exec(label.trim().toUpperCase());
+  if (!m) return null;
+  return { number: Number(m[1]), mode: m[2] as "A" | "B" };
+}
+
+/** Same number in the other mode, plus one step either way in the same mode. */
+export function camelotNeighbours(label: string): string[] {
+  const p = parseCamelot(label);
+  if (!p) return [];
+  const wrap = (n: number) => ((n - 1 + 12) % 12) + 1;
+  return [
+    `${p.number}${p.mode}`,
+    `${p.number}${p.mode === "A" ? "B" : "A"}`,
+    `${wrap(p.number - 1)}${p.mode}`,
+    `${wrap(p.number + 1)}${p.mode}`,
+  ];
+}
+
+export function keyDistance(a: string, b: string): number | null {
+  const pa = parseCamelot(a), pb = parseCamelot(b);
+  if (!pa || !pb) return null;
+  const raw = Math.abs(pa.number - pb.number);
+  return Math.min(raw, 12 - raw);
+}
+
+/**
+ * SQL-callable versions. These are an escape hatch for run_sql; filtering by
+ * key or tempo in a WHERE clause should use the indexed sidecar columns in
+ * side.track_derived, because a JS callback runs per row and defeats indexes.
+ */
+export function registerFunctions(db: DatabaseSync): void {
+  const opts = { deterministic: true } as const;
+  db.function("camelot", opts, (key: unknown) => camelot(key === null ? null : Number(key)));
+  db.function("key_name", opts, (key: unknown) => keyName(key === null ? null : Number(key)));
+  db.function("tempo", opts, (a: unknown, b: unknown) =>
+    tempo(a === null ? null : Number(a), b === null ? null : Number(b)));
+  db.function("key_distance", opts, (a: unknown, b: unknown) =>
+    a === null || b === null ? null : keyDistance(String(a), String(b)));
+}
