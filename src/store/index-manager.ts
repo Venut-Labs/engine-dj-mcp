@@ -10,7 +10,7 @@ import type { QueryProcess } from "../proc/query-client.js";
 
 export interface FreshResult {
   rebuilt: boolean;
-  indexed: number;
+  indexed: number | null;
   elapsed_ms: number;
   generation: number;
 }
@@ -75,10 +75,28 @@ export class IndexManager {
     }
 
     if (this.#storedCounter() === current) {
-      return { rebuilt: false, indexed: -1, elapsed_ms: 0, generation: this.#generation };
+      // null, not a count: nothing was rebuilt this call, so there is no
+      // "tracks indexed just now" number to report. -1 previously stood in
+      // here and could be read by a caller as "minus one track indexed".
+      return { rebuilt: false, indexed: null, elapsed_ms: 0, generation: this.#generation };
     }
 
-    mkdirSync(join(this.baseDir, this.lib.uuid), { recursive: true });
+    // Captured before the directory/build attempt: distinguishes "the
+    // library was locked and we had nothing to fall back on" from "the
+    // library was locked but the previous index is still serving fine".
+    const hadPrevious = existsSync(this.path);
+
+    try {
+      mkdirSync(join(this.baseDir, this.lib.uuid), { recursive: true });
+    } catch (e) {
+      // A permissions failure or full disk here must not throw out of
+      // ensureFresh: errors at this layer are structured returns, not
+      // exceptions.
+      return err("library_busy", "Could not create the sidecar directory", {
+        detail: String((e as Error).message),
+      });
+    }
+
     const tmp = `${this.path}.tmp`;
     let built: { indexed: number; elapsed_ms: number };
     try {
@@ -92,17 +110,35 @@ export class IndexManager {
     } catch (e) {
       const message = String((e as Error).message);
       // Serving the previous index beats refusing to answer: search while
-      // Engine DJ is open should keep working on a slightly old index.
+      // Engine DJ is open should keep working on a slightly old index. But
+      // say so honestly: on the very first build there is no previous
+      // index to fall back on.
       return /locked|busy/i.test(message)
-        ? err("index_stale", "The library was busy; the previous index is still in use", {
-            retry_after_ms: 5000,
-          })
+        ? err(
+            "index_stale",
+            hadPrevious
+              ? "The library was busy; the previous index is still in use"
+              : "The library was busy; the index could not be built yet",
+            { retry_after_ms: 5000 },
+          )
         : err("library_busy", "Could not rebuild the index", { detail: message });
     }
 
     // rename() is invisible to an already-open connection: the query
     // process keeps reading the old inode unless told to re-attach.
-    renameSync(tmp, this.path);
+    try {
+      renameSync(tmp, this.path);
+    } catch (e) {
+      // A cross-device rename or a filesystem failure here must not throw:
+      // the freshly built file just never becomes the active index.
+      return err(
+        "index_stale",
+        hadPrevious
+          ? "The rebuilt index could not be swapped in; the previous index is still in use"
+          : "The rebuilt index could not be swapped in; no index is available yet",
+        { detail: String((e as Error).message) },
+      );
+    }
     this.#generation += 1;
     await this.qp.setSidecar(this.path);
 

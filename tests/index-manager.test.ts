@@ -1,6 +1,6 @@
 // tests/index-manager.test.ts
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -35,6 +35,10 @@ describe("index lifecycle", () => {
     expect(isEngineError(r)).toBe(false);
     if (isEngineError(r)) return;
     expect(r.rebuilt).toBe(false);
+    // null, not a sentinel count: nothing was rebuilt, so there is no
+    // "tracks indexed just now" number. A caller must not read this as -1
+    // (or any other number) of tracks.
+    expect(r.indexed).toBeNull();
   });
 
   it("rebuilds after a write and the query process sees the new index", async () => {
@@ -53,5 +57,29 @@ describe("index lifecycle", () => {
     expect(isEngineError(hit)).toBe(false);
     if (isEngineError(hit)) return;
     expect(hit.rows).toEqual([[7]]);
+  });
+
+  it("returns a structured error instead of throwing when the sidecar directory cannot be created", async () => {
+    // A base directory made unwritable stands in for a permissions failure
+    // or a full disk: mkdirSync must not be allowed to throw out of
+    // ensureFresh, since errors at this layer are structured returns.
+    const roRoot = mkdtempSync(join(tmpdir(), "edj-mgr-ro-"));
+    chmodSync(roRoot, 0o500); // read + execute only: no write, so no child can be created
+
+    const lib2 = readLibraryInfo(mdb);
+    if (isEngineError(lib2)) throw new Error("fixture library unreadable");
+    const qp2 = new QueryProcess(mdb, null, 5000);
+    try {
+      const mgr2 = new IndexManager(lib2, qp2, join(roRoot, "sidecars"));
+      const r = await mgr2.ensureFresh();
+      expect(isEngineError(r)).toBe(true);
+      if (!isEngineError(r)) return;
+      expect(r.error).toBe("library_busy");
+      expect(r.detail).toBeTruthy();
+    } finally {
+      qp2.dispose();
+      chmodSync(roRoot, 0o700);
+      rmSync(roRoot, { recursive: true, force: true });
+    }
   });
 });
