@@ -10,6 +10,15 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-20-engine-dj-mcp-design.md`
 
+> **Correction, 2026-08-21.** This plan originally stated that Engine stores
+> `Track.bpm` as an integer times one hundred. That is false — it is a
+> rekordbox convention carried in by mistake. Measured against a real Engine
+> DJ 5.0 library: stored values of 102, 105, 128, 145 and 147, each matching
+> `bpmAnalyzed` to within 0.68, and Engine's own interface displays 102 for
+> the track stored as 102. Every code block below has been corrected. The
+> defect survived 147 passing tests because the fixture generator encoded the
+> same false assumption as the implementation.
+
 ## Global Constraints
 
 - Node `>=22.0.0`. `node:sqlite` is required and is experimental on 22; it prints an `ExperimentalWarning` to stderr, which is harmless for stdio transport.
@@ -368,7 +377,7 @@ export function makeLibrary(
     const bpm = 118 + Math.floor(r() * 22);
     const played = r() < 0.6 ? now - Math.floor(r() * 86400 * 900) : null;
     ins.run(
-      i, 180 + Math.floor(r() * 300), bpm * 100, 2005 + Math.floor(r() * 21),
+      i, 180 + Math.floor(r() * 300), bpm, 2005 + Math.floor(r() * 21),
       `../Music/lib/${i % 50}/t${i}.mp3`, `t${i}.mp3`, 320, bpm + r() * 0.4,
       8_000_000 + Math.floor(r() * 4e6),
       `${pick(WORDS)} ${pick(WORDS)} ${i}`, pick(ARTISTS), `Album ${i % 40}`, pick(GENRES),
@@ -811,7 +820,7 @@ export function keyName(key: number | null): string | null {
 
 export function tempo(bpmAnalyzed: number | null, bpm: number | null): number | null {
   if (bpmAnalyzed !== null && bpmAnalyzed !== undefined && bpmAnalyzed > 0) return bpmAnalyzed;
-  if (bpm !== null && bpm !== undefined && bpm > 0) return bpm / 100;
+  if (bpm !== null && bpm !== undefined && bpm > 0) return bpm;
   return null;
 }
 
@@ -2353,8 +2362,8 @@ const SQL_CHECKS: Record<string, string> = {
   missing_key: `SELECT t.id FROM Track t WHERE t.key = -1 OR t.key IS NULL`,
   suspicious_bpm: `SELECT t.id FROM Track t
                    WHERE (t.bpmAnalyzed IS NOT NULL AND t.bpm IS NOT NULL
-                          AND ABS(t.bpmAnalyzed - t.bpm / 100.0) > 1.0)
-                      OR COALESCE(t.bpmAnalyzed, t.bpm / 100.0) NOT BETWEEN 60 AND 200`,
+                          AND ABS(t.bpmAnalyzed - t.bpm) > 1.0)
+                      OR COALESCE(t.bpmAnalyzed, t.bpm) NOT BETWEEN 60 AND 200`,
   empty_metadata: `SELECT t.id FROM Track t
                    WHERE t.title IS NULL OR TRIM(t.title) = ''
                       OR t.artist IS NULL OR TRIM(t.artist) = ''`,
@@ -3011,7 +3020,8 @@ Tables live in \`m.db\` (attached as \`main\`); the search index lives in \`side
 - \`Track.key\` is 0..23, \`-1\` means undetermined. Use \`side.track_derived.camelot\`
   for filtering — it is indexed. The SQL function \`camelot(key)\` exists but runs
   per row and defeats indexes.
-- Real tempo is \`COALESCE(bpmAnalyzed, bpm / 100.0)\`; \`bpm\` is stored times 100.
+- Real tempo is \`COALESCE(bpmAnalyzed, bpm)\`. \`bpm\` is stored at face value —
+  it is NOT scaled by 100; that is a rekordbox convention, not an Engine one.
   \`side.track_derived.tempo\` holds the resolved value and is indexed.
 - \`Track.path\` is relative to the \`Engine Library\` folder and usually contains \`..\`.
 - Playlists are singly linked lists: order lives in \`Playlist.nextListId\` and
