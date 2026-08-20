@@ -3,6 +3,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { makeLibrary } from "./fixtures/gen-library.js";
 import { readLibraryInfo } from "../src/discovery.js";
 import { QueryProcess } from "../src/proc/query-client.js";
@@ -14,6 +15,20 @@ let dir: string, qp: QueryProcess;
 beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), "edj-search-"));
   const mdb = makeLibrary(dir, { tracks: 1500 });
+
+  // Deliberately decorrelate has_cues from has_beatgrid for two known ids:
+  // the default generator ties quickCues and beatData to the same hasPerf
+  // flag, so without this, has_cues and has_beatgrid are always equal for
+  // every track and a field-mapping swap between them would go undetected
+  // by any assertion that only checks the two flags against each other.
+  {
+    const raw = new DatabaseSync(mdb);
+    raw.exec("PRAGMA busy_timeout=3000");
+    raw.prepare("UPDATE PerformanceData SET quickCues = ?, beatData = NULL WHERE trackId = 1").run(Buffer.alloc(8));
+    raw.prepare("UPDATE PerformanceData SET quickCues = NULL, beatData = ? WHERE trackId = 2").run(Buffer.alloc(8));
+    raw.close();
+  }
+
   const lib = readLibraryInfo(mdb);
   if (isEngineError(lib)) throw new Error("fixture library unreadable");
   qp = new QueryProcess(mdb, null, 5000);
@@ -145,6 +160,20 @@ describe("search_tracks — FTS5 sanitisation", () => {
       expect(isEngineError(r)).toBe(false);
     }
   });
+
+  it("a punctuation-only query returns an empty result, not an error", async () => {
+    // Verified directly against node:sqlite: a bare hyphen, a bare star, a
+    // hyphen/punctuation carrying a prefix star, and a literal quoted-empty
+    // phrase all sanitise to a syntactically valid MATCH that simply never
+    // matches fixture data (none of it is punctuation-only) rather than
+    // erroring or silently falling back to an unfiltered scan.
+    for (const q of ["-", "*", "-*", "!!!", "!!!*", '""']) {
+      const r = await searchTracks(qp, { q, limit: 5 });
+      expect(isEngineError(r)).toBe(false);
+      if (isEngineError(r)) continue;
+      expect(r.tracks.length).toBe(0);
+    }
+  });
 });
 
 describe("search_tracks — other filters", () => {
@@ -171,22 +200,133 @@ describe("search_tracks — other filters", () => {
     }
   });
 
-  it("filters played.never and played.before", async () => {
-    const never = await searchTracks(qp, { played: { never: true }, limit: 50 });
+  it("played.never returns only unplayed tracks, and strictly fewer than unfiltered", async () => {
+    // Fixture: ~60% of 1500 tracks are played, so both sides are non-empty
+    // (confirmed by execution: never.total = 603).
+    const never = await searchTracks(qp, {
+      played: { never: true }, fields: ["id", "last_played"], limit: 50, include_total: true,
+    });
     expect(isEngineError(never)).toBe(false);
+    if (isEngineError(never)) return;
+    expect(never.tracks.length).toBeGreaterThan(0);
+    for (const t of never.tracks) expect(t.last_played).toBeNull();
 
-    const before = await searchTracks(qp, { played: { before: "-6 months" }, limit: 50 });
+    const all = await searchTracks(qp, { limit: 1, include_total: true });
+    expect(isEngineError(all)).toBe(false);
+    if (isEngineError(all)) return;
+    // never.total lands under the 1000 cap (603, exact) while the
+    // unfiltered total is capped at 1000, so this comparison is a genuine
+    // inequality, not an artifact of both sides being capped equal.
+    expect(never.total!).toBeLessThan(all.total!);
+  });
+
+  it("played.before/after a relative cutoff partition into disjoint, non-empty sets", async () => {
+    const cutoffRes = await qp.run("SELECT CAST(strftime('%s','now','-6 months') AS INTEGER) AS c");
+    expect(isEngineError(cutoffRes)).toBe(false);
+    if (isEngineError(cutoffRes)) return;
+    const cutoffEpoch = Number(cutoffRes.rows[0]![0]);
+
+    const before = await searchTracks(qp, {
+      played: { before: "-6 months" }, fields: ["id", "last_played"], limit: 200,
+    });
+    const after = await searchTracks(qp, {
+      played: { after: "-6 months" }, fields: ["id", "last_played"], limit: 200,
+    });
     expect(isEngineError(before)).toBe(false);
+    expect(isEngineError(after)).toBe(false);
+    if (isEngineError(before) || isEngineError(after)) return;
+
+    expect(before.tracks.length).toBeGreaterThan(0);
+    expect(after.tracks.length).toBeGreaterThan(0);
+
+    for (const t of before.tracks) {
+      if (t.last_played !== null) expect(Number(t.last_played)).toBeLessThan(cutoffEpoch);
+    }
+    for (const t of after.tracks) {
+      expect(t.last_played).not.toBeNull();
+      expect(Number(t.last_played)).toBeGreaterThanOrEqual(cutoffEpoch);
+    }
+
+    // Mutually exclusive by construction (NULL/old vs. non-null/recent), so
+    // no id can legitimately appear on both sides of the same cutoff.
+    const beforeIds = new Set(before.tracks.map((t) => t.id));
+    for (const t of after.tracks) expect(beforeIds.has(t.id)).toBe(false);
   });
 
-  it("filters added.after with an ISO-8601 date", async () => {
-    const r = await searchTracks(qp, { added: { after: "2000-01-01" }, limit: 5 });
+  it("added.after keeps only tracks added at or after the cutoff, and changes the count", async () => {
+    // 500 days before "now" falls inside the fixture's 0..1500-day dateAdded
+    // spread, so both the filtered and complementary populations are large.
+    const cutoffIso = new Date(Date.now() - 500 * 86400 * 1000).toISOString().slice(0, 10);
+    const cutoffRes = await qp.run("SELECT CAST(strftime('%s', ?) AS INTEGER) AS c", [cutoffIso]);
+    expect(isEngineError(cutoffRes)).toBe(false);
+    if (isEngineError(cutoffRes)) return;
+    const cutoffEpoch = Number(cutoffRes.rows[0]![0]);
+
+    const r = await searchTracks(qp, {
+      added: { after: cutoffIso }, fields: ["id", "date_added"], limit: 200, include_total: true,
+    });
     expect(isEngineError(r)).toBe(false);
+    if (isEngineError(r)) return;
+    expect(r.tracks.length).toBeGreaterThan(0);
+    for (const t of r.tracks) expect(Number(t.date_added)).toBeGreaterThanOrEqual(cutoffEpoch);
+
+    const all = await searchTracks(qp, { limit: 1, include_total: true });
+    expect(isEngineError(all)).toBe(false);
+    if (isEngineError(all)) return;
+    // Confirmed by execution: filtered total (521) lands under the cap, so
+    // this is a real inequality against the (capped) unfiltered total.
+    expect(r.total!).toBeGreaterThan(0);
+    expect(r.total!).toBeLessThan(all.total!);
   });
 
-  it("filters by flags.has_cues and flags.has_beatgrid", async () => {
-    const r = await searchTracks(qp, { flags: { has_cues: true, has_beatgrid: true }, limit: 5 });
-    expect(isEngineError(r)).toBe(false);
+  it("flags.has_cues and flags.has_beatgrid are wired to distinct columns, not swapped", async () => {
+    // The fixture's two known ids (1, 2) were deliberately decorrelated in
+    // beforeAll: id 1 has cues but no beatgrid, id 2 has a beatgrid but no
+    // cues. Cross-check both the SELECT projection and the WHERE filtering
+    // against the real side.track_derived values for those ids — with the
+    // generator's normal (correlated) data alone, a swap between the two
+    // flags would be numerically invisible, since both would always agree.
+    const raw1 = await qp.run("SELECT has_cues, has_grid FROM side.track_derived WHERE track_id = ?", [1]);
+    const raw2 = await qp.run("SELECT has_cues, has_grid FROM side.track_derived WHERE track_id = ?", [2]);
+    expect(isEngineError(raw1)).toBe(false);
+    expect(isEngineError(raw2)).toBe(false);
+    if (isEngineError(raw1) || isEngineError(raw2)) return;
+    expect(raw1.rows[0]).toEqual([1, 0]);
+    expect(raw2.rows[0]).toEqual([0, 1]);
+
+    // Projection: id 1 and id 2 sort first under the default id ordering
+    // with no filter, so a plain two-row page reaches both directly.
+    const first2 = await searchTracks(qp, { fields: ["id", "has_cues", "has_beatgrid"], limit: 2 });
+    expect(isEngineError(first2)).toBe(false);
+    if (isEngineError(first2)) return;
+    expect(first2.tracks[0]).toEqual({ id: 1, has_cues: 1, has_beatgrid: 0 });
+    expect(first2.tracks[1]).toEqual({ id: 2, has_cues: 0, has_beatgrid: 1 });
+
+    // WHERE filtering: id 1 must appear under has_cues:true but not
+    // has_beatgrid:true, and id 2 the other way around.
+    const cuesTrue = await searchTracks(qp, { flags: { has_cues: true }, fields: ["id"], limit: 2 });
+    const gridTrue = await searchTracks(qp, { flags: { has_beatgrid: true }, fields: ["id"], limit: 2 });
+    expect(isEngineError(cuesTrue)).toBe(false);
+    expect(isEngineError(gridTrue)).toBe(false);
+    if (isEngineError(cuesTrue) || isEngineError(gridTrue)) return;
+    expect(cuesTrue.tracks.map((t) => t.id)).toContain(1);
+    expect(cuesTrue.tracks.map((t) => t.id)).not.toContain(2);
+    expect(gridTrue.tracks.map((t) => t.id)).toContain(2);
+    expect(gridTrue.tracks.map((t) => t.id)).not.toContain(1);
+
+    // Non-vacuous in both directions: confirmed by execution that
+    // has_cues:true totals 1000 (capped; the true ~85% exceeds the cap) and
+    // has_cues:false totals 239 (exact, well under the cap) — so neither
+    // "matches nothing" nor "matches everything" is possible here.
+    const cuesFalse = await searchTracks(qp, { flags: { has_cues: false }, limit: 1, include_total: true });
+    const gridFalse = await searchTracks(qp, { flags: { has_beatgrid: false }, limit: 1, include_total: true });
+    expect(isEngineError(cuesFalse)).toBe(false);
+    expect(isEngineError(gridFalse)).toBe(false);
+    if (isEngineError(cuesFalse) || isEngineError(gridFalse)) return;
+    expect(cuesTrue.tracks.length).toBeGreaterThan(0);
+    expect(gridTrue.tracks.length).toBeGreaterThan(0);
+    expect(cuesFalse.total!).toBeGreaterThan(0);
+    expect(gridFalse.total!).toBeGreaterThan(0);
   });
 });
 
@@ -233,7 +373,7 @@ describe("search_tracks — cursor safety", () => {
     expect(dark.next_cursor).toBeTruthy();
 
     // Same cursor, different filters entirely (and a different ordering:
-    // rank-based vs id-based) — must be rejected, not silently mispaged.
+    // rank- vs id-based) — must be rejected, not silently mispaged.
     const mismatched = await searchTracks(qp, {
       bpm: { around: 124, tolerance_pct: 2 },
       limit: 5,
