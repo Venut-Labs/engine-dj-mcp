@@ -33,7 +33,13 @@ describe("statement guard", () => {
   });
 
   it("allows trailing semicolon and trailing comments", () => {
-    for (const sql of ["SELECT 1;", "SELECT 1; -- trailing note", "SELECT 1; /* comment */"]) {
+    for (const sql of [
+      "SELECT 1;",
+      "SELECT 1; -- trailing note",
+      "SELECT 1; /* comment */",
+      "SELECT 1; -- 'a;b' trailing comment",
+      "SELECT 1; /* a;b trailing comment */",
+    ]) {
       expect(checkStatement(sql)).toBeNull();
     }
   });
@@ -98,6 +104,7 @@ describe("statement guard", () => {
       "SELECT 1; VACUUM INTO '/tmp/x.db'",
       "SELECT 1; SELECT 2",
       "SELECT 1; DELETE FROM Track",
+      "SELECT 1; /* c */ VACUUM INTO '/tmp/x.db'",
     ]) {
       const e = checkStatement(sql);
       expect(e?.error).toBe("invalid_argument");

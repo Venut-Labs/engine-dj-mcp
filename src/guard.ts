@@ -4,6 +4,7 @@ interface ScanResult {
   firstTokenIndex: number;
   hasChainedStatement: boolean;
   hasLimit: boolean;
+  lastSemicolonIndex: number; // Position of last top-level semicolon, or -1 if none
 }
 
 /**
@@ -16,6 +17,7 @@ function scanStatement(sql: string): ScanResult {
   let hasChainedStatement = false;
   let hasLimit = false;
   let semicolonCount = 0;
+  let lastSemicolonIndex = -1;
 
   while (i < sql.length) {
     const ch = sql[i];
@@ -94,9 +96,10 @@ function scanStatement(sql: string): ScanResult {
       continue;
     }
 
-    // Semicolon - statement separator
+    // Semicolon - statement separator (top-level, outside quotes/comments)
     if (ch === ";") {
       semicolonCount++;
+      lastSemicolonIndex = i;
       i++;
       continue;
     }
@@ -121,13 +124,13 @@ function scanStatement(sql: string): ScanResult {
     }
   }
 
-  // Check for statement chaining: more than one semicolon, or semicolon before trailing whitespace/comments
+  // Check for statement chaining: more than one semicolon, or real content after semicolon (besides whitespace/comments)
   // We allow one optional trailing semicolon
   if (semicolonCount > 1) {
     hasChainedStatement = true;
-  } else if (semicolonCount === 1) {
-    // Check if there's content after the semicolon (besides whitespace/comments)
-    const afterSemicolon = sql.substring(sql.lastIndexOf(";") + 1);
+  } else if (semicolonCount === 1 && lastSemicolonIndex !== -1) {
+    // Check if there's real content after the top-level semicolon (besides whitespace/comments)
+    const afterSemicolon = sql.substring(lastSemicolonIndex + 1);
     let j = 0;
     while (j < afterSemicolon.length) {
       const c = afterSemicolon[j];
@@ -152,7 +155,7 @@ function scanStatement(sql: string): ScanResult {
     }
   }
 
-  return { firstTokenIndex, hasChainedStatement, hasLimit };
+  return { firstTokenIndex, hasChainedStatement, hasLimit, lastSemicolonIndex };
 }
 
 /**
