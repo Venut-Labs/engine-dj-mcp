@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -46,5 +46,109 @@ describe("sidecar", () => {
     expect(meta.schema_version).toBe("3.0.2");
     expect(typeof meta.change_counter).toBe("number");
     db.close();
+  });
+
+  it("cleans up the sidecar file if build fails", () => {
+    const dir = mkdtempSync(join(tmpdir(), "edj-side-fail-"));
+    try {
+      const mdb = makeLibrary(dir, { tracks: 10 });
+      const side = join(dir, "index.db");
+
+      // Break the library by dropping PerformanceData so the JOIN fails
+      const engineDb = new DatabaseSync(mdb);
+      engineDb.exec("DROP TABLE IF EXISTS PerformanceData");
+      engineDb.close();
+
+      // Build should throw
+      expect(() => buildSidecar({ mdbPath: mdb, outPath: side, uuid: "u", schema: "3.0.2" })).toThrow();
+
+      // File must not exist
+      expect(existsSync(side)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("records has_cues and has_grid correctly without swapping", () => {
+    const dir = mkdtempSync(join(tmpdir(), "edj-side-cues-"));
+    try {
+      const mdb = makeLibrary(dir, { tracks: 2 });
+      const side = join(dir, "index.db");
+
+      // Customize the library: one track with cues only, one with grid only
+      const engineDb = new DatabaseSync(mdb);
+      const trackIds = (engineDb.prepare("SELECT id FROM Track LIMIT 2").all() as any[]).map((r) => r.id);
+
+      // Clear existing PerformanceData
+      engineDb.exec("DELETE FROM PerformanceData");
+
+      // First track: add quickCues only (has_cues = 1, has_grid = 0)
+      engineDb.prepare(
+        "INSERT INTO PerformanceData (trackId, quickCues) VALUES (?, ?)"
+      ).run(trackIds[0], Buffer.from([1, 2, 3]));
+
+      // Second track: add beatData only (has_cues = 0, has_grid = 1)
+      engineDb.prepare(
+        "INSERT INTO PerformanceData (trackId, beatData) VALUES (?, ?)"
+      ).run(trackIds[1], Buffer.from([4, 5, 6]));
+
+      engineDb.close();
+
+      buildSidecar({ mdbPath: mdb, outPath: side, uuid: "u", schema: "3.0.2" });
+
+      const sideDb = new DatabaseSync(side, { readOnly: true });
+      const rows = (sideDb.prepare("SELECT track_id, has_cues, has_grid FROM track_derived ORDER BY track_id").all() as any[]);
+
+      // First track should have cues but not grid
+      expect(rows[0].has_cues).toBe(1);
+      expect(rows[0].has_grid).toBe(0);
+
+      // Second track should have grid but not cues
+      expect(rows[1].has_cues).toBe(0);
+      expect(rows[1].has_grid).toBe(1);
+
+      sideDb.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rebuilds over an existing sidecar correctly", () => {
+    const dir = mkdtempSync(join(tmpdir(), "edj-side-rebuild-"));
+    try {
+      const mdb = makeLibrary(dir, { tracks: 50 });
+      const side = join(dir, "index.db");
+
+      // First build
+      const result1 = buildSidecar({ mdbPath: mdb, outPath: side, uuid: "u1", schema: "3.0.1" });
+      expect(result1.indexed).toBe(50);
+
+      // Verify first build is present
+      let sideDb = new DatabaseSync(side, { readOnly: true });
+      let meta = sideDb.prepare("SELECT COUNT(*) c FROM index_meta").get() as any;
+      expect(meta.c).toBe(1);
+      sideDb.close();
+
+      // Second build over the same path
+      const result2 = buildSidecar({ mdbPath: mdb, outPath: side, uuid: "u2", schema: "3.0.2" });
+      expect(result2.indexed).toBe(50);
+
+      // Verify only one metadata row exists (old one was replaced)
+      sideDb = new DatabaseSync(side, { readOnly: true });
+      meta = sideDb.prepare("SELECT COUNT(*) c FROM index_meta").get() as any;
+      expect(meta.c).toBe(1);
+
+      // Verify metadata is from second build
+      const metaRow = sideDb.prepare("SELECT * FROM index_meta").get() as any;
+      expect(metaRow.library_uuid).toBe("u2");
+      expect(metaRow.schema_version).toBe("3.0.2");
+
+      // Verify data counts
+      const trackCount = sideDb.prepare("SELECT COUNT(*) c FROM track_derived").get() as any;
+      expect(trackCount.c).toBe(50);
+      sideDb.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

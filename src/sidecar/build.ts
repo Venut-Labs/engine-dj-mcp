@@ -49,6 +49,9 @@ export function buildSidecar(args: BuildArgs): { indexed: number; elapsed_ms: nu
                 VALUES (?,?,?,?,?)`)
       .run(args.uuid, args.schema, counter, Math.floor(started / 1000), args.generation ?? 1);
     return { indexed, elapsed_ms: Date.now() - started };
+  } catch (e) {
+    rmSync(args.outPath, { force: true });
+    throw e;
   } finally {
     db.close();
   }
