@@ -91,7 +91,7 @@ describe("get_tracks", () => {
     expect(track.title).toBe(expectedTitle);
 
     // Verify derived table fields match expected values computed from Track fields
-    // bpm comes from tempo(bpmAnalyzed, bpm/100), camelot comes from key
+    // bpm comes from tempo(bpmAnalyzed, bpm), camelot comes from key
     expect(track.bpm).toBe(expectedBpm);
     expect(track.camelot).toBe(expectedCamelot);
   });
@@ -198,7 +198,7 @@ describe("refresh_index", () => {
       raw.prepare(`INSERT INTO Track (id, length, bpm, year, path, filename, bitrate, bpmAnalyzed,
         fileBytes, title, artist, album, genre, rating, fileType, isAnalyzed, dateAdded, isAvailable,
         originDatabaseUuid, originTrackId)
-        VALUES (999, 180, 12000, 2025, '../Music/lib/new.mp3', 'new.mp3', 320, 120,
+        VALUES (999, 180, 120, 2025, '../Music/lib/new.mp3', 'new.mp3', 320, 120,
         8000000, 'New Track', 'Test Artist', 'New Album', 'Techno', 0, 'mp3', 1, ?, 1, ?, 999)`).run(
           Math.floor(Date.now() / 1000),
           lib2.uuid,

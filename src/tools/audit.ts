@@ -44,10 +44,11 @@ const SQL_CHECKS: Record<string, string> = {
   no_beatgrid: `SELECT t.id FROM Track t LEFT JOIN PerformanceData p ON p.trackId = t.id
                 WHERE p.beatData IS NULL`,
   missing_key: `SELECT t.id FROM Track t WHERE t.key = -1 OR t.key IS NULL`,
+  // bpm is stored at face value (not times 100, as rekordbox does).
   suspicious_bpm: `SELECT t.id FROM Track t
                    WHERE (t.bpmAnalyzed IS NOT NULL AND t.bpm IS NOT NULL
-                          AND ABS(t.bpmAnalyzed - t.bpm / 100.0) > 1.0)
-                      OR COALESCE(t.bpmAnalyzed, t.bpm / 100.0) NOT BETWEEN 60 AND 200`,
+                          AND ABS(t.bpmAnalyzed - t.bpm) > 1.0)
+                      OR COALESCE(t.bpmAnalyzed, t.bpm) NOT BETWEEN 60 AND 200`,
   empty_metadata: `SELECT t.id FROM Track t
                    WHERE t.title IS NULL OR TRIM(t.title) = ''
                       OR t.artist IS NULL OR TRIM(t.artist) = ''`,

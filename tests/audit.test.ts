@@ -197,7 +197,7 @@ describe("audit_library — each check against an independently computed truth",
     const r = await auditLibrary(qp, mdb, { checks: ["suspicious_bpm"] });
     expect(isEngineError(r)).toBe(false);
     if (isEngineError(r)) return;
-    // The generator keeps bpmAnalyzed within 0.4 of bpm/100 and both inside
+    // The generator keeps bpmAnalyzed within 0.4 of bpm and both inside
     // [118, 140] for every other track, so id 5 (bpmAnalyzed forced to 300)
     // is the only one that can trip either branch of the check.
     expect(r.checks[0]!.count).toBe(1);

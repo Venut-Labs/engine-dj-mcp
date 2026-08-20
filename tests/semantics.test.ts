@@ -51,10 +51,35 @@ describe("keyName", () => {
 });
 
 describe("tempo", () => {
-  it("prefers the analysed value and scales the stored integer by 100", () => {
-    expect(tempo(128.03, 12800)).toBeCloseTo(128.03, 2);
-    expect(tempo(null, 12800)).toBeCloseTo(128.0, 2);
+  it("prefers the analysed value and uses the stored bpm at face value", () => {
+    expect(tempo(128.03, 128)).toBeCloseTo(128.03, 2);
+    expect(tempo(null, 128)).toBeCloseTo(128.0, 2);
     expect(tempo(null, null)).toBeNull();
+  });
+
+  /**
+   * Regression for the ×100 defect: the project originally assumed `bpm` is
+   * stored the way rekordbox stores it (12800 = 128.0 BPM), a claim carried
+   * into the design doc from rekordbox documentation by mistake. Measured
+   * against a real Engine DJ 5.0 library, schema 3.0.2 (the history
+   * database, 24 genuinely analysed tracks), `bpm` is a plain BPM integer
+   * that agrees with `bpmAnalyzed` to within 0.68:
+   *
+   *   id=1  bpm=102  bpmAnalyzed=102                  ratio 1.000
+   *   id=2  bpm=105  bpmAnalyzed=105                  ratio 1.000
+   *   id=4  bpm=145  bpmAnalyzed=145.00000000000003   ratio 1.000
+   *   id=5  bpm=147  bpmAnalyzed=147.67619323730474   ratio 0.995
+   *   id=6  bpm=128  bpmAnalyzed=128                  ratio 1.000
+   *   id=7  bpm=129  bpmAnalyzed=129                  ratio 1.000
+   *
+   * This is an observation from a real library, not a preference: a track
+   * carrying only an integer `bpm` and no `bpmAnalyzed` must resolve to
+   * that same integer.
+   */
+  it("resolves a bare integer bpm to itself when bpmAnalyzed is absent", () => {
+    expect(tempo(null, 102)).toBe(102);
+    expect(tempo(null, 128)).toBe(128);
+    expect(tempo(undefined as unknown as null, 145)).toBe(145);
   });
 });
 

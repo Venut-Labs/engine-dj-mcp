@@ -28,9 +28,17 @@ export function keyName(key: number | null): string | null {
   return mode === "B" ? NAMES_B[number - 1]! : NAMES_A[number - 1]!;
 }
 
+/**
+ * `bpm` is stored at face value (102 means 102 BPM), not times one hundred as
+ * in rekordbox. That times-100 rule was carried into this project from
+ * rekordbox documentation by mistake; measured against a real Engine DJ 5.0
+ * library (schema 3.0.2, history database) every non-null `bpm` among 24
+ * analysed tracks agrees with `bpmAnalyzed` to within 0.68 — e.g. id=6
+ * bpm=128 bpmAnalyzed=128, id=7 bpm=129 bpmAnalyzed=129 — not 12800/12900.
+ */
 export function tempo(bpmAnalyzed: number | null, bpm: number | null): number | null {
   if (bpmAnalyzed !== null && bpmAnalyzed !== undefined && bpmAnalyzed > 0) return bpmAnalyzed;
-  if (bpm !== null && bpm !== undefined && bpm > 0) return bpm / 100;
+  if (bpm !== null && bpm !== undefined && bpm > 0) return bpm;
   return null;
 }
 

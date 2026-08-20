@@ -73,7 +73,8 @@ export function makeLibrary(
     const bpm = 118 + Math.floor(r() * 22);
     const played = r() < 0.6 ? now - Math.floor(r() * 86400 * 900) : null;
     ins.run(
-      i, 180 + Math.floor(r() * 300), bpm * 100, 2005 + Math.floor(r() * 21),
+      // bpm is stored at face value (not times 100, as rekordbox does).
+      i, 180 + Math.floor(r() * 300), bpm, 2005 + Math.floor(r() * 21),
       `../Music/lib/${i % 50}/t${i}.mp3`, `t${i}.mp3`, 320, bpm + r() * 0.4,
       8_000_000 + Math.floor(r() * 4e6),
       `${pick(WORDS)} ${pick(WORDS)} ${i}`, pick(ARTISTS), `Album ${i % 40}`, pick(GENRES),

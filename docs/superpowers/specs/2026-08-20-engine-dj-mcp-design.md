@@ -104,7 +104,28 @@ Sentry — падения у него штатны. После падения п
   соответствие `key=0` = до-мажор. Требуется один реальный трек с известной
   тональностью.
 - **Темп.** Реальное значение — `COALESCE(bpmAnalyzed, bpm)`, где `bpm` хранится
-  как целое ×100 (12800 = 128.0), а `bpmAnalyzed` — `REAL`.
+  как обычное BPM лицом к значению (102 = 102 BPM), а `bpmAnalyzed` — `REAL`
+  того же порядка.
+
+  **Исправление (task R1, 2026-08-20).** Раньше здесь утверждалось, что
+  `bpm` хранится как целое ×100 (12800 = 128.0) — правило rekordbox,
+  ошибочно перенесённое в этот дизайн-документ из документации rekordbox и
+  ни разу не проверенное на реальных данных Engine. Измерено на живой
+  библиотеке Engine DJ 5.0, схема 3.0.2 (history-БД, 24 реально
+  проанализированных трека, восемь из них с непустым `bpm`):
+
+  ```
+  id=1  bpm=102  bpmAnalyzed=102                  ratio 1.000
+  id=2  bpm=105  bpmAnalyzed=105                  ratio 1.000
+  id=4  bpm=145  bpmAnalyzed=145.00000000000003   ratio 1.000
+  id=5  bpm=147  bpmAnalyzed=147.67619323730474   ratio 0.995
+  id=6  bpm=128  bpmAnalyzed=128                  ratio 1.000
+  id=7  bpm=129  bpmAnalyzed=129                  ratio 1.000
+  ```
+
+  Все восемь треков с непустым `bpm` сходятся с `bpmAnalyzed` в пределах
+  0.68 BPM; при правиле ×100 они читались бы как 10200–14700. Правило ×100
+  — факт про rekordbox, не про Engine.
 - **Путь.** `Track.path` относительный от `Engine Library`, обычно содержит `..`.
 - **Плейлисты** — односвязные списки: `Playlist.nextListId`,
   `PlaylistEntity.nextEntityId`. Порядок поддерживается триггерами.
@@ -360,7 +381,7 @@ unanalyzed       isAnalyzed = 0
 no_cues          quickCues пуст или NULL
 no_beatgrid      beatData пуст или NULL
 missing_key      key = -1
-suspicious_bpm   |bpmAnalyzed - bpm/100| > 1.0 либо темп вне диапазона 60..200
+suspicious_bpm   |bpmAnalyzed - bpm| > 1.0 либо темп вне диапазона 60..200
 duplicates       нормализованные (artist,title); отдельно (fileBytes,length)
 empty_metadata   нет artist или title
 orphan_entries   PlaylistEntity ссылается на несуществующий Track
