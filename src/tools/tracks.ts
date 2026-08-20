@@ -19,8 +19,14 @@ export async function getTracks(
     return err("invalid_argument", "ids must contain between 1 and 200 track ids");
   }
   const { ids } = parsed.data;
-  const fields = (parsed.data.fields ?? [...DEFAULT_FIELDS]).filter((f) => f in FIELD_SQL);
-  if (!fields.length) return err("invalid_argument", "No recognised fields requested");
+  const requestedFields = parsed.data.fields ?? [...DEFAULT_FIELDS];
+  const unknownFields = requestedFields.filter((f) => !(f in FIELD_SQL));
+  if (unknownFields.length) {
+    return err("invalid_argument", `Unknown field(s): ${unknownFields.join(", ")}`, {
+      detail: `Recognised fields: ${Object.keys(FIELD_SQL).join(", ")}`,
+    });
+  }
+  const fields = requestedFields;
 
   const select = fields.map((f) => `${FIELD_SQL[f]} AS "${f}"`).join(", ");
   const sql = `SELECT ${select}, t.id AS __id
