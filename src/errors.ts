@@ -7,6 +7,7 @@ export const ERROR_CODES = [
   "index_stale",
   "decode_failed",
   "invalid_argument",
+  "library_needs_recovery",
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];
