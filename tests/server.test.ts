@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { fork } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { makeLibrary } from "./fixtures/gen-library.js";
@@ -44,10 +45,11 @@ async function makeHotJournalLibrary(): Promise<{ dir: string; mdb: string }> {
   return { dir, mdb };
 }
 
-let dir: string, qp: QueryProcess;
+let dir: string, mdb: string, qp: QueryProcess;
 beforeAll(() => {
   dir = mkdtempSync(join(tmpdir(), "edj-sql-"));
-  qp = new QueryProcess(makeLibrary(dir, { tracks: 100 }), null, 5000);
+  mdb = makeLibrary(dir, { tracks: 100 });
+  qp = new QueryProcess(mdb, null, 5000);
 });
 afterAll(() => {
   qp.dispose();
@@ -134,6 +136,40 @@ describe("run_sql and a caller-supplied LIMIT that would otherwise bypass the ca
     if (isEngineError(r)) return;
     expect(r.rows.length).toBe(3);
     expect(r.truncated).toBe(false);
+  });
+
+  it("preserves ORDER BY through the wrap, not merely the row count", async () => {
+    // enforceLimit composes "SELECT * FROM (<sql>) LIMIT n" rather than
+    // appending, so the inner ORDER BY sits inside a subquery -- SQL does
+    // not guarantee a subquery preserves its own ordering when it feeds an
+    // outer query. fileBytes carries no index (only title, artist, album,
+    // genre, key, rating, year, dateAdded, length and bpmAnalyzed do, per
+    // gen-library.ts), and its values are drawn independently of both
+    // insertion order and the id/rowid order SQLite would fall back to, so
+    // a regression that silently dropped the ORDER BY would very likely
+    // change the row sequence, not just its length. The tiebreak on id
+    // makes the expectation deterministic even if two fixture rows land on
+    // the same fileBytes value.
+    const sql = "SELECT id, fileBytes FROM Track ORDER BY fileBytes DESC, id ASC";
+
+    const raw = new DatabaseSync(`file:${mdb}?mode=ro`, { readOnly: true });
+    let expected: [number, number][];
+    try {
+      expected = (raw.prepare(`${sql} LIMIT 20`).all() as { id: number; fileBytes: number }[]).map((row) => [
+        Number(row.id),
+        Number(row.fileBytes),
+      ]);
+    } finally {
+      raw.close();
+    }
+    expect(expected.length).toBe(20);
+
+    const r = await runSql(qp, { sql, limit: 20 });
+    expect(isEngineError(r)).toBe(false);
+    if (isEngineError(r)) return;
+    const actual = r.rows.map((row) => [Number(row[0]), Number(row[1])]);
+
+    expect(actual).toEqual(expected);
   });
 });
 

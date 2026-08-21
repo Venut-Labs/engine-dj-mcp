@@ -19,3 +19,12 @@ export function absTrackPath(mdbPath: string, relative: string): string {
 export function libraryCandidates(root: string): string[] {
   return [join(root, "Engine Library", "Database2", "m.db")];
 }
+
+/**
+ * Absolute library paths carry the user's account name. Search results are
+ * shipped to a model provider, so the home prefix is folded to `~` by default.
+ */
+export function redactPath(p: string): string {
+  const home = homedir();
+  return p === home || p.startsWith(home + "/") ? "~" + p.slice(home.length) : p;
+}

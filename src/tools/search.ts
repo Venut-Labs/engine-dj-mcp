@@ -3,6 +3,7 @@ import { z } from "zod";
 import { createHash } from "node:crypto";
 import { err, isEngineError, type EngineError } from "../errors.js";
 import { camelotNeighbours } from "../semantics.js";
+import { redactPath } from "../paths.js";
 import type { QueryProcess } from "../proc/query-client.js";
 
 export const DEFAULT_FIELDS = ["id", "artist", "title", "bpm", "camelot", "rating"] as const;
@@ -83,6 +84,7 @@ export const SearchInput = z.object({
   limit: z.number().int().positive().default(25),
   cursor: z.string().optional(),
   include_total: z.boolean().default(false),
+  redact_paths: z.boolean().default(true),
 });
 export type SearchInput = z.input<typeof SearchInput>;
 
@@ -318,9 +320,13 @@ export async function searchTracks(
   if (isEngineError(res)) return res;
 
   const idx = Object.fromEntries(res.columns.map((c, i) => [c, i]));
-  const tracks = res.rows.map(
-    (row) => Object.fromEntries(fields.map((f) => [f, row[idx[f]!]])) as Record<string, unknown>,
-  );
+  const tracks = res.rows.map((row) =>
+    Object.fromEntries(fields.map((f) => {
+      const value = row[idx[f]!];
+      return [f, input.redact_paths && f === "path" && typeof value === "string"
+        ? redactPath(value)
+        : value];
+    })) as Record<string, unknown>);
 
   let next_cursor: string | undefined;
   if (res.rows.length === limit) {
