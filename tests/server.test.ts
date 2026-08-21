@@ -1,6 +1,6 @@
 // tests/server.test.ts
 import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, chmodSync, readFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -283,6 +283,24 @@ describe("createServer", () => {
     libSidecars = join(libDir, "sidecars");
   });
   afterAll(() => rmSync(libDir, { recursive: true, force: true }));
+
+  it("reports the version and name from package.json, not a hardcoded literal", async () => {
+    // Regression for a real defect: the McpServer constructor once had
+    // version: "0.1.0" typed in literally while package.json said "0.9.0",
+    // so every client's initialize handshake got the stale number. A test
+    // that only asserted "some version string" passed the whole time that
+    // bug shipped, so this reads package.json independently (not by
+    // importing anything from src/server.ts) and compares it against what
+    // the server actually told a connected client, through the real MCP
+    // initialize handshake -- not the source literal.
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+      name: string;
+      version: string;
+    };
+    const { client } = await connectedClient([libDir], libSidecars);
+    expect(client.getServerVersion()).toEqual({ name: pkg.name, version: pkg.version });
+    await client.close();
+  });
 
   it("registers all seven read-only tools", async () => {
     const { client } = await connectedClient([libDir], libSidecars);

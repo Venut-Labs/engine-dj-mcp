@@ -1,6 +1,6 @@
 {
   "name": "engine-dj-mcp",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Read-only MCP server for searching and auditing an Engine DJ library. Not affiliated with inMusic or Denon DJ.",
   "keywords": [
     "mcp",

@@ -1,5 +1,5 @@
 // src/server.ts
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -24,6 +24,25 @@ import { refreshIndex } from "./tools/refresh.js";
 import { err, isEngineError, libraryNeedsRecovery, type EngineError } from "./errors.js";
 
 const RO = { readOnlyHint: true, destructiveHint: false, idempotentHint: true } as const;
+
+/**
+ * name/version reported to every client on initialize. Read from
+ * package.json rather than typed here, so the two cannot re-diverge the way
+ * they already have once (this constructor shipped 0.1.0 while package.json
+ * said 0.9.0).
+ *
+ * Resolved via import.meta.url, one directory up from this module, not by
+ * relative path from cwd: this runs under `npx` from an arbitrary working
+ * directory, and package.json sits next to dist/ (this module's compiled
+ * location) in both the repo (src/../package.json) and the installed
+ * layout (dist/../package.json) -- package.json is always included in the
+ * published tarball regardless of the "files" field, so this path exists
+ * in both places even though "files" lists only "dist".
+ */
+const PACKAGE_INFO = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+  name: string;
+  version: string;
+};
 
 /**
  * Appended to every tool description that takes a `library`. The argument's
@@ -95,7 +114,7 @@ interface LibraryState {
 export async function createServer(
   opts: { roots?: string[]; sidecarBaseDir?: string } = {},
 ): Promise<EngineDjMcpServer> {
-  const server = new McpServer({ name: "engine-dj-mcp", version: "0.1.0" }) as EngineDjMcpServer;
+  const server = new McpServer({ name: PACKAGE_INFO.name, version: PACKAGE_INFO.version }) as EngineDjMcpServer;
 
   const libs = discoverLibraries(opts.roots);
 
