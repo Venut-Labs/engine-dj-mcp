@@ -25,7 +25,22 @@ beforeAll(async () => {
 }, 120_000);
 afterAll(() => { qp.dispose(); rmSync(dir, { recursive: true, force: true }); });
 
-/** Budgets are ~3x the numbers measured while designing, to absorb slow CI. */
+/**
+ * Budgets, and what was actually measured while designing (see
+ * task-17-brief.md), at 50k synthetic tracks:
+ *  - staleness probe: ~0.03 ms (a direct file read) -> 1 ms budget.
+ *  - full rebuild: ~104 ms (same-process, no IPC) -> 300 ms budget (~2.9x).
+ *  - search page: ~0.2 ms for the raw SQL query alone -> 25 ms budget.
+ *
+ * The search-page number is not directly comparable to its budget the way
+ * the other two are: 0.2 ms is in-process query execution time, while this
+ * test (like every real call) measures the full round trip through
+ * QueryProcess's forked worker -- fork/IPC/serialization overhead, not just
+ * SQL. On the machine this was last measured on, that full round trip runs
+ * ~8 ms, still comfortably under 25 ms. Treat the 25 ms budget as the real
+ * contract; do not read "8 ms vs 0.2 ms" as 40x regression, since the two
+ * numbers measure different things.
+ */
 describe(`performance budgets at ${N} tracks`, () => {
   it("probes staleness in under 1 ms", () => {
     const t = performance.now();

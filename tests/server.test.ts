@@ -1,7 +1,7 @@
 // tests/server.test.ts
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { mkdtempSync, rmSync, existsSync, chmodSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { fork } from "node:child_process";
@@ -326,6 +326,41 @@ describe("createServer", () => {
     const resEntry = resBody.libraries.find((l: any) => l.path === libMdb);
     expect(resEntry.index_generation).toBe(entry.index_generation);
     await client.close();
+  });
+
+  it("redacts the library's own absolute path -- containing the account name -- in both the tool and the resource", async () => {
+    // list_libraries reports the absolute location of m.db itself (not a
+    // Track.path), which is routinely absolute in real use, unlike search
+    // results. Rooting the fixture under $HOME, rather than the usual
+    // os.tmpdir(), is required to exercise this for real: a fixture placed
+    // under tmpdir (as libDir above is) never contains $HOME to begin with,
+    // so any "does not contain $HOME" assertion against it would pass
+    // whether or not redaction ran at all.
+    const homeLibDir = mkdtempSync(join(homedir(), ".edj-mcp-srv-lib-priv-"));
+    try {
+      const homeLibMdb = makeLibrary(homeLibDir, { tracks: 5 });
+      expect(homeLibMdb.startsWith(homedir() + "/")).toBe(true); // sanity
+
+      const { client } = await connectedClient([homeLibDir], join(homeLibDir, "sidecars"));
+
+      const listed = await client.callTool({ name: "list_libraries", arguments: {} });
+      const toolPath = String((listed.structuredContent as any).libraries[0].path);
+      expect(toolPath).not.toContain(homedir());
+      // Still the same file: only the home prefix changed, not the tail --
+      // a redaction that truncated or mangled the path would satisfy the
+      // "not.toContain" check above but fail this one.
+      expect(toolPath).toBe("~" + homeLibMdb.slice(homedir().length));
+
+      const resource = await client.readResource({ uri: "engine://libraries" });
+      const resBody = JSON.parse(String((resource.contents[0] as { text: string }).text));
+      const resPath = String(resBody.libraries[0].path);
+      expect(resPath).not.toContain(homedir());
+      expect(resPath).toBe(toolPath);
+
+      await client.close();
+    } finally {
+      rmSync(homeLibDir, { recursive: true, force: true });
+    }
   });
 
   it("reports index_generation as null, not 0, when the index could not be built at all", async () => {
