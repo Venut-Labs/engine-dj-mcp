@@ -76,14 +76,48 @@ export function defaultRoots(): string[] {
   return roots;
 }
 
-export function discoverLibraries(roots: string[] = defaultRoots()): LibraryInfo[] {
-  const out: LibraryInfo[] = [];
+/** One candidate path's read outcome: either a readable library, or why it
+ * currently is not. `path` is always the candidate location, even on
+ * failure, so a caller can correlate this against a previous successful
+ * probe of the same path. */
+export interface LibraryProbe {
+  path: string;
+  info: LibraryInfo | null;
+  error: EngineError | null;
+}
+
+/**
+ * Walks the same candidate paths as discoverLibraries(), but -- unlike it --
+ * reports every candidate that exists on disk, including ones readLibraryInfo
+ * could not read right now. discoverLibraries() drops those by design (see
+ * below); this is for a caller that needs to tell "not there" apart from
+ * "there but currently unreadable", e.g. to keep reporting a library that
+ * was seen before while Engine DJ holds a write lock on it.
+ */
+export function probeLibraries(roots: string[] = defaultRoots()): LibraryProbe[] {
+  const out: LibraryProbe[] = [];
   for (const root of roots) {
     for (const candidate of libraryCandidates(root)) {
       if (!existsSync(candidate)) continue;
       const info = readLibraryInfo(candidate);
-      if (!("error" in info)) out.push(info);
+      out.push(
+        "error" in info
+          ? { path: candidate, info: null, error: info }
+          : { path: candidate, info, error: null },
+      );
     }
   }
   return out;
+}
+
+/**
+ * Reports only libraries it could actually read, by design: a permissions
+ * error (or a mid-write lock) on one candidate must not blank out every
+ * other one. Built on probeLibraries(); see that function for a version that
+ * also reports what could not be read and why.
+ */
+export function discoverLibraries(roots: string[] = defaultRoots()): LibraryInfo[] {
+  return probeLibraries(roots)
+    .map((p) => p.info)
+    .filter((info): info is LibraryInfo => info !== null);
 }

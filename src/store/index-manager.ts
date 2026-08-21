@@ -70,9 +70,16 @@ export class IndexManager {
    * serves). Without it those paths return a success/index_stale result
    * while `side` is not attached at all, and the next tool query dies on
    * "no such table: side.track_derived".
+   *
+   * The short-circuit also checks qp.hasSidecar, not just #attached: a
+   * worker respawn racing a failed setSidecar could otherwise leave
+   * #attached true while the live process actually has nothing attached,
+   * which would let this report success with nothing attached -- the same
+   * class of failure the comment above describes, just reached from the
+   * other side.
    */
   async #attach(): Promise<boolean> {
-    if (this.#attached) return true;
+    if (this.#attached && this.qp.hasSidecar) return true;
     this.#attached = await this.qp.setSidecar(this.path);
     return this.#attached;
   }

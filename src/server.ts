@@ -1,7 +1,7 @@
 // src/server.ts
 import { existsSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { discoverLibraries, defaultRoots, type LibraryInfo } from "./discovery.js";
+import { discoverLibraries, defaultRoots, probeLibraries, type LibraryInfo } from "./discovery.js";
 import { libraryCandidates } from "./paths.js";
 import { hasHotJournal } from "./store/connections.js";
 import { QueryProcess } from "./proc/query-client.js";
@@ -11,7 +11,7 @@ import { getTracks, GetTracksInput } from "./tools/tracks.js";
 import { getTrackPerformance, PerformanceInput } from "./tools/performance.js";
 import { auditLibrary, AuditInput, AUDIT_CHECKS } from "./tools/audit.js";
 import { runSql, RunSqlInput } from "./tools/sql.js";
-import { listLibraries } from "./tools/libraries.js";
+import { listLibraries, type LibraryEntry } from "./tools/libraries.js";
 import { refreshIndex } from "./tools/refresh.js";
 import { err, isEngineError, libraryNeedsRecovery } from "./errors.js";
 
@@ -86,6 +86,46 @@ export async function createServer(
   };
 
   /**
+   * Seeded from the start-time scan and grown by every list_libraries call
+   * after: once a candidate path has been read successfully, it stays here.
+   * That is what lets rescanLibraries() below keep reporting a library that
+   * a later scan catches locked, instead of discoverLibraries() silently
+   * dropping it -- the same library that "was discoverable before must not
+   * silently disappear because it is momentarily unreadable" (see
+   * tools/libraries.ts). Keyed by candidate path rather than uuid: a failed
+   * read has no fresh uuid to key on, only the path it was attempted at.
+   */
+  const knownLibraries = new Map<string, LibraryInfo>(libs.map((l) => [l.path, l]));
+
+  /**
+   * The re-scan behind the list_libraries tool. Every candidate path that
+   * still exists but failed to read this time is reported using its last
+   * known-good LibraryInfo, marked `unreadable` with the fresh error --
+   * present, but visibly not fine, rather than absent. A candidate that no
+   * longer exists at all (the drive itself is gone) is forgotten instead:
+   * that is a real disappearance, not a degraded state.
+   */
+  const rescanLibraries = (): LibraryEntry[] => {
+    const roots = opts.roots ?? defaultRoots();
+    const seen = new Set<string>();
+    const entries: LibraryEntry[] = [];
+    for (const probe of probeLibraries(roots)) {
+      seen.add(probe.path);
+      if (probe.info) {
+        knownLibraries.set(probe.path, probe.info);
+        entries.push(probe.info);
+      } else {
+        const cached = knownLibraries.get(probe.path);
+        if (cached) entries.push({ ...cached, unreadable: probe.error! });
+      }
+    }
+    for (const path of knownLibraries.keys()) {
+      if (!seen.has(path)) knownLibraries.delete(path);
+    }
+    return entries;
+  };
+
+  /**
    * `index_stale` is swallowed only when an index is genuinely attached:
    * "the previous index is still in use" is a reason to answer anyway, but
    * "the index could not be built yet" is not. Every tool's SQL joins
@@ -119,7 +159,7 @@ export async function createServer(
    * generation 0, which is not a real generation number and must read as
    * null, not as "generation zero".
    */
-  const libraryReport = async (discovered: LibraryInfo[]) => {
+  const libraryReport = async (discovered: LibraryEntry[]) => {
     if (mgr) await mgr.ensureFresh(); // best effort: keeps the generation accurate even as the first call of a session
     const generations = new Map<string, number>();
     if (mgr && primary && mgr.generation > 0) generations.set(primary.uuid, mgr.generation);
@@ -238,11 +278,13 @@ export async function createServer(
       description:
         "List every discovered library, including ones whose schema is unsupported. " +
         "Re-scans on every call, so a drive plugged in after this server started is visible " +
-        "without a restart (the engine://libraries resource is a start-time snapshot).",
+        "without a restart (the engine://libraries resource is a start-time snapshot). A " +
+        "library seen before but not readable right now (e.g. Engine DJ is writing to it) " +
+        "stays listed with status: \"unreadable\" and error set, instead of disappearing.",
       inputSchema: {},
       annotations: RO,
     },
-    async () => reply(await libraryReport(discoverLibraries(opts.roots))),
+    async () => reply(await libraryReport(rescanLibraries())),
   );
 
   server.registerTool(
