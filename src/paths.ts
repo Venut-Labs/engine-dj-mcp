@@ -24,3 +24,15 @@ export function redactPath(p: string): string {
   const home = homedir();
   return p === home || p.startsWith(home + "/") ? "~" + p.slice(home.length) : p;
 }
+
+/**
+ * The inverse of redactPath, for values coming back *in*. Every library path
+ * this server reports has been through redactPath, so the most obvious way
+ * to name a library -- copy the `path` list_libraries just printed -- hands
+ * back a `~/...` string that exists on no filesystem. Anything without a
+ * leading `~` is returned untouched, so an absolute path stays absolute.
+ */
+export function expandHome(p: string): string {
+  if (p === "~") return homedir();
+  return p.startsWith("~/") ? join(homedir(), p.slice(2)) : p;
+}

@@ -24,9 +24,23 @@ function rng(seed: number) {
   return () => ((s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
 }
 
+/**
+ * `uuid` and `marker` exist for tests that need two libraries to be *told
+ * apart*. Without them every fixture of the same schema version shares one
+ * uuid and one set of generated titles, so a test that selected the wrong
+ * library would pass exactly as happily as one that selected the right one
+ * -- and the sidecars, keyed by uuid, would land on top of each other.
+ * `marker` is prefixed to every title, so an FTS search for it returns rows
+ * from that library and no other.
+ */
 export function makeLibrary(
   dir: string,
-  opts: { tracks?: number; schema?: [number, number, number] } = {},
+  opts: {
+    tracks?: number;
+    schema?: [number, number, number];
+    uuid?: string;
+    marker?: string;
+  } = {},
 ): string {
   const n = opts.tracks ?? 500;
   const [maj, min, pat] = opts.schema ?? [3, 0, 2];
@@ -53,7 +67,7 @@ export function makeLibrary(
   }
   db.exec(`CREATE INDEX index_Track_bpmAnalyzed ON Track(CAST(bpmAnalyzed + 0.5 AS int))`);
 
-  const uuid = "00000000-0000-4000-8000-0000000000" + String(maj).padStart(2, "0");
+  const uuid = opts.uuid ?? "00000000-0000-4000-8000-0000000000" + String(maj).padStart(2, "0");
   // Measured on two independent real Engine libraries: currentPlayedIndiciator
   // is a 64-bit value far outside Number.MAX_SAFE_INTEGER (9007199254740991),
   // not a corrupt or unusual one. A fixture that wrote 0 here let the code
@@ -84,7 +98,8 @@ export function makeLibrary(
       i, 180 + Math.floor(r() * 300), bpm, 2005 + Math.floor(r() * 21),
       `../Music/lib/${i % 50}/t${i}.mp3`, `t${i}.mp3`, 320, bpm + r() * 0.4,
       8_000_000 + Math.floor(r() * 4e6),
-      `${pick(WORDS)} ${pick(WORDS)} ${i}`, pick(ARTISTS), `Album ${i % 40}`, pick(GENRES),
+      `${opts.marker ? opts.marker + " " : ""}${pick(WORDS)} ${pick(WORDS)} ${i}`,
+      pick(ARTISTS), `Album ${i % 40}`, pick(GENRES),
       r() < 0.3 ? pick(WORDS) : null, `Label ${i % 20}`,
       r() < 0.05 ? -1 : Math.floor(r() * 24), Math.floor(r() * 6),
       played, played ? 1 : 0, "mp3", r() < 0.9 ? 1 : 0,

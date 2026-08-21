@@ -1,7 +1,7 @@
 # engine-dj-mcp
 
 An MCP server that lets an AI assistant search and audit your **Engine DJ**
-library.
+libraries — the one on your Mac and the ones on your USB drives.
 
 > **Not affiliated with, endorsed by, or sponsored by inMusic Brands, Denon
 > DJ, or the Engine DJ product.** "Engine DJ" is used here only to name the
@@ -30,6 +30,31 @@ It also exposes two MCP resources: `engine://schema` (the field semantics an
 assistant needs before writing SQL against the library) and
 `engine://libraries` (what was discovered, and whether each library's schema
 is supported).
+
+## Choosing a library
+
+Engine DJ keeps a library on your computer and another on every drive you
+export to, so more than one is usually connected at once. `list_libraries`
+reports each of them with a `uuid` and a `path`, and **every tool that reads
+library data takes an optional `library` argument** — `search_tracks`,
+`get_tracks`, `get_track_performance`, `audit_library`, `run_sql` and
+`refresh_index`. Pass either the `uuid` or the `path` exactly as
+`list_libraries` printed it; the `~/…` form it reports is accepted alongside
+the absolute one. A value matching neither comes back as
+`library_not_found`, listing the libraries you can actually choose from.
+
+Leave `library` out and the server uses **the supported library holding the
+most tracks**, ties broken by the order the drives were scanned in. That
+matters: the local library Engine DJ creates on install is scanned first and
+is often empty, so "the first one found" would hide the drive you actually
+work from.
+
+Each library gets its own search index and its own read-only connection,
+opened the first time you ask that library a question — mounting four drives
+does not cost four connections. Every query, audit and file-path check stays
+inside the library selected for that call. Comparing two libraries against
+each other — "what is on this drive but not that one?" — is **not** something
+this server does.
 
 ## Safety
 
