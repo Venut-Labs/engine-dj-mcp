@@ -8,7 +8,7 @@ import { fork, execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { makeLibrary } from "./fixtures/gen-library.js";
+import { makeLibrary, addPlaylists } from "./fixtures/gen-library.js";
 import { QueryProcess } from "../src/proc/query-client.js";
 import { runSql } from "../src/tools/sql.js";
 import { createServer, findHotJournalCandidate } from "../src/server.js";
@@ -277,12 +277,40 @@ function workerPids(mdbPath: string): number[] {
 
 describe("createServer", () => {
   let libDir: string, libMdb: string, libSidecars: string;
+  let plDir: string, plSidecars: string;
   beforeAll(() => {
     libDir = mkdtempSync(join(tmpdir(), "edj-srv-lib-"));
     libMdb = makeLibrary(libDir, { tracks: 40 });
     libSidecars = join(libDir, "sidecars");
+
+    // A second library carrying playlists, with both chains laid out so
+    // that following them gives a different answer from sorting by id --
+    // lists Second, First against ids 1, 2, and tracks 3, 1, 2 against
+    // entry ids 1, 2, 3.
+    plDir = mkdtempSync(join(tmpdir(), "edj-srv-pl-"));
+    const plMdb = makeLibrary(plDir, {
+      tracks: 6,
+      uuid: "00000000-0000-4000-8000-00000000d1ca",
+    });
+    addPlaylists(plMdb, [
+      {
+        id: 1,
+        title: "First",
+        nextListId: 0,
+        entries: [
+          { id: 1, trackId: 1, next: 2 },
+          { id: 2, trackId: 2, next: 0 },
+          { id: 3, trackId: 3, next: 1 },
+        ],
+      },
+      { id: 2, title: "Second", nextListId: 1 },
+    ]);
+    plSidecars = join(plDir, "sidecars");
   });
-  afterAll(() => rmSync(libDir, { recursive: true, force: true }));
+  afterAll(() => {
+    rmSync(libDir, { recursive: true, force: true });
+    rmSync(plDir, { recursive: true, force: true });
+  });
 
   it("reports the version and name from package.json, not a hardcoded literal", async () => {
     // Regression for a real defect: the McpServer constructor once had
@@ -302,12 +330,14 @@ describe("createServer", () => {
     await client.close();
   });
 
-  it("registers all seven read-only tools", async () => {
+  it("registers all nine read-only tools", async () => {
     const { client } = await connectedClient([libDir], libSidecars);
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual(
       [
         "audit_library",
+        "get_playlist_tracks",
+        "get_playlists",
         "get_track_performance",
         "get_tracks",
         "list_libraries",
@@ -319,6 +349,74 @@ describe("createServer", () => {
     for (const tool of tools) {
       expect(tool.annotations?.readOnlyHint, `${tool.name} must be readOnlyHint`).toBe(true);
     }
+    await client.close();
+  });
+
+  it("lets every library-reading tool be pointed at a specific library", async () => {
+    // The `library` argument is the one thing every one of these has to
+    // accept: a tool that quietly ignored it would answer about the wrong
+    // drive. list_libraries is excluded because it reports all of them.
+    const { client } = await connectedClient([libDir], libSidecars);
+    const { tools } = await client.listTools();
+    for (const tool of tools) {
+      if (tool.name === "list_libraries") continue;
+      const props = (tool.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};
+      expect(Object.keys(props), `${tool.name} must accept a library argument`).toContain("library");
+    }
+    await client.close();
+  });
+
+  it("tells a model where playlist order lives, and where it does not", async () => {
+    // A model reading only the tool description is the one that has to be
+    // stopped from reaching for PlaylistPath.position or ORDER BY id --
+    // both of which look right and give a different answer from Engine.
+    const { client } = await connectedClient([libDir], libSidecars);
+    const { tools } = await client.listTools();
+    const list = tools.find((t) => t.name === "get_playlists")!;
+    expect(list.description).toMatch(/nextListId/);
+    expect(list.description).toMatch(/PlaylistPath/);
+    const entries = tools.find((t) => t.name === "get_playlist_tracks")!;
+    expect(entries.description).toMatch(/nextEntityId/);
+    expect(entries.description).toMatch(/not from row ids/);
+    // And what a hole in a playlist is, since it is routine rather than rare.
+    expect(entries.description).toMatch(/missing: true/);
+    await client.close();
+  });
+
+  it("warns in engine://schema against the position column that reverses the order", async () => {
+    const { client } = await connectedClient([libDir], libSidecars);
+    const { contents } = await client.readResource({ uri: "engine://schema" });
+    const text = String((contents[0] as { text: string }).text);
+    expect(text).toMatch(/PlaylistPath/);
+    expect(text).toMatch(/Do not use it for display order/i);
+    expect(text).toMatch(/reverse of the chain/i);
+    expect(text).toMatch(/never\s+`ORDER BY id`/);
+    // And the two facts a model needs before writing its own playlist SQL.
+    expect(text).toMatch(/nextListId/);
+    expect(text).toMatch(/nextEntityId/);
+    expect(text).toMatch(/unique only within a\s+parent/i);
+    await client.close();
+  });
+
+  it("returns a playlist and its tracks in order through the real MCP request path", async () => {
+    // The tool bodies are covered directly in playlists.test.ts; what this
+    // adds is that both are actually reachable as MCP calls, that the
+    // library gate runs first, and that the ordering survives the JSON round
+    // trip a client sees.
+    const { client } = await connectedClient([plDir], plSidecars);
+    const listed = await client.callTool({ name: "get_playlists", arguments: {} });
+    expect(listed.isError).toBeFalsy();
+    const tree = listed.structuredContent as any;
+    expect(tree.playlists.map((p: any) => p.name)).toEqual(["Second", "First"]);
+
+    const got = await client.callTool({
+      name: "get_playlist_tracks",
+      arguments: { playlist_name: "First", fields: ["id"] },
+    });
+    expect(got.isError).toBeFalsy();
+    const body = got.structuredContent as any;
+    expect(body.tracks.map((t: any) => t.id)).toEqual([3, 1, 2]);
+    expect(body.entry_count).toBe(3);
     await client.close();
   });
 

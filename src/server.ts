@@ -16,6 +16,12 @@ import { QueryProcess } from "./proc/query-client.js";
 import { IndexManager } from "./store/index-manager.js";
 import { searchTracks, SearchInput } from "./tools/search.js";
 import { getTracks, GetTracksInput } from "./tools/tracks.js";
+import {
+  getPlaylists,
+  GetPlaylistsInput,
+  getPlaylistTracks,
+  GetPlaylistTracksInput,
+} from "./tools/playlists.js";
 import { getTrackPerformance, PerformanceInput } from "./tools/performance.js";
 import { auditLibrary, AuditInput, AUDIT_CHECKS } from "./tools/audit.js";
 import { runSql, RunSqlInput } from "./tools/sql.js";
@@ -310,6 +316,8 @@ export async function createServer(
         "flags.has_cues means a hot cue is actually set (the blob is decoded when the index " +
         "is built), not merely that Engine analysed the track; flags.has_beatgrid means a " +
         "beatData blob is present. " +
+        "playlist: {id} or {name} narrows the search to one playlist -- results still come " +
+        "back by relevance or id, not in playlist order; use get_playlist_tracks for that. " +
         LIBRARY_SELECTION_NOTE,
       inputSchema: { ...SearchInput.shape, library: LibraryArg },
       annotations: RO,
@@ -335,6 +343,61 @@ export async function createServer(
       const state = await acquire(args.library);
       if (isEngineError(state)) return reply(state);
       return reply(await getTracks(state.qp, args as any));
+    },
+  );
+
+  server.registerTool(
+    "get_playlists",
+    {
+      title: "List playlists",
+      description:
+        "The library's playlist tree, in the order Engine DJ displays it -- taken from the " +
+        "Playlist.nextListId chain, which is where that order actually lives (the PlaylistPath " +
+        "view's `position` column runs the other way). " +
+        "Flat and in pre-order, so reading top to bottom is exactly the sidebar: `depth` and " +
+        "`path` carry the nesting, `parent_id` names the folder. " +
+        "is_folder means the list has child lists (Engine has no folder flag; a folder is a " +
+        "playlist other playlists sit under), so an emptied folder reads as an empty playlist. " +
+        "track_count is entries in that list alone, never rolled up from children, and " +
+        "missing_count is how many of them name a track that is not in this library. " +
+        "`warnings` appears when a link chain is broken or cyclic; nothing is ever dropped " +
+        "from the list because of one. " +
+        LIBRARY_SELECTION_NOTE,
+      inputSchema: { ...GetPlaylistsInput.shape, library: LibraryArg },
+      annotations: RO,
+    },
+    async (args) => {
+      const state = await acquire(args.library);
+      if (isEngineError(state)) return reply(state);
+      return reply(await getPlaylists(state.qp, args as any));
+    },
+  );
+
+  server.registerTool(
+    "get_playlist_tracks",
+    {
+      title: "Get the tracks in a playlist",
+      description:
+        "The tracks of one playlist, in playlist order -- from the PlaylistEntity.nextEntityId " +
+        "chain, not from row ids, so a track dragged up the list comes back where the DJ put it. " +
+        "Name the playlist with playlist_id, or with playlist_name (exactly one of the two). A " +
+        "name that matches several playlists is refused with every candidate's id and full path " +
+        "rather than picked between -- names are unique only within a folder, so pass the full " +
+        "`path` from get_playlists to disambiguate. " +
+        "Each row carries `position`, its 1-based place in the playlist. An entry whose track is " +
+        "not in this library comes back as { position, entry_id, track_id, missing: true } and " +
+        "keeps its slot, so entry_count still matches the playlist's own length; missing_count " +
+        "says how many of those there are. That is ordinary, not corruption -- entries outlive " +
+        "their tracks and arrive from other drives (see audit_library's orphan_entries). " +
+        "Same fields, limit and cursor conventions as search_tracks. " +
+        LIBRARY_SELECTION_NOTE,
+      inputSchema: { ...GetPlaylistTracksInput.shape, library: LibraryArg },
+      annotations: RO,
+    },
+    async (args) => {
+      const state = await acquire(args.library);
+      if (isEngineError(state)) return reply(state);
+      return reply(await getPlaylistTracks(state.qp, args as any));
     },
   );
 
@@ -488,8 +551,9 @@ Tables live in \`m.db\` (attached as \`main\`); the search index lives in \`side
 More than one library can be connected at once — the local one under
 \`~/Music\` and one per USB drive. \`list_libraries\` reports each with a
 \`uuid\` and a \`path\`, and every tool that reads library data
-(\`search_tracks\`, \`get_tracks\`, \`get_track_performance\`,
-\`audit_library\`, \`run_sql\`, \`refresh_index\`) takes an optional
+(\`search_tracks\`, \`get_tracks\`, \`get_playlists\`,
+\`get_playlist_tracks\`, \`get_track_performance\`, \`audit_library\`,
+\`run_sql\`, \`refresh_index\`) takes an optional
 \`library\` argument naming one of them: either the \`uuid\` or the
 \`path\`, in the \`~/...\` form \`list_libraries\` prints or the absolute
 one. A value matching neither comes back as \`library_not_found\` listing
@@ -518,8 +582,6 @@ other.
 - \`Track.path\` is relative to the \`Engine Library\` folder and usually
   contains \`..\`. The SQL function \`abs_path(path)\` resolves it against
   this library's location; the home prefix comes back folded to \`~\`.
-- Playlists are singly linked lists: order lives in \`Playlist.nextListId\`
-  and \`PlaylistEntity.nextEntityId\`, not in any position column.
 - A track's natural key across drives is \`(originDatabaseUuid, originTrackId)\`.
 - \`PerformanceData\`'s blob columns are binary and cannot be read with SQL.
   Engine writes \`quickCues\`, \`loops\`, \`beatData\` and
@@ -528,6 +590,41 @@ other.
   cues": a track with no hot cues still carries a full eight-slot blob.
   \`get_track_performance\` decodes one track's blobs; for the whole library,
   \`side.track_derived.has_cues\` below holds the decoded answer.
+
+## Playlists
+Order is a **singly linked list**, in both directions of the structure, and
+there is no position column anywhere:
+- \`Playlist.nextListId\` orders sibling lists within one \`parentListId\`.
+- \`PlaylistEntity.nextEntityId\` orders the entries within one \`listId\`.
+Both chains terminate at \`0\`.
+
+The schema ships a \`PlaylistPath\` view with a column named \`position\`.
+**Do not use it for display order.** Its \`OrderedList\` CTE anchors on
+\`WHERE nextListId = 0\` and counts upwards from the *tail*, so ordering by
+it yields the sidebar reversed — measured on a real library of 16 playlists,
+\`PlaylistPath\` order is exactly the reverse of the chain, and the chain is
+what Engine DJ draws. \`get_playlists\` and \`get_playlist_tracks\` walk the
+chains; write the same recursive walk if you go via \`run_sql\`, and never
+\`ORDER BY id\` — ids happen to agree with the chain until the first time
+someone drags a track up a playlist.
+
+Nesting is \`Playlist.parentListId\` (\`0\` at the top level). There is no
+folder flag: an Engine folder is just a \`Playlist\` row that other rows
+name as their parent. \`Playlist.isPersisted\` marks a list saved to the
+device rather than a transient one; both values occur on lists Engine
+displays, so nothing is filtered on it. Titles are unique only within a
+parent (\`UNIQUE (title, parentListId)\`), so a bare name can match several
+playlists — the full \`path\` \`get_playlists\` reports is unique.
+
+\`PlaylistEntity.trackId\` may name a track that is not in this library:
+entries outlive their tracks and travel between drives (\`databaseUuid\`
+records which library an entry came from). On the reference library 105 of
+202 entries are such holes. \`audit_library\`'s \`orphan_entries\` counts
+them; \`get_playlist_tracks\` keeps them in place, flagged \`missing\`.
+
+Rule-based **smartlists** live in a separate \`Smartlist\` table, keyed by
+uuid with its own \`nextListUuid\` ordering and a JSON \`rules\` column.
+Nothing here reads it — a smartlist is not reported by \`get_playlists\`.
 
 ## SQL functions
 Registered on the query connection, all deterministic:

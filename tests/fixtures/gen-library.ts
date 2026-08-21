@@ -82,11 +82,56 @@ export function makeLibrary(
   db.exec(`CREATE TABLE PerformanceData (trackId INTEGER PRIMARY KEY, trackData BLOB,
     overviewWaveFormData BLOB, beatData BLOB, quickCues BLOB, loops BLOB,
     thirdPartySourceId INTEGER, activeOnLoadLoops INTEGER)`);
+  // The two UNIQUE constraints are Engine's own, copied verbatim from a real
+  // 3.0.2 library, and they are load-bearing for the playlist fixtures
+  // below: C_NEXT_LIST_ID_UNIQUE_FOR_PARENT is what makes "two sibling
+  // chains both ending at 0" impossible in a real library, so a broken-chain
+  // fixture that ignored it would be testing a shape Engine can never
+  // produce. The triggers Engine also defines are deliberately *not* copied
+  // — they rewrite nextListId on insert to splice new lists into the chain,
+  // which is exactly the behaviour a fixture needs to override to place a
+  // chain by hand. This server never writes to a library, so no code under
+  // test depends on them.
   db.exec(`CREATE TABLE Playlist (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT,
     parentListId INTEGER, isPersisted BOOLEAN, nextListId INTEGER, lastEditTime DATETIME,
-    isExplicitlyExported BOOLEAN)`);
+    isExplicitlyExported BOOLEAN,
+    CONSTRAINT C_NAME_UNIQUE_FOR_PARENT UNIQUE (title, parentListId),
+    CONSTRAINT C_NEXT_LIST_ID_UNIQUE_FOR_PARENT UNIQUE (parentListId, nextListId))`);
   db.exec(`CREATE TABLE PlaylistEntity (id INTEGER PRIMARY KEY AUTOINCREMENT, listId INTEGER,
-    trackId INTEGER, databaseUuid TEXT, nextEntityId INTEGER, membershipReference INTEGER)`);
+    trackId INTEGER, databaseUuid TEXT, nextEntityId INTEGER, membershipReference INTEGER,
+    CONSTRAINT C_NAME_UNIQUE_FOR_LIST UNIQUE (listId, databaseUuid, trackId),
+    FOREIGN KEY (listId) REFERENCES Playlist (id) ON DELETE CASCADE)`);
+  // Engine's own PlaylistPath view, copied verbatim from a real 3.0.2
+  // library. Nothing in src/ reads it — it is here precisely so a test can
+  // demonstrate *why* nothing reads it: its `position` column is the obvious
+  // thing to order by and gives a different answer from the nextListId
+  // chain Engine actually draws. Without the view in the fixture, that claim
+  // could only be asserted against a USB drive.
+  db.exec(`CREATE VIEW PlaylistPath AS
+    WITH RECURSIVE Heirarchy AS (
+      SELECT id AS child, parentListId AS parent, title AS name, 1 AS depth FROM Playlist
+      UNION ALL
+      SELECT child, parentListId AS parent, title AS name, h.depth + 1 AS depth FROM Playlist c
+      JOIN Heirarchy h ON h.parent = c.id
+      ORDER BY depth DESC
+    ),
+    OrderedList AS (
+      SELECT id, nextListId, 1 AS position FROM Playlist WHERE nextListId = 0
+      UNION ALL
+      SELECT c.id, c.nextListId, l.position + 1
+      FROM Playlist c INNER JOIN OrderedList l ON c.nextListId = l.id
+    ),
+    NameConcat AS (
+      SELECT child AS id, GROUP_CONCAT(name, ';') || ';' AS path
+      FROM (SELECT child, name FROM Heirarchy ORDER BY depth DESC)
+      GROUP BY child
+    )
+    SELECT id, path,
+      ROW_NUMBER() OVER (
+        ORDER BY (SELECT COUNT(*) FROM (SELECT * FROM Heirarchy WHERE child = id)) DESC,
+                 (SELECT position FROM OrderedList ol WHERE ol.id = c.id) ASC
+      ) AS position
+    FROM Playlist c LEFT JOIN NameConcat g USING (id)`);
   for (const ix of ["title", "artist", "album", "genre", "key", "rating", "year", "dateAdded", "length"]) {
     db.exec(`CREATE INDEX index_Track_${ix} ON Track(${ix})`);
   }
@@ -142,4 +187,56 @@ export function makeLibrary(
   db.exec("COMMIT");
   db.close();
   return dbPath;
+}
+
+/**
+ * One playlist to write into a fixture, chain links and all.
+ *
+ * Every link is given explicitly, with no defaulting that would quietly
+ * produce a well-formed chain: the whole reason these fixtures exist is that
+ * a *real* library cannot exercise the ordering code. In all ten non-empty
+ * playlists of the reference library, chain order and row-id order are
+ * identical — the tracks were added in order and never reordered — so an
+ * implementation that sorted by `id` instead of walking `nextEntityId` would
+ * pass against real data and start lying the first time a DJ dragged a track
+ * up their playlist. A fixture where the two disagree is the only thing that
+ * can tell those implementations apart.
+ */
+export interface PlaylistSpec {
+  id: number;
+  title: string;
+  /** 0 (the default) is the top level; otherwise the id of the parent list. */
+  parentId?: number;
+  /** Next sibling under the same parent; 0 ends the chain. Required, never guessed. */
+  nextListId: number;
+  isPersisted?: boolean;
+  entries?: { id: number; trackId: number; next: number }[];
+}
+
+/**
+ * Writes playlists and their entries into an existing fixture library.
+ *
+ * Separate from makeLibrary rather than another option on it, so the
+ * hundreds of existing fixtures keep generating byte-identical databases:
+ * this touches no PRNG and runs after the track loop has finished drawing.
+ */
+export function addPlaylists(dbPath: string, specs: PlaylistSpec[]): void {
+  const db = new DatabaseSync(dbPath);
+  const insList = db.prepare(`INSERT INTO Playlist
+    (id, title, parentListId, isPersisted, nextListId, lastEditTime, isExplicitlyExported)
+    VALUES (?,?,?,?,?,?,?)`);
+  const insEntry = db.prepare(`INSERT INTO PlaylistEntity
+    (id, listId, trackId, databaseUuid, nextEntityId, membershipReference)
+    VALUES (?,?,?,?,?,0)`);
+  const uuid = (db.prepare("SELECT uuid FROM Information").get() as { uuid: string }).uuid;
+  db.exec("BEGIN");
+  for (const s of specs) {
+    insList.run(
+      s.id, s.title, s.parentId ?? 0, s.isPersisted === false ? 0 : 1, s.nextListId,
+      new Date().toISOString(), 1,
+    );
+    for (const e of s.entries ?? []) insEntry.run(e.id, s.id, e.trackId, uuid, e.next);
+  }
+  db.exec("COMMIT");
+  db.close();
 }

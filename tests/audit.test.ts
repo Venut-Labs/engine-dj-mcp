@@ -75,6 +75,14 @@ beforeAll(async () => {
       "Duplicate Artist",
       "Duplicate Title",
     );
+    // An orphan entry is one whose *track* is gone, not one whose playlist
+    // is: Engine's own schema puts a FOREIGN KEY on listId (and the fixture
+    // now carries it), so a PlaylistEntity with no Playlist behind it is a
+    // row a real library cannot hold. Give it a list to sit in.
+    raw
+      .prepare(`INSERT INTO Playlist (id, title, parentListId, isPersisted, nextListId)
+                VALUES (1, 'Audit Fixture', 0, 1, 0)`)
+      .run();
     raw
       .prepare(`INSERT INTO PlaylistEntity (id, listId, trackId, databaseUuid) VALUES (12345, 1, 999999, 'x')`)
       .run();
