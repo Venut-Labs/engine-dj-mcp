@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { err, isEngineError, type EngineError } from "../errors.js";
 import { camelotNeighbours } from "../semantics.js";
 import { redactPath } from "../paths.js";
+import { resolvePlaylist } from "../playlists.js";
 import type { QueryProcess } from "../proc/query-client.js";
 
 export const DEFAULT_FIELDS = ["id", "artist", "title", "bpm", "camelot", "rating"] as const;
@@ -69,6 +70,29 @@ export const SearchInput = z.object({
     })
     .optional(),
   rating: z.object({ min: z.number().optional(), max: z.number().optional() }).optional(),
+  /**
+   * Restricts the search to one playlist.
+   *
+   * An object, like every other filter here (`bpm`, `key`, `rating`,
+   * `played`, `added`, `flags`), rather than a flat `playlist_id` /
+   * `playlist_name` pair as get_playlist_tracks uses: this schema's shape is
+   * "one named object per dimension you can narrow on", each grouping its own
+   * alternative ways of expressing that dimension -- exactly what id-or-name
+   * is. Two more top-level keys would put playlist selection at a different
+   * altitude from every other filter and leave no room to grow (an
+   * `exclude` sits naturally inside this object; `playlist_exclude` does
+   * not). get_playlist_tracks is flat for the opposite reason: there the
+   * playlist is the subject of the call, not one filter among eight.
+   *
+   * Ordering is unaffected -- results still come back by relevance or id, not
+   * in playlist order. get_playlist_tracks is the tool that preserves order.
+   */
+  playlist: z
+    .object({
+      id: z.number().int().positive().optional(),
+      name: z.string().min(1).optional(),
+    })
+    .optional(),
   played: z
     .object({
       never: z.boolean().optional(),
@@ -169,7 +193,14 @@ export async function searchTracks(
   qp: QueryProcess,
   raw: SearchInput,
 ): Promise<
-  | { tracks: Record<string, unknown>[]; total?: number; total_capped?: boolean; next_cursor?: string }
+  | {
+      tracks: Record<string, unknown>[];
+      total?: number;
+      total_capped?: boolean;
+      next_cursor?: string;
+      /** Echoed only when the playlist filter was used: which list it resolved to. */
+      playlist?: { id: number; name: string; path: string };
+    }
   | EngineError
 > {
   const input = SearchInput.parse(raw);
@@ -197,6 +228,32 @@ export async function searchTracks(
   if (useFts) {
     filterWhere.push("f.fts_track MATCH ?");
     filterParams.push(sanitizeFtsQuery(input.q!));
+  }
+
+  // Resolved to an id before the SQL is built, so an unknown or ambiguous
+  // name comes back as the same actionable error get_playlist_tracks gives
+  // (naming every candidate), rather than as an empty result set that reads
+  // like "you own nothing at 128 BPM in that playlist".
+  //
+  // The subquery is a semi-join on PlaylistEntity, not a join: a track
+  // appears once in a playlist (UNIQUE (listId, databaseUuid, trackId)), but
+  // an entry may point at a track that is gone, and joining would then be
+  // one more way for row counts to drift. Membership is the whole question
+  // here.
+  let resolvedPlaylist: { id: number; name: string; path: string } | undefined;
+  if (input.playlist) {
+    const resolved = await resolvePlaylist(qp, input.playlist, {
+      id: "playlist.id",
+      name: "playlist.name",
+    });
+    if (isEngineError(resolved)) return resolved;
+    resolvedPlaylist = {
+      id: resolved.playlist.id,
+      name: resolved.playlist.name,
+      path: resolved.playlist.path,
+    };
+    filterWhere.push("t.id IN (SELECT e.trackId FROM main.PlaylistEntity e WHERE e.listId = ?)");
+    filterParams.push(resolved.playlist.id);
   }
 
   if (input.bpm) {
@@ -354,6 +411,7 @@ export async function searchTracks(
 
   return {
     tracks,
+    ...(resolvedPlaylist ? { playlist: resolvedPlaylist } : {}),
     ...(total !== undefined ? { total, total_capped } : {}),
     ...(next_cursor ? { next_cursor } : {}),
   };
