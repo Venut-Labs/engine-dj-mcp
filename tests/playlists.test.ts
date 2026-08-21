@@ -758,6 +758,37 @@ describe("search_tracks: playlist filter", () => {
     expect(narrowed.tracks.map((t) => t.id)).toEqual(expected);
   });
 
+  it("applies to full-text search too, which builds a different FROM clause", async () => {
+    // With `q` set, the query starts from side.fts_track and joins Track in;
+    // without it, Track is the driving table. A membership predicate written
+    // against the wrong alias would be a hard SQL error on exactly one of
+    // those two paths, so both need exercising.
+    const inPlaylist = await searchTracks(qp, {
+      playlist: { id: 11 },
+      fields: ["id", "title"],
+      limit: 200,
+    });
+    if (isEngineError(inPlaylist)) throw new Error(JSON.stringify(inPlaylist));
+    const word = String(inPlaylist.tracks[0]!.title).split(" ")[0]!;
+
+    const searched = await searchTracks(qp, {
+      q: word,
+      playlist: { id: 11 },
+      fields: ["id"],
+      limit: 200,
+    });
+    if (isEngineError(searched)) throw new Error(JSON.stringify(searched));
+    const members = new Set(inPlaylist.tracks.map((t) => t.id));
+    expect(searched.tracks.length).toBeGreaterThan(0);
+    for (const t of searched.tracks) expect(members.has(t.id)).toBe(true);
+
+    // And the same text search outside the playlist reaches more, so the
+    // filter is narrowing rather than the search term doing all the work.
+    const unscoped = await searchTracks(qp, { q: word, fields: ["id"], limit: 200 });
+    if (isEngineError(unscoped)) throw new Error(JSON.stringify(unscoped));
+    expect(unscoped.tracks.length).toBeGreaterThan(searched.tracks.length);
+  });
+
   it("counts only the playlist's members when include_total is asked for", async () => {
     const r = await searchTracks(qp, {
       playlist: { id: 20 },
