@@ -18,9 +18,14 @@ export async function getTrackPerformance(qp: QueryProcess, raw: PerformanceInpu
   if (!parsed.success) return err("invalid_argument", "id must be a positive integer");
   const { id } = parsed.data;
 
+  // Track.length carries the duration the waveform summary reports; the
+  // waveform blob's own point spacing is unverified, so a duration derived
+  // from its byte count would be a guess dressed as a measurement. LEFT JOIN
+  // so a PerformanceData row whose Track is missing still decodes.
   const res = await qp.run(
-    `SELECT quickCues, loops, beatData, overviewWaveFormData
-     FROM PerformanceData WHERE trackId = ?`,
+    `SELECT p.quickCues, p.loops, p.beatData, p.overviewWaveFormData, t.length
+     FROM PerformanceData p LEFT JOIN Track t ON t.id = p.trackId
+     WHERE p.trackId = ?`,
     [id],
   );
   if (isEngineError(res)) return res;
@@ -31,7 +36,7 @@ export async function getTrackPerformance(qp: QueryProcess, raw: PerformanceInpu
   }
 
   const row = res.rows[0]!;
-  const [quickCues, loops, beatData, overviewWaveFormData] = row;
+  const [quickCues, loops, beatData, overviewWaveFormData, length] = row;
   return {
     track_id: id,
     ...decodePerformance({
@@ -39,6 +44,7 @@ export async function getTrackPerformance(qp: QueryProcess, raw: PerformanceInpu
       loops: asBuffer(loops),
       beatData: asBuffer(beatData),
       overviewWaveFormData: asBuffer(overviewWaveFormData),
+      durationSeconds: typeof length === "number" ? length : null,
     }),
   };
 }

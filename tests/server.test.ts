@@ -292,6 +292,21 @@ describe("createServer", () => {
     await client.close();
   });
 
+  it("warns, in get_track_performance's own description, that the layouts are unvalidated", async () => {
+    // The decoders return status: "ok" for anything that merely parses, and
+    // two of the four layouts are known wrong against real Engine data. A
+    // model that never sees the caveat repeats fabricated cue positions to
+    // the user as fact, so the caveat has to live where the model reads it,
+    // not only in a source comment.
+    const { client } = await connectedClient([libDir], libSidecars);
+    const { tools } = await client.listTools();
+    const perf = tools.find((t) => t.name === "get_track_performance")!;
+    expect(perf.description).toMatch(/reverse-engineered/i);
+    expect(perf.description).toMatch(/not been validated against real Engine DJ data/i);
+    expect(perf.description).toMatch(/unverified/);
+    await client.close();
+  });
+
   it("exposes engine://schema without the stale bpm*100 claim, and states the camelot mapping as fact", async () => {
     const { client } = await connectedClient([libDir], libSidecars);
     const { contents } = await client.readResource({ uri: "engine://schema" });

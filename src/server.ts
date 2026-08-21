@@ -163,7 +163,15 @@ export async function createServer(
     "get_track_performance",
     {
       title: "Get cues, loops and beatgrid",
-      description: "Decode PerformanceData for one track. Each field carries its own decode status.",
+      description:
+        "Decode PerformanceData for one track. Each field carries its own decode status. " +
+        "IMPORTANT: the cue, loop and beatgrid binary layouts are reverse-engineered and have " +
+        "NOT been validated against real Engine DJ data -- two of them are known to be wrong " +
+        "today. Every decoded field is marked layout: \"unverified\" for this reason: " +
+        "status: \"ok\" means only that the bytes parsed, not that the values are correct, so " +
+        "cue positions, loop bounds and beat anchors may be wrong or unavailable and must not " +
+        "be reported to a user as fact. Cues, loops and beat anchors are capped at 64 items; " +
+        "total gives the full count and truncated says whether the cap was hit.",
       inputSchema: PerformanceInput.shape,
       annotations: RO,
     },

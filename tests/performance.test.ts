@@ -93,13 +93,29 @@ function makeWellFormedLibrary(dir: string): { dbPath: string; db: DatabaseSync 
 
 describe("get_track_performance", () => {
   it("returns a per-field status instead of failing the call", async () => {
-    // The fixture stores zero-filled blobs, which are not valid frames.
+    // The fixture is deterministic (seeded PRNG): track 1 carries a
+    // 128-byte zero-filled quickCues and a 64-byte zero-filled beatData --
+    // neither is a valid qCompress frame -- and no loops or waveform at all.
+    // Asserting the single expected status per field, rather than
+    // "one of ok/empty/corrupt/unsupported", is the difference between
+    // covering the behaviour and covering nothing: the loose form passes
+    // whatever the decoders do.
     const r = await getTrackPerformance(qp, { id: 1 });
     expect(isEngineError(r)).toBe(false);
     if (isEngineError(r)) return;
     expect(r.track_id).toBe(1);
-    for (const key of ["cues", "loops", "beatgrid", "waveform_summary"] as const) {
-      expect(["ok", "empty", "corrupt", "unsupported"]).toContain((r as any)[key].status);
+    expect((r as any).cues.status).toBe("corrupt");
+    expect((r as any).beatgrid.status).toBe("corrupt");
+    expect((r as any).loops.status).toBe("empty");
+    expect((r as any).waveform_summary.status).toBe("empty");
+  });
+
+  it("marks the reverse-engineered layouts as unverified on every field", async () => {
+    const r = await getTrackPerformance(qp, { id: 1 });
+    expect(isEngineError(r)).toBe(false);
+    if (isEngineError(r)) return;
+    for (const key of ["cues", "loops", "beatgrid"] as const) {
+      expect((r as any)[key].layout, key).toBe("unverified");
     }
   });
 
@@ -149,6 +165,57 @@ describe("get_track_performance", () => {
     }
   });
 
+  it("bounds a huge cue list and reports the track duration with the waveform", async () => {
+    // 300 cues is well inside the 512 parse cap but far outside anything
+    // worth putting in an LLM's context -- and reply() serialises the
+    // payload twice. A wrong layout guess yielding a large-but-plausible
+    // count is exactly how this happens in the field.
+    const tempDir = mkdtempSync(join(tmpdir(), "edj-perf-bounded-"));
+    try {
+      const dbPath = makeLibrary(tempDir, { tracks: 2 });
+      const db = new DatabaseSync(dbPath);
+      const many = Array.from({ length: 300 }, (_, i) => ({
+        label: `cue ${i}`,
+        position: i * 1000,
+        colour: i,
+      }));
+      db.prepare(
+        "UPDATE PerformanceData SET quickCues = ?, overviewWaveFormData = ? WHERE trackId = 1",
+      ).run(cueFrame(many), qCompress(Buffer.from([0, 64, 128, 255, 32, 16, 8, 4])));
+      // Track.length for the seeded fixture's id 1 is 389 seconds.
+      const trackLength = Number(
+        (db.prepare("SELECT length FROM Track WHERE id = 1").get() as any).length,
+      );
+      db.close();
+
+      const tempQp = new QueryProcess(dbPath, null, 5000);
+      try {
+        const r = await getTrackPerformance(tempQp, { id: 1 });
+        expect(isEngineError(r)).toBe(false);
+        if (isEngineError(r)) return;
+
+        expect((r as any).cues.status).toBe("ok");
+        expect((r as any).cues.items).toHaveLength(64);
+        expect((r as any).cues.total).toBe(300);
+        expect((r as any).cues.truncated).toBe(true);
+
+        const wave = (r as any).waveform_summary;
+        expect(wave.status).toBe("ok");
+        // peaks must count peak values, not decompressed bytes: the profile
+        // has 8 bytes across 32 buckets, so peaks is 8 either way here --
+        // pin it to profile.length so the two can never disagree.
+        expect(wave.peaks).toBe(wave.profile.length);
+        expect(wave.bytes).toBe(8);
+        expect(wave.duration_seconds).toBe(trackLength);
+        expect(wave.duration_seconds).toBeGreaterThan(0);
+      } finally {
+        tempQp.dispose();
+      }
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("preserves per-field status for mixed valid and corrupt data", async () => {
     // Create a temporary library with mixed well-formed and corrupt data
     const tempDir = mkdtempSync(join(tmpdir(), "edj-perf-mixed-"));
@@ -168,13 +235,16 @@ describe("get_track_performance", () => {
         expect((r as any).cues.items).toHaveLength(1);
         expect((r as any).cues.items[0].label).toBe("Intro");
 
-        // Loops should be corrupt or unsupported, not fail the entire call
-        const loopsStatus = (r as any).loops.status;
-        expect(["corrupt", "unsupported"]).toContain(loopsStatus);
+        // The loops blob is a 4-byte frame, below qUncompress's 5-byte
+        // minimum, so this is "corrupt" and nothing else. The fixture is
+        // deterministic, so a range of accepted statuses here asserted
+        // nothing.
+        expect((r as any).loops.status).toBe("corrupt");
+        expect((r as any).loops.detail).toMatch(/frame too short/i);
 
-        // Beatgrid should be corrupt or empty (zero-filled from fixture)
-        const beatgridStatus = (r as any).beatgrid.status;
-        expect(["corrupt", "empty", "unsupported"]).toContain(beatgridStatus);
+        // Track 2's beatData is the generator's 64 zero bytes, untouched by
+        // makeWellFormedLibrary: also a specific, deterministic outcome.
+        expect((r as any).beatgrid.status).toBe("corrupt");
 
         // The entire call should succeed even though loops failed
         expect(r).toHaveProperty("track_id");

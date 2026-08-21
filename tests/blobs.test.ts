@@ -214,10 +214,20 @@ describe("decoders never throw", () => {
   it("summarises a well-formed waveform frame into a bounded, non-raw profile", () => {
     // 8 raw bytes, bucket size 2 (buckets=4): profile[i] = max(bytes[2i],bytes[2i+1])/255
     const raw = Buffer.from([10, 250, 0, 5, 255, 0, 128, 128]);
-    const r = summariseWaveform(qCompress(raw), 4);
+    const r = summariseWaveform(qCompress(raw), 4, 372);
     expect(r.status).toBe("ok");
     if (r.status !== "ok") return;
-    expect(r.peaks).toBe(8);
+    // peaks counts peak values, which is what the name says. It used to
+    // report the decompressed byte count (8 here) under that name -- a units
+    // error travelling straight into the model's context. The byte count is
+    // still available, under a name that matches it.
+    expect(r.peaks).toBe(4);
+    expect(r.peaks).toBe(r.profile.length);
+    expect(r.bytes).toBe(8);
+    // The spec's waveform_summary is duration + peak count + coarse profile;
+    // the duration comes from Track.length, since the blob's own point
+    // spacing is unverified.
+    expect(r.duration_seconds).toBe(372);
     expect(r.profile).toEqual([
       Math.round((250 / 255) * 100) / 100,
       Math.round((5 / 255) * 100) / 100,
@@ -315,5 +325,82 @@ describe("decoders never throw", () => {
     expect(r.loops.status).toBe("empty");
     expect(["corrupt", "unsupported"]).toContain(r.beatgrid.status);
     expect(r.waveform_summary.status).toBe("ok");
+  });
+});
+
+describe("bounded responses", () => {
+  // The 512/8192 parse caps are sanity bounds on a length field read out of
+  // the blob; they are not response bounds. A single wrong layout guess that
+  // yields a plausible-looking count is exactly how 8192 fabricated anchors
+  // reach an LLM's context -- and reply() serialises the payload twice.
+  it("returns at most 64 cues, with the true total alongside", () => {
+    const many = Array.from({ length: 300 }, (_, i) => ({
+      label: `cue ${i}`,
+      position: i * 1000,
+      colour: i,
+    }));
+    const r = decodeCues(cueFrame(many));
+    expect(r.status).toBe("ok");
+    if (r.status !== "ok") return;
+    expect(r.items).toHaveLength(64);
+    expect(r.total).toBe(300);
+    expect(r.truncated).toBe(true);
+    // The prefix, not an arbitrary window: a caller has to know which 64.
+    expect(r.items[0]!.label).toBe("cue 0");
+    expect(r.items[63]!.label).toBe("cue 63");
+  });
+
+  it("returns at most 64 beat anchors, with the true total alongside", () => {
+    const many = Array.from({ length: 5000 }, (_, i) => ({ sample: i * 22050, beat: i }));
+    const r = decodeBeatgrid(beatgridFrame(many));
+    expect(r.status).toBe("ok");
+    if (r.status !== "ok") return;
+    expect(r.items).toHaveLength(64);
+    expect(r.total).toBe(5000);
+    expect(r.truncated).toBe(true);
+  });
+
+  it("does not claim truncation when everything fits", () => {
+    const r = decodeLoops(loopFrame([{ label: "Main", start: 1, end: 2 }]));
+    expect(r.status).toBe("ok");
+    if (r.status !== "ok") return;
+    expect(r.total).toBe(1);
+    expect(r.truncated).toBe(false);
+    expect(r.items).toHaveLength(1);
+  });
+});
+
+describe("layout honesty", () => {
+  // Two of these four layouts are known wrong against real Engine data
+  // today, and a fixed-slot quickCues array whose leading u32 happens to be
+  // small parses into finite floats and returns "ok" with fabricated
+  // positions. The uncertainty has to travel with the data.
+  it("marks every cue/loop/beatgrid result unverified, whatever its status", () => {
+    const results = [
+      decodeCues(cueFrame([{ label: "Intro", position: 1, colour: 0 }])), // ok
+      decodeCues(null), // empty
+      decodeLoops(Buffer.from([0, 0, 0, 1])), // corrupt (frame too short)
+      decodeBeatgrid(Buffer.concat([u32(4), deflateSync(Buffer.alloc(0))])), // corrupt
+      decodeCues(qCompress(u32(99999))), // unsupported cue count
+    ];
+    for (const r of results) {
+      expect(r.layout, JSON.stringify(r)).toBe("unverified");
+    }
+    // Non-vacuous: the set above really does span all four statuses.
+    expect(new Set(results.map((r) => r.status))).toEqual(
+      new Set(["ok", "empty", "corrupt", "unsupported"]),
+    );
+  });
+
+  it("carries the marker through decodePerformance onto every decoded field", () => {
+    const r = decodePerformance({
+      quickCues: cueFrame([{ label: "Intro", position: 100, colour: 1 }]),
+      loops: null,
+      beatData: null,
+      overviewWaveFormData: null,
+    });
+    expect(r.cues.layout).toBe("unverified");
+    expect(r.loops.layout).toBe("unverified");
+    expect(r.beatgrid.layout).toBe("unverified");
   });
 });
