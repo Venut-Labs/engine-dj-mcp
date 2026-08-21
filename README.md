@@ -15,7 +15,9 @@ library.
   I not played in six months?").
 - **Track lookup** (`get_tracks`) — full metadata for specific track ids.
 - **Cues, loops and beatgrids** (`get_track_performance`) — decoded from
-  Engine's `PerformanceData`, with a per-field decode status.
+  Engine's `PerformanceData`, with a per-field decode status. The binary
+  layouts are reverse-engineered and **not yet validated against real Engine
+  data** — see [Limitations](#limitations) before trusting these values.
 - **Collection audit** (`audit_library`) — missing files, unanalysed tracks,
   tracks without cues or beatgrids, duplicates, suspicious tempos, orphaned
   playlist entries.
@@ -45,6 +47,34 @@ server will never open the library writably to "fix" it for you — that
 would break the one guarantee this project makes. It reports
 `library_needs_recovery` instead and asks you to launch Engine DJ once so it
 can recover the library itself.
+
+## Limitations
+
+Read this before deciding what to trust.
+
+- **Cue, loop and beatgrid layouts are reverse-engineered and not yet
+  validated against real Engine data.** They were derived from reading the
+  Engine binary and from third-party projects, and no byte from a real
+  library has been run through them. Every decoded field is marked
+  `layout: "unverified"` for this reason, and a `status: "ok"` means only
+  that the bytes parsed — **not** that the values are correct. Cue positions,
+  loop bounds and beat anchors may be wrong, or may come back as `corrupt`
+  or `unsupported`. Do not act on them as facts. Everything else the server
+  reports — titles, artists, tempo, key, ratings, play history, file paths —
+  is read straight from the database and carries no such caveat.
+- **It never writes to your library.** Not to add a cue, not to fix a tag,
+  not even to recover a journal Engine DJ left behind. The connection is
+  read-only at the kernel level, so a write is refused by SQLite itself
+  rather than by a rule this code could get wrong.
+- **It does not read play history.** `Track.timeLastPlayed` is used to answer
+  "what have I not played in six months?", but the separate Engine history
+  database — individual sessions, decks, what followed what — is not opened
+  at all.
+- **It does not build set lists**, reorder playlists, or suggest transitions.
+  It answers questions about the collection; the mixing is yours.
+- **Schema 3.0.0 through 3.0.2 only** (Engine DJ 4.5 and 5.x). Older and
+  newer libraries are listed with their version and reported as unsupported
+  rather than read on a guess.
 
 ## Requirements
 
