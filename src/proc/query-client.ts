@@ -23,6 +23,30 @@ export interface QueryResult {
   rows: unknown[][];
 }
 
+/**
+ * Extra attempts after the first, per the spec's "busy_timeout = 3000 plus
+ * three attempts with jitter". Engine's own write transactions are usually
+ * short, so a lock that outlasts one 3 s busy_timeout often clears well
+ * inside the next -- this converts a refusal into an answer more often than
+ * not. It is bounded on purpose: an unbounded retry against an Engine DJ
+ * that is mid-import would hang the tool call instead of reporting
+ * library_busy with a retry_after_ms the model can act on.
+ */
+const BUSY_RETRIES = 2;
+
+/**
+ * Jitter, not a fixed delay: several tools retrying in lockstep would
+ * otherwise re-collide on the same lock every time. Short (50-100 ms, then
+ * 100-200 ms) because the real waiting already happened inside SQLite's own
+ * busy_timeout; this only staggers the next attempt.
+ */
+function busyBackoffMs(attempt: number): number {
+  const base = 50 * 2 ** attempt;
+  return base + Math.random() * base;
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 /** Counterpart to encodeValue in the worker: rebuild BLOBs framed as base64. */
 function decodeValue(v: unknown): unknown {
   if (v && typeof v === "object" && typeof (v as any).__blob === "string") {
@@ -151,15 +175,54 @@ export class QueryProcess {
     });
   }
 
-  async run(sql: string, params: unknown[] = []): Promise<QueryResult | EngineError> {
-    const m = await this.#send({ kind: "query", sql, params });
-    if ("error" in m) return m as EngineError;
-    if (!m.ok) {
-      return /database is locked|busy/i.test(m.message)
-        ? err("library_busy", "Engine DJ is writing to the library right now", { retry_after_ms: 5000 })
-        : err("invalid_argument", "The SQL query failed", { detail: m.message });
+  /**
+   * The plan for a query that had to be killed. EXPLAIN QUERY PLAN does not
+   * execute anything (measured at ~0.02 ms), so it cannot itself hang, and
+   * it is the one piece of information that tells a model *why* its query
+   * was too slow -- "SCAN Track" against "SEARCH Track USING INDEX" is
+   * actionable in a way that "exceeded 10000 ms" is not.
+   *
+   * Best effort: the previous child was SIGKILLed, so this respawns, and
+   * anything unexplainable (a PRAGMA, a syntax error) simply yields no plan
+   * rather than replacing the timeout with a second failure.
+   */
+  async #queryPlan(sql: string, params: unknown[]): Promise<string | undefined> {
+    try {
+      const m = await this.#send({ kind: "query", sql: `EXPLAIN QUERY PLAN ${sql}`, params });
+      if (!m || "error" in m || !m.ok || !Array.isArray(m.rows) || !m.rows.length) return undefined;
+      // EXPLAIN QUERY PLAN's last column is the human-readable `detail`.
+      return m.rows
+        .map((row: unknown[]) => String(row[row.length - 1]))
+        .join("; ");
+    } catch {
+      return undefined;
     }
-    return { columns: m.columns, rows: m.rows.map((row: unknown[]) => row.map(decodeValue)) };
+  }
+
+  async run(sql: string, params: unknown[] = []): Promise<QueryResult | EngineError> {
+    for (let attempt = 0; ; attempt++) {
+      const m = await this.#send({ kind: "query", sql, params });
+      if ("error" in m) {
+        if (m.error === "query_timeout") {
+          const plan = await this.#queryPlan(sql, params);
+          return plan ? { ...(m as EngineError), detail: plan } : (m as EngineError);
+        }
+        return m as EngineError;
+      }
+      if (!m.ok) {
+        if (!/database is locked|busy/i.test(m.message)) {
+          return err("invalid_argument", "The SQL query failed", { detail: m.message });
+        }
+        if (attempt < BUSY_RETRIES) {
+          await sleep(busyBackoffMs(attempt));
+          continue;
+        }
+        return err("library_busy", "Engine DJ is writing to the library right now", {
+          retry_after_ms: 5000,
+        });
+      }
+      return { columns: m.columns, rows: m.rows.map((row: unknown[]) => row.map(decodeValue)) };
+    }
   }
 
   /**
