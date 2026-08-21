@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { existsSync, openSync, readSync, closeSync } from "node:fs";
 import { registerFunctions } from "../semantics.js";
-import { err } from "../errors.js";
+import { EngineErrorException, libraryNeedsRecovery } from "../errors.js";
 
 /**
  * SQLite's rollback-journal header magic (see aJournalMagic in sqlite3
@@ -85,12 +85,12 @@ export function openQueryConnection(mdbPath: string, sidecar: string | null): Da
     // Never open the database writable to roll the journal forward
     // ourselves: writing to the user's library is the one thing this
     // project promises never to do. v1 detects and explains instead.
-    const { message } = err(
-      "library_needs_recovery",
-      "The Engine library was closed uncleanly and has an unrecovered journal. " +
-        "Launch Engine DJ once so it can recover the library, then retry.",
-    );
-    throw new Error(message);
+    //
+    // The structured error is carried by the exception rather than
+    // flattened to its message: this runs inside the forked worker, where
+    // returning is not an option, and the parent used to re-stat the disk to
+    // rediscover what this function already knew.
+    throw new EngineErrorException(libraryNeedsRecovery());
   }
   const db = new DatabaseSync(mdbPath, { readOnly: true });
   db.exec("PRAGMA busy_timeout = 3000");

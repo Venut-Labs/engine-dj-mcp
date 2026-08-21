@@ -13,7 +13,7 @@ import { auditLibrary, AuditInput, AUDIT_CHECKS } from "./tools/audit.js";
 import { runSql, RunSqlInput } from "./tools/sql.js";
 import { listLibraries } from "./tools/libraries.js";
 import { refreshIndex } from "./tools/refresh.js";
-import { err, isEngineError } from "./errors.js";
+import { err, isEngineError, libraryNeedsRecovery } from "./errors.js";
 
 const RO = { readOnlyHint: true, destructiveHint: false, idempotentHint: true } as const;
 
@@ -49,10 +49,20 @@ export function findHotJournalCandidate(roots: string[]): string | null {
   return null;
 }
 
+/**
+ * An McpServer that also owns a forked query process, and can therefore be
+ * shut down rather than merely disconnected. Nothing else in this server
+ * holds an OS resource, so `dispose()` is the whole of it.
+ */
+export type EngineDjMcpServer = McpServer & {
+  /** Kills the query child. Idempotent, and also run by close(). */
+  dispose(): void;
+};
+
 export async function createServer(
   opts: { roots?: string[]; sidecarBaseDir?: string } = {},
-): Promise<McpServer> {
-  const server = new McpServer({ name: "engine-dj-mcp", version: "0.1.0" });
+): Promise<EngineDjMcpServer> {
+  const server = new McpServer({ name: "engine-dj-mcp", version: "0.1.0" }) as EngineDjMcpServer;
 
   const libs = discoverLibraries(opts.roots);
   // Prefer a library whose schema this project actually understands; fall
@@ -71,11 +81,7 @@ export async function createServer(
   const noLibraryError = () => {
     const hotPath = findHotJournalCandidate(opts.roots ?? defaultRoots());
     return hotPath
-      ? err(
-          "library_needs_recovery",
-          "The Engine library was closed uncleanly and has an unrecovered journal. " +
-            "Launch Engine DJ once so it can recover the library, then retry.",
-        )
+      ? libraryNeedsRecovery()
       : err("library_not_found", "No supported Engine DJ library was found");
   };
 
@@ -252,6 +258,28 @@ export async function createServer(
       return reply(await refreshIndex(mgr));
     },
   );
+
+  /**
+   * There was previously no way to shut this down at all: createServer
+   * forked a query child and handed back an McpServer whose close() knows
+   * only about the transport, so the child outlived every caller -- a leak
+   * in tests, and in a host that restarts its MCP servers a leak of one
+   * process per restart.
+   *
+   * close() is wrapped rather than replaced so a client disconnecting
+   * through the normal MCP path also releases the child; dispose() is
+   * exposed for a caller that owns the server directly. QueryProcess#kill
+   * tolerates being called with no live child, so both are idempotent.
+   */
+  const closeTransport = server.close.bind(server);
+  server.dispose = () => qp?.dispose();
+  server.close = async () => {
+    try {
+      await closeTransport();
+    } finally {
+      qp?.dispose();
+    }
+  };
 
   return server;
 }

@@ -1,10 +1,10 @@
 // tests/server.test.ts
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
 import { mkdtempSync, rmSync, existsSync, chmodSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { fork } from "node:child_process";
+import { fork, execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -246,12 +246,33 @@ describe("findHotJournalCandidate", () => {
  * developer's actual home directory; callers point it inside their own
  * temp dir so cleanup is a single rmSync.
  */
+const openServers: { dispose(): void }[] = [];
+
 async function connectedClient(roots: string[], sidecarBaseDir: string) {
   const server = await createServer({ roots, sidecarBaseDir });
+  // Each createServer forks a query child; without this every test in this
+  // file that only closed its client left one behind for the rest of the run.
+  openServers.push(server);
   const client = new Client({ name: "test-client", version: "0" });
   const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   return { server, client };
+}
+
+afterEach(() => {
+  for (const s of openServers.splice(0)) s.dispose();
+});
+
+/** Live query-worker child processes serving a specific library file. */
+function workerPids(mdbPath: string): number[] {
+  return execFileSync("ps", ["-eo", "pid=,args=", "-ww"], {
+    encoding: "utf8",
+    maxBuffer: 32 * 1024 * 1024,
+  })
+    .split("\n")
+    .filter((line) => line.includes("query-worker.js") && line.includes(mdbPath))
+    .map((line) => Number(line.trim().split(/\s+/)[0]))
+    .filter((pid) => Number.isFinite(pid));
 }
 
 describe("createServer", () => {
@@ -478,6 +499,55 @@ describe("createServer", () => {
       rmSync(hotDir, { recursive: true, force: true });
     }
   }, 20_000);
+
+  it("kills its query child on close, instead of leaking one process per server", async () => {
+    // createServer forks a child and previously had no shutdown path at all,
+    // so nothing -- not close(), not garbage collection -- ever released it.
+    // Matching on this library's own unique temp path keeps the count exact
+    // even while other suites have their own workers running.
+    const ownDir = mkdtempSync(join(tmpdir(), "edj-srv-shutdown-"));
+    try {
+      const ownMdb = makeLibrary(ownDir, { tracks: 5 });
+      expect(workerPids(ownMdb)).toEqual([]); // nothing before
+
+      const { server, client } = await connectedClient([ownDir], join(ownDir, "sidecars"));
+      const r = await client.callTool({ name: "search_tracks", arguments: { limit: 1 } });
+      expect(r.isError).toBeFalsy(); // the child really is up and serving
+
+      const alive = workerPids(ownMdb);
+      // Proves the matcher works; without this the "gone afterwards"
+      // assertion below would pass against a matcher that finds nothing.
+      expect(alive.length).toBe(1);
+
+      await client.close();
+      await server.close();
+
+      // SIGKILL is delivered synchronously to the parent's bookkeeping, but
+      // reaping is not instant; give the OS a moment before looking.
+      for (let i = 0; i < 50 && workerPids(ownMdb).length > 0; i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(workerPids(ownMdb)).toEqual([]);
+
+      // ps stops matching a dead process's argv, so confirm the pid itself
+      // is no longer a running process: either fully reaped (no ps row) or
+      // a zombie (state Z), never still executing. `process.kill(pid, 0)`
+      // cannot make this distinction -- it succeeds against a zombie too.
+      // ps exits non-zero (and execFileSync throws) when the pid is gone
+      // entirely, which is the strongest form of the outcome we want.
+      let state = "";
+      try {
+        state = execFileSync("ps", ["-o", "stat=", "-p", String(alive[0])], {
+          encoding: "utf8",
+        }).trim();
+      } catch {
+        state = "";
+      }
+      expect(state === "" || state.startsWith("Z"), `pid ${alive[0]} state ${state}`).toBe(true);
+    } finally {
+      rmSync(ownDir, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it("reports unsupported_schema, not library_not_found, when the only library's schema is too old", async () => {
     const oldDir = mkdtempSync(join(tmpdir(), "edj-srv-old-"));

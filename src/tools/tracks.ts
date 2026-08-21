@@ -22,6 +22,11 @@ export async function getTracks(
   }
   const { ids, redact_paths } = parsed.data;
   const requestedFields = parsed.data.fields ?? [...DEFAULT_FIELDS];
+  // Matches search.ts: an empty projection builds "SELECT , t.id ..." and
+  // fails as a raw SQLite syntax error instead of a named argument problem.
+  // Omitting `fields` already means "the default projection", so an empty
+  // list has no second meaning to honour.
+  if (requestedFields.length === 0) return err("invalid_argument", "No fields requested");
   const unknownFields = requestedFields.filter((f) => !(f in FIELD_SQL));
   if (unknownFields.length) {
     return err("invalid_argument", `Unknown field(s): ${unknownFields.join(", ")}`, {

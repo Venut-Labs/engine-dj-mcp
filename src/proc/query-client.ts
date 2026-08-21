@@ -2,8 +2,7 @@
 import { fork, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join, sep } from "node:path";
-import { err, type EngineError } from "../errors.js";
-import { hasHotJournal } from "../store/connections.js";
+import { err, EngineErrorException, type EngineError } from "../errors.js";
 
 /**
  * Tests run against src/ under vitest, whose TypeScript transform does not
@@ -87,8 +86,16 @@ export class QueryProcess {
     return new Promise((resolve, reject) => {
       const onMessage = (m: any) => {
         cleanup();
-        if (m && m.ready === false) reject(new Error(m.message ?? "query worker failed to start"));
-        else resolve(child);
+        if (m && m.ready === false) {
+          // The worker forwards the structured error when it has one, so a
+          // hot journal arrives here as library_needs_recovery rather than
+          // as a string this side has to re-diagnose.
+          reject(
+            m.engineError
+              ? new EngineErrorException(m.engineError as EngineError)
+              : new Error(m.message ?? "query worker failed to start"),
+          );
+        } else resolve(child);
       };
       const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
         cleanup();
@@ -136,15 +143,12 @@ export class QueryProcess {
     try {
       child = await this.#ensure();
     } catch (e) {
-      // openQueryConnection throws only a message for a hot journal; re-derive
-      // the condition from disk rather than string-matching that message.
-      if (hasHotJournal(this.mdbPath)) {
-        return err(
-          "library_needs_recovery",
-          "The Engine library was closed uncleanly and has an unrecovered journal. " +
-            "Launch Engine DJ once so it can recover the library, then retry.",
-        );
-      }
+      // The worker forwards its structured error across IPC, so a hot
+      // journal is already library_needs_recovery by the time it lands
+      // here. This used to re-stat the journal file to work out what the
+      // worker had already determined -- a second, independent diagnosis
+      // that could disagree with the first.
+      if (e instanceof EngineErrorException) return e.engineError;
       return err("query_process_crashed", "Could not start the query process", { detail: String(e) });
     }
     const id = ++this.#seq;

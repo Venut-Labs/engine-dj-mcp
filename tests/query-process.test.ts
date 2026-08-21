@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { fork } from "node:child_process";
+import { fork, execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { makeLibrary } from "./fixtures/gen-library.js";
 import { QueryProcess } from "../src/proc/query-client.js";
@@ -85,6 +85,52 @@ describe("query process", () => {
     expect(Buffer.isBuffer(r.rows[0]![0])).toBe(true);
     expect((r.rows[0]![0] as Buffer).length).toBeGreaterThan(0);
   });
+});
+
+describe("spawn memoisation", () => {
+  /** Live query-worker child processes serving a specific library file. */
+  function workerPids(mdbPath: string): number[] {
+    return execFileSync("ps", ["-eo", "pid=,args=", "-ww"], {
+      encoding: "utf8",
+      maxBuffer: 32 * 1024 * 1024,
+    })
+      .split("\n")
+      .filter((line) => line.includes("query-worker.js") && line.includes(mdbPath))
+      .map((line) => Number(line.trim().split(/\s+/)[0]))
+      .filter((pid) => Number.isFinite(pid));
+  }
+
+  it("forks exactly one child for concurrent first calls, not one per call", async () => {
+    // #ensure stores the spawn promise before awaiting anything, so several
+    // run() calls that all see no live child share one fork. Nothing else
+    // in the suite would notice that memoisation regressing: every call
+    // would still return the right answer, while leaking a child process
+    // per concurrent call, silently. A fresh library file per test makes
+    // the process count exact regardless of what else is running.
+    const ownDir = mkdtempSync(join(tmpdir(), "edj-proc-single-"));
+    try {
+      const ownMdb = makeLibrary(ownDir, { tracks: 20 });
+      expect(workerPids(ownMdb)).toEqual([]);
+
+      const own = new QueryProcess(ownMdb, null, 10_000);
+      try {
+        // Fired together, before any of them can have finished spawning.
+        const results = await Promise.all(
+          Array.from({ length: 8 }, () => own.run("SELECT COUNT(*) AS c FROM Track")),
+        );
+        for (const r of results) {
+          expect(isEngineError(r), JSON.stringify(r)).toBe(false);
+          if (isEngineError(r)) return;
+          expect(Number(r.rows[0]![0])).toBe(20);
+        }
+        expect(workerPids(ownMdb).length).toBe(1);
+      } finally {
+        own.dispose();
+      }
+    } finally {
+      rmSync(ownDir, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
 
 describe("library_busy retries", () => {

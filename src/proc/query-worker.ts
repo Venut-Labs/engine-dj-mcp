@@ -4,6 +4,7 @@
 // plain compiled JS — see query-client.ts for why the TypeScript source is
 // never forked directly.
 import { openQueryConnection, reattachSidecar } from "../store/connections.js";
+import { EngineErrorException } from "../errors.js";
 import type { DatabaseSync } from "node:sqlite";
 
 interface Request {
@@ -33,13 +34,16 @@ try {
   opened = true;
 } catch (e) {
   // openQueryConnection throws (e.g. a hot journal); report it back instead
-  // of crashing with a bare stack trace, so the parent can map it to a
-  // structured error rather than guessing from an exit code. process.send()
+  // of crashing with a bare stack trace. When it threw a structured
+  // EngineError, forward the whole thing rather than just its message: the
+  // parent used to re-derive the condition by re-stat'ing the journal file,
+  // which could disagree with what this process actually saw. process.send()
   // is asynchronous, so exit only from its callback -- calling process.exit()
   // right after send() can drop the message before it reaches the pipe.
   const message = (e as Error).message;
+  const engineError = e instanceof EngineErrorException ? e.engineError : undefined;
   if (process.send) {
-    process.send({ ready: false, message }, () => process.exit(1));
+    process.send({ ready: false, message, engineError }, () => process.exit(1));
   } else {
     process.exit(1);
   }

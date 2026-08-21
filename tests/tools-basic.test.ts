@@ -9,6 +9,7 @@ import { readLibraryInfo } from "../src/discovery.js";
 import { QueryProcess } from "../src/proc/query-client.js";
 import { IndexManager } from "../src/store/index-manager.js";
 import { getTracks } from "../src/tools/tracks.js";
+import { searchTracks } from "../src/tools/search.js";
 import { listLibraries } from "../src/tools/libraries.js";
 import { refreshIndex } from "../src/tools/refresh.js";
 import { isEngineError } from "../src/errors.js";
@@ -90,6 +91,24 @@ describe("get_tracks", () => {
 
   it("rejects an empty id list", async () => {
     expect(isEngineError(await getTracks(qp, { ids: [] }))).toBe(true);
+  });
+
+  it("rejects an empty fields list the same way search_tracks does", async () => {
+    // Without the check, the projection builds "SELECT , t.id AS __id ..."
+    // and comes back as invalid_argument carrying a raw SQLite syntax
+    // error. A branch commit claimed get_tracks and search_tracks were
+    // matched on this; only search_tracks had the guard.
+    const r = await getTracks(qp, { ids: [1], fields: [] });
+    expect(isEngineError(r)).toBe(true);
+    if (!isEngineError(r)) return;
+    expect(r.error).toBe("invalid_argument");
+    expect(r.message).toBe("No fields requested");
+    expect(r.detail ?? "").not.toMatch(/syntax error/i);
+
+    const viaSearch = await searchTracks(qp, { fields: [], limit: 1 });
+    expect(isEngineError(viaSearch)).toBe(true);
+    if (!isEngineError(viaSearch)) return;
+    expect(viaSearch.message).toBe(r.message); // literally the same answer
   });
 
   it("rejects unknown fields with named detail, matching search_tracks", async () => {
