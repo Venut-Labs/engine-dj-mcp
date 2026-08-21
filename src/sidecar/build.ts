@@ -32,12 +32,16 @@ export function buildSidecar(args: BuildArgs): { indexed: number; elapsed_ms: nu
     db.exec(`INSERT INTO fts_track(rowid, title, artist, album, genre, comment, label)
              SELECT id, title, artist, album, genre, comment, label FROM engine.Track`);
     db.exec(`INSERT INTO fts_map(rowid, track_id) SELECT id, id FROM engine.Track`);
+    // "Empty OR NULL", per the spec, not "NOT NULL": a zero-length blob
+    // carries no cues and no beatgrid. Reading it as present made a track
+    // has_cues: 1 in search while get_track_performance reported the same
+    // blob as `empty` and audit_library left it out of no_cues.
     db.exec(`INSERT INTO track_derived(track_id, camelot, tempo, has_cues, has_grid)
              SELECT t.id,
                     camelot(t.key),
                     tempo(t.bpmAnalyzed, t.bpm),
-                    CASE WHEN p.quickCues IS NOT NULL THEN 1 ELSE 0 END,
-                    CASE WHEN p.beatData  IS NOT NULL THEN 1 ELSE 0 END
+                    CASE WHEN COALESCE(length(p.quickCues), 0) = 0 THEN 0 ELSE 1 END,
+                    CASE WHEN COALESCE(length(p.beatData),  0) = 0 THEN 0 ELSE 1 END
              FROM engine.Track t
              LEFT JOIN engine.PerformanceData p ON p.trackId = t.id`);
     db.exec("COMMIT");

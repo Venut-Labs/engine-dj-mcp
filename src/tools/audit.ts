@@ -39,10 +39,14 @@ const SAMPLE = 10;
 const SQL_CHECKS: Record<string, string> = {
   unavailable: `SELECT t.id FROM Track t WHERE t.isAvailable = 0`,
   unanalyzed: `SELECT t.id FROM Track t WHERE t.isAnalyzed = 0 OR t.isAnalyzed IS NULL`,
+  // "Empty OR NULL", per the spec: a zero-length blob is not a cue list.
+  // The same expression backs side.track_derived.has_cues/has_grid (see
+  // sidecar/build.ts) and blobs/index.ts's `empty` status, so search, audit
+  // and get_track_performance cannot disagree about the same track.
   no_cues: `SELECT t.id FROM Track t LEFT JOIN PerformanceData p ON p.trackId = t.id
-            WHERE p.quickCues IS NULL`,
+            WHERE COALESCE(length(p.quickCues), 0) = 0`,
   no_beatgrid: `SELECT t.id FROM Track t LEFT JOIN PerformanceData p ON p.trackId = t.id
-                WHERE p.beatData IS NULL`,
+                WHERE COALESCE(length(p.beatData), 0) = 0`,
   missing_key: `SELECT t.id FROM Track t WHERE t.key = -1 OR t.key IS NULL`,
   // bpm is stored at face value (not times 100, as rekordbox does).
   suspicious_bpm: `SELECT t.id FROM Track t
