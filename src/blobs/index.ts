@@ -556,6 +556,18 @@ export function decodeBeatgrid(buf: Buffer | null): BeatgridResult {
  * `duration_seconds` still comes from Track.length rather than from the
  * blob: the overview carries a sample *count* but no sample rate, so a
  * duration derived from it alone would be a guess.
+ *
+ * `buckets` has no caller today that passes anything but the default, so a
+ * bad value here is unreachable in practice -- guarded anyway so it stays
+ * that way for the next caller rather than becoming a trap. A non-finite or
+ * non-positive value (0, negative, NaN, +/-Infinity) falls back to the
+ * default instead of reaching the bucket-size arithmetic below: 0 or a
+ * negative value there would clamp the *denominator*, not the bucket count,
+ * which maximises bucket size and collapses the whole track into one giant
+ * bucket -- the opposite of "more buckets"; NaN propagates through to a
+ * single bucket reporting a peak of 0 regardless of the actual audio. Both
+ * still come back `status: "ok"` -- a confident, wrong answer, not a
+ * request this function visibly declined to honour.
  */
 export function summariseWaveform(
   buf: Buffer | null,
@@ -563,6 +575,7 @@ export function summariseWaveform(
   durationSeconds: number | null = null,
 ): WaveformSummary {
   if (!buf || buf.length === 0) return { layout: LAYOUT_VERIFIED, status: "empty" };
+  const safeBuckets = Number.isFinite(buckets) && buckets > 0 ? buckets : 32;
   try {
     const data = qUncompress(buf);
     if (data.length === 0) return { layout: LAYOUT_VERIFIED, status: "empty" };
@@ -577,7 +590,7 @@ export function summariseWaveform(
     // here rather than producing a silently short waveform.
     const points = r.bytes(entries * 3);
 
-    const size = Math.max(1, Math.ceil(entries / Math.max(1, buckets)));
+    const size = Math.max(1, Math.ceil(entries / safeBuckets));
     const profile: number[] = [];
     for (let i = 0; i < entries; i += size) {
       let peak = 0;

@@ -356,6 +356,46 @@ describe("decoders never throw", () => {
     expect(r.profile).toEqual(Array(8).fill(0));
   });
 
+  it("falls back to the default bucket count for a non-positive or non-finite buckets, without misbehaving", () => {
+    // No caller passes a bad value today, so this is unreachable in
+    // practice -- it is about the parameter not being a trap for the next
+    // one. Before this guard, 0 or a negative buckets silently collapsed
+    // the whole track into one giant bucket (the Math.max(1, buckets)
+    // divisor clamped the *denominator* up to 1, which maximises the
+    // bucket *size*, the opposite of what a caller asking for more
+    // buckets than that would expect); NaN was worse, propagating through
+    // the arithmetic to a single bucket reporting a peak of 0 regardless of
+    // the actual audio. Both came back `status: "ok"` either way -- a
+    // confident, wrong answer, not a visible refusal.
+    const points: [number, number, number][] = Array.from({ length: 16 }, (_, i): [number, number, number] => [
+      i,
+      i,
+      i,
+    ]);
+    const baseline = summariseWaveform(waveFrame(points), 32);
+    expect(baseline.status).toBe("ok");
+    if (baseline.status !== "ok") return;
+    expect(baseline.peaks).toBe(16); // one bucket per point: 16 points < 32 buckets
+
+    // A real, explicit bucket count is still honoured -- the guard must not
+    // quietly override every call with the default.
+    const explicit = summariseWaveform(waveFrame(points), 4);
+    expect(explicit.status).toBe("ok");
+    if (explicit.status !== "ok") return;
+    expect(explicit.peaks).toBe(4);
+    expect(explicit.peaks).not.toBe(baseline.peaks);
+
+    for (const bad of [0, -1, -32, NaN, Infinity, -Infinity]) {
+      const r = summariseWaveform(waveFrame(points), bad);
+      expect(r.status, `buckets=${bad}`).toBe("ok");
+      if (r.status !== "ok") continue;
+      // Falls back to the same 32-bucket default as the explicit baseline
+      // above, not to some other coincidental clamp.
+      expect(r.peaks, `buckets=${bad}`).toBe(baseline.peaks);
+      expect(r.profile, `buckets=${bad}`).toEqual(baseline.profile);
+    }
+  });
+
   it("reports corrupt when the waveform's two point counts disagree", () => {
     const payload = Buffer.concat([i64(4), i64(5), f64(4096), Buffer.alloc(15)]);
     const r = summariseWaveform(qCompress(payload));
