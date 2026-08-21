@@ -308,14 +308,21 @@ export async function createServer(
     {
       title: "Get cues, loops and beatgrid",
       description:
-        "Decode PerformanceData for one track. Each field carries its own decode status. " +
-        "IMPORTANT: the cue, loop and beatgrid binary layouts are reverse-engineered and have " +
-        "NOT been validated against real Engine DJ data -- two of them are known to be wrong " +
-        "today. Every decoded field is marked layout: \"unverified\" for this reason: " +
-        "status: \"ok\" means only that the bytes parsed, not that the values are correct, so " +
-        "cue positions, loop bounds and beat anchors may be wrong or unavailable and must not " +
-        "be reported to a user as fact. Cues, loops and beat anchors are capped at 64 items; " +
-        "total gives the full count and truncated says whether the cap was hit. " +
+        "Decode PerformanceData for one track: hot cues, the main cue, saved loops, the " +
+        "beatgrid and a coarse waveform profile. Each field carries its own decode status " +
+        "and its own layout marker. " +
+        "layout: \"verified\" (cues, beatgrid) means the binary layout was confirmed against " +
+        "a real Engine DJ library -- cue positions land inside the track and the beatgrid's " +
+        "implied tempo matches the analysed BPM -- so status: \"ok\" there is a claim about " +
+        "the values, not just about the parse. " +
+        "layout: \"unverified\" (loops) still means only that the bytes parsed: the loop slot " +
+        "structure is known, but no library was available with a loop actually saved, so " +
+        "loop bounds must not be reported to a user as fact. " +
+        "Positions are sample offsets; sample_rate at the top level converts them to " +
+        "seconds, and cue/loop items carry the seconds already. Only hot-cue and loop slots " +
+        "that hold something are listed -- slots is how many the track has in total, so " +
+        "items: [] with slots: 8 means an analysed track with no cues set. Items are capped " +
+        "at 64; total gives the full count and truncated says whether the cap was hit. " +
         LIBRARY_SELECTION_NOTE,
       inputSchema: { ...PerformanceInput.shape, library: LibraryArg },
       annotations: RO,
@@ -475,6 +482,13 @@ other.
 - Playlists are singly linked lists: order lives in \`Playlist.nextListId\`
   and \`PlaylistEntity.nextEntityId\`, not in any position column.
 - A track's natural key across drives is \`(originDatabaseUuid, originTrackId)\`.
+- \`PerformanceData\`'s blob columns are binary and cannot be read with SQL.
+  Engine writes \`quickCues\`, \`loops\`, \`beatData\` and
+  \`overviewWaveFormData\` to **every analysed track** whether or not the DJ
+  set anything, so \`quickCues IS NOT NULL\` means "analysed", not "has
+  cues": a track with no hot cues still carries a full eight-slot blob.
+  \`get_track_performance\` decodes them and is the only way to tell the
+  difference.
 
 ## SQL functions
 Registered on the query connection, all deterministic:
@@ -487,6 +501,10 @@ where \`side.track_derived\` is indexed and these are not.
 - \`side.fts_track\` — FTS5 over title, artist, album, genre, comment, label,
   with diacritics folded. Join via \`side.fts_map(rowid, track_id)\`.
 - \`side.track_derived(track_id, camelot, tempo, has_cues, has_grid)\` — indexed.
+  \`has_cues\`/\`has_grid\` mirror "the blob is present and non-empty", which
+  on a real library means "analysed" rather than "a cue is set" — see the
+  \`PerformanceData\` note above before answering "which tracks have no
+  cues?" from these columns.
 
 ## Limits
 The connection is read-only at the kernel level, not by convention: writes

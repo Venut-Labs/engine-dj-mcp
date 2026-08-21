@@ -2,9 +2,16 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { deflateSync } from "node:zlib";
 import { DatabaseSync } from "node:sqlite";
 import { makeLibrary } from "./fixtures/gen-library.js";
+import {
+  cueFrame,
+  emptyCue,
+  loopBlob,
+  beatFrame,
+  waveFrame,
+  type CueSlot,
+} from "./fixtures/blob-frames.js";
 import { QueryProcess } from "../src/proc/query-client.js";
 import { getTrackPerformance } from "../src/tools/performance.js";
 import { isEngineError } from "../src/errors.js";
@@ -19,64 +26,25 @@ afterAll(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-/** Qt qCompress framing: 4-byte BE uncompressed length + raw zlib stream. */
-function qCompress(payload: Buffer): Buffer {
-  const header = Buffer.alloc(4);
-  header.writeUInt32BE(payload.length, 0);
-  return Buffer.concat([header, deflateSync(payload)]);
-}
-
-function u32(n: number): Buffer {
-  const b = Buffer.alloc(4);
-  b.writeUInt32BE(n, 0);
-  return b;
-}
-function f64(n: number): Buffer {
-  const b = Buffer.alloc(8);
-  b.writeDoubleBE(n, 0);
-  return b;
-}
-function labeled(label: string): Buffer {
-  const l = Buffer.from(label, "utf8");
-  return Buffer.concat([u32(l.length), l]);
-}
-
-/** count:u32be, then per cue: label(len-prefixed), position:f64be, colour:u32be */
-function cueFrame(cues: { label: string; position: number; colour: number }[]): Buffer {
-  const parts = [u32(cues.length)];
-  for (const c of cues) parts.push(labeled(c.label), f64(c.position), u32(c.colour));
-  return qCompress(Buffer.concat(parts));
-}
-
-/** count:u32be, then per loop: label(len-prefixed), start:f64be, end:f64be */
-function loopFrame(loops: { label: string; start: number; end: number }[]): Buffer {
-  const parts = [u32(loops.length)];
-  for (const l of loops) parts.push(labeled(l.label), f64(l.start), f64(l.end));
-  return qCompress(Buffer.concat(parts));
-}
-
-/** count:u32be, then per anchor: sample:f64be, beat:f64be */
-function beatgridFrame(anchors: { sample: number; beat: number }[]): Buffer {
-  const parts = [u32(anchors.length)];
-  for (const a of anchors) parts.push(f64(a.sample), f64(a.beat));
-  return qCompress(Buffer.concat(parts));
-}
-
 /** Create a test library with well-formed performance data */
 function makeWellFormedLibrary(dir: string): { dbPath: string; db: DatabaseSync } {
   const libraryPath = makeLibrary(dir, { tracks: 2 });
   const db = new DatabaseSync(libraryPath);
 
-  // Insert well-formed data for track 1
-  const cuesBlob = cueFrame([
-    { label: "Intro", position: 1000, colour: 0xff0000 },
-    { label: "Break", position: 50000, colour: 0x00ff00 },
-  ]);
-  const loopsBlob = loopFrame([{ label: "Main", start: 10000, end: 40000 }]);
-  const beatgridBlob = beatgridFrame([
-    { sample: 0, beat: 0 },
-    { sample: 44100, beat: 1 },
-  ]);
+  // Well-formed data for track 1, in the eight-slot shape a real library
+  // uses: two pads set, six left at the -1.0 marker.
+  const slots: CueSlot[] = [...Array(8)].map(() => ({ ...emptyCue }));
+  slots[0] = { label: "Intro", position: 1000, colour: 0xff0000 };
+  slots[3] = { label: "Break", position: 50000, colour: 0x00ff00 };
+  const cuesBlob = cueFrame(slots);
+  const loopsBlob = loopBlob([{ label: "Main", start: 10000, end: 40000 }]);
+  const beatgridBlob = beatFrame(
+    [
+      { sample: 0, beat: 0 },
+      { sample: 44100 * 60, beat: 120 },
+    ],
+    { rate: 44100, samples: 44100 * 120 },
+  );
 
   db.prepare("UPDATE PerformanceData SET quickCues = ?, loops = ?, beatData = ? WHERE trackId = 1")
     .run(cuesBlob, loopsBlob, beatgridBlob);
@@ -110,13 +78,17 @@ describe("get_track_performance", () => {
     expect((r as any).waveform_summary.status).toBe("empty");
   });
 
-  it("marks the reverse-engineered layouts as unverified on every field", async () => {
+  it("says which layouts were confirmed against real Engine data and which were not", async () => {
+    // The cue and beatgrid layouts were checked against 281 real blobs; the
+    // loop layout could not be, because no track in that library has a loop
+    // set. The marker travels with the data so a model reading the response
+    // does not have to guess which is which.
     const r = await getTrackPerformance(qp, { id: 1 });
     expect(isEngineError(r)).toBe(false);
     if (isEngineError(r)) return;
-    for (const key of ["cues", "loops", "beatgrid"] as const) {
-      expect((r as any)[key].layout, key).toBe("unverified");
-    }
+    expect((r as any).cues.layout).toBe("verified");
+    expect((r as any).beatgrid.layout).toBe("verified");
+    expect((r as any).loops.layout).toBe("unverified");
   });
 
   it("reports an unknown track as a structured error", async () => {
@@ -139,11 +111,19 @@ describe("get_track_performance", () => {
 
         expect(r.track_id).toBe(1);
         expect((r as any).cues.status).toBe("ok");
+        // Two pads set out of eight slots: the six unused ones are not cues.
+        expect((r as any).cues.slots).toBe(8);
         expect((r as any).cues.items).toHaveLength(2);
         expect((r as any).cues.items[0].label).toBe("Intro");
+        expect((r as any).cues.items[0].index).toBe(0);
         expect((r as any).cues.items[0].position_samples).toBe(1000);
         expect((r as any).cues.items[0].colour).toBe(0xff0000);
         expect((r as any).cues.items[1].label).toBe("Break");
+        expect((r as any).cues.items[1].index).toBe(3); // the pad, not the position in the list
+
+        // The sample rate only beatData carries reaches the cue positions.
+        expect((r as any).sample_rate).toBe(44100);
+        expect((r as any).cues.items[1].position_seconds).toBeCloseTo(50000 / 44100, 3);
 
         expect((r as any).loops.status).toBe("ok");
         expect((r as any).loops.items).toHaveLength(1);
@@ -155,8 +135,9 @@ describe("get_track_performance", () => {
         expect((r as any).beatgrid.items).toHaveLength(2);
         expect((r as any).beatgrid.items[0].sample).toBe(0);
         expect((r as any).beatgrid.items[0].beat).toBe(0);
-        expect((r as any).beatgrid.items[1].sample).toBe(44100);
-        expect((r as any).beatgrid.items[1].beat).toBe(1);
+        expect((r as any).beatgrid.items[1].sample).toBe(44100 * 60);
+        expect((r as any).beatgrid.items[1].beat).toBe(120);
+        expect((r as any).beatgrid.bpm).toBeCloseTo(120, 3);
       } finally {
         tempQp.dispose();
       }
@@ -176,12 +157,17 @@ describe("get_track_performance", () => {
       const db = new DatabaseSync(dbPath);
       const many = Array.from({ length: 300 }, (_, i) => ({
         label: `cue ${i}`,
-        position: i * 1000,
+        position: i * 1000 + 1,
         colour: i,
       }));
+      const wavePoints: [number, number, number][] = [
+        [0, 64, 128],
+        [255, 32, 16],
+        [8, 4, 2],
+      ];
       db.prepare(
         "UPDATE PerformanceData SET quickCues = ?, overviewWaveFormData = ? WHERE trackId = 1",
-      ).run(cueFrame(many), qCompress(Buffer.from([0, 64, 128, 255, 32, 16, 8, 4])));
+      ).run(cueFrame(many), waveFrame(wavePoints, 4096));
       // Track.length for the seeded fixture's id 1 is 389 seconds.
       const trackLength = Number(
         (db.prepare("SELECT length FROM Track WHERE id = 1").get() as any).length,
@@ -205,7 +191,9 @@ describe("get_track_performance", () => {
         // has 8 bytes across 32 buckets, so peaks is 8 either way here --
         // pin it to profile.length so the two can never disagree.
         expect(wave.peaks).toBe(wave.profile.length);
-        expect(wave.bytes).toBe(8);
+        expect(wave.entries).toBe(3);
+        expect(wave.samples_per_entry).toBe(4096);
+        expect(wave.bytes).toBe(24 + 3 * 3 + 3);
         expect(wave.duration_seconds).toBe(trackLength);
         expect(wave.duration_seconds).toBeGreaterThan(0);
       } finally {
@@ -235,12 +223,12 @@ describe("get_track_performance", () => {
         expect((r as any).cues.items).toHaveLength(1);
         expect((r as any).cues.items[0].label).toBe("Intro");
 
-        // The loops blob is a 4-byte frame, below qUncompress's 5-byte
-        // minimum, so this is "corrupt" and nothing else. The fixture is
-        // deterministic, so a range of accepted statuses here asserted
-        // nothing.
+        // The loops blob is four bytes, and a loops blob opens with an
+        // eight-byte little-endian slot count, so this is "corrupt" and
+        // nothing else. The fixture is deterministic, so a range of accepted
+        // statuses here asserted nothing.
         expect((r as any).loops.status).toBe("corrupt");
-        expect((r as any).loops.detail).toMatch(/frame too short/i);
+        expect((r as any).loops.detail).toMatch(/need 8 bytes/i);
 
         // Track 2's beatData is the generator's 64 zero bytes, untouched by
         // makeWellFormedLibrary: also a specific, deterministic outcome.

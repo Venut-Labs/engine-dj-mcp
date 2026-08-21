@@ -15,9 +15,10 @@ libraries — the one on your Mac and the ones on your USB drives.
   I not played in six months?").
 - **Track lookup** (`get_tracks`) — full metadata for specific track ids.
 - **Cues, loops and beatgrids** (`get_track_performance`) — decoded from
-  Engine's `PerformanceData`, with a per-field decode status. The binary
-  layouts are reverse-engineered and **not yet validated against real Engine
-  data** — see [Limitations](#limitations) before trusting these values.
+  Engine's `PerformanceData`, with a per-field decode status. The cue and
+  beatgrid layouts are reverse-engineered but **validated against a real
+  Engine library**; the loop layout is not fully validated — see
+  [Limitations](#limitations).
 - **Collection audit** (`audit_library`) — missing files, unanalysed tracks,
   tracks without cues or beatgrids, duplicates, suspicious tempos, orphaned
   playlist entries.
@@ -77,16 +78,38 @@ can recover the library itself.
 
 Read this before deciding what to trust.
 
-- **Cue, loop and beatgrid layouts are reverse-engineered and not yet
-  validated against real Engine data.** They were derived from reading the
-  Engine binary and from third-party projects, and no byte from a real
-  library has been run through them. Every decoded field is marked
-  `layout: "unverified"` for this reason, and a `status: "ok"` means only
-  that the bytes parsed — **not** that the values are correct. Cue positions,
-  loop bounds and beat anchors may be wrong, or may come back as `corrupt`
-  or `unsupported`. Do not act on them as facts. Everything else the server
-  reports — titles, artists, tempo, key, ratings, play history, file paths —
-  is read straight from the database and carries no such caveat.
+- **Cue and beatgrid layouts are validated; the loop layout is not.** The
+  binary layouts inside `PerformanceData` are reverse-engineered, so every
+  decoded field says which kind it is:
+
+  - `layout: "verified"` — **cues** (including the main cue), the
+    **beatgrid**, and the **waveform summary**. These were derived from and
+    checked against a real Engine DJ 3.0.x library of 281 analysed tracks:
+    cue offsets land inside the track, the beatgrid's implied tempo matches
+    `bpmAnalyzed` on all 281, and the waveform's declared point spacing
+    multiplies back out to the track's sample count on all 281. A
+    `status: "ok"` here is a claim about the values, not just the parse.
+  - `layout: "unverified"` — **loops**. The blob's slot structure is known
+    (eight slots, uncompressed, little-endian) and an empty one decodes
+    correctly, but not one track in that library had a loop saved, so the
+    meaning of a *populated* loop slot is untested. Do not report loop
+    bounds to a user as fact.
+
+  One further detail is unconfirmed even on the verified fields: which of a
+  cue's four colour bytes is which channel. They are reported as stored, as
+  one 32-bit value, with no channel claim attached.
+
+  Everything else the server reports — titles, artists, tempo, key, ratings,
+  play history, file paths — is read straight from the database and carries
+  no such caveat.
+- **`has_cues` and the `no_cues` audit mean "the blob exists", not "a cue is
+  set".** Engine writes a `quickCues` blob to every analysed track whether or
+  not any pad is used, so `search_tracks(flags: { has_cues: true })` and
+  `audit_library`'s `no_cues` currently answer a question about analysis, not
+  about cues: in the 281-track reference library all 281 count as having
+  cues while only two actually do. `get_track_performance` is the tool that
+  answers it properly — an analysed track with no cues comes back as
+  `items: []` with `slots: 8`.
 - **It never writes to your library.** Not to add a cue, not to fix a tag,
   not even to recover a journal Engine DJ left behind. The connection is
   read-only at the kernel level, so a write is refused by SQLite itself

@@ -313,18 +313,36 @@ describe("createServer", () => {
     await client.close();
   });
 
-  it("warns, in get_track_performance's own description, that the layouts are unvalidated", async () => {
-    // The decoders return status: "ok" for anything that merely parses, and
-    // two of the four layouts are known wrong against real Engine data. A
-    // model that never sees the caveat repeats fabricated cue positions to
-    // the user as fact, so the caveat has to live where the model reads it,
-    // not only in a source comment.
+  it("says in get_track_performance's own description which layouts are validated", async () => {
+    // The cue and beatgrid layouts are now confirmed against a real library;
+    // the loop layout is not, because no library was available with a loop
+    // saved. A model that sees neither fact either repeats unconfirmed loop
+    // bounds as fact or discards confirmed cue positions as guesses, so both
+    // halves have to live where the model reads them, not in a source
+    // comment.
     const { client } = await connectedClient([libDir], libSidecars);
     const { tools } = await client.listTools();
     const perf = tools.find((t) => t.name === "get_track_performance")!;
-    expect(perf.description).toMatch(/reverse-engineered/i);
-    expect(perf.description).toMatch(/not been validated against real Engine DJ data/i);
+    expect(perf.description).toMatch(/verified/);
     expect(perf.description).toMatch(/unverified/);
+    // Which is which, not merely that both words appear.
+    expect(perf.description).toMatch(/layout: "verified" \(cues, beatgrid\)/);
+    expect(perf.description).toMatch(/layout: "unverified" \(loops\)/);
+    expect(perf.description).toMatch(/must not be reported to a user as fact/i);
+    await client.close();
+  });
+
+  it("tells a model, in engine://schema, that a quickCues blob is not a cue", async () => {
+    // Engine writes the blob to every analysed track, so `quickCues IS NOT
+    // NULL` answers "analysed", not "has cues" -- in the reference library
+    // all 281 tracks pass that test and two actually have a cue. A model
+    // writing SQL against side.track_derived.has_cues needs to know.
+    const { client } = await connectedClient([libDir], libSidecars);
+    const { contents } = await client.readResource({ uri: "engine://schema" });
+    const text = String((contents[0] as { text: string }).text);
+    expect(text).toMatch(/quickCues IS NOT NULL/);
+    expect(text).toMatch(/means "analysed", not "has\s+cues"/);
+    expect(text).toMatch(/get_track_performance/);
     await client.close();
   });
 
