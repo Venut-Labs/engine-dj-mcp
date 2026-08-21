@@ -145,6 +145,57 @@ describe("audit_library", () => {
     expect(r.checks.length).toBe(AUDIT_CHECKS.length);
     expect(r.checks.map((c) => c.name).sort()).toEqual([...AUDIT_CHECKS].sort());
   });
+
+  it("counts in SQL instead of shipping every offending row across the process boundary", async () => {
+    // The old implementation ran `SELECT t.id ...` and then took .length and
+    // .slice(0, 10) in JS, so a library with 40k unanalysed tracks moved 40k
+    // ids over IPC to produce the number 40000 and ten of them. Asserting
+    // the resulting counts cannot catch that -- they were correct. What has
+    // to be measured is how many rows actually cross, so this wraps the real
+    // QueryProcess and records the size of every result it hands back.
+    const seen: { sql: string; rows: number }[] = [];
+    const spy = {
+      run: async (sql: string, params?: unknown[]) => {
+        const res = await qp.run(sql, params ?? []);
+        if (!isEngineError(res)) seen.push({ sql, rows: res.rows.length });
+        return res;
+      },
+    } as unknown as QueryProcess;
+
+    const sqlChecks = AUDIT_CHECKS.filter((c) => c !== "missing_files");
+    const r = await auditLibrary(spy, mdb, { checks: [...sqlChecks] });
+    expect(isEngineError(r)).toBe(false);
+    if (isEngineError(r)) return;
+
+    // Non-vacuous: at least one check must match more rows than the sample
+    // size, or "no query returned more than 10 rows" would hold trivially.
+    // The seeded fixture puts no_cues/no_beatgrid at hundreds and
+    // unanalyzed at 50 out of 600.
+    const biggest = Math.max(...r.checks.map((c) => c.count));
+    expect(biggest).toBeGreaterThan(10);
+
+    for (const q of seen) {
+      expect(q.rows, `query returned ${q.rows} rows: ${q.sql}`).toBeLessThanOrEqual(10);
+    }
+    // Two queries per check -- one COUNT(*), one LIMIT-ed sample -- and the
+    // count query really is a count, not a truncated row set.
+    expect(seen.length).toBe(sqlChecks.length * 2);
+    expect(seen.filter((q) => /^SELECT COUNT\(\*\)/.test(q.sql.trim())).length).toBe(
+      sqlChecks.length,
+    );
+    expect(seen.filter((q) => /LIMIT \?/.test(q.sql)).length).toBe(sqlChecks.length);
+  });
+
+  it("still reports missing_files by path, the one check that legitimately needs every row", async () => {
+    // Deliberately excluded from the bound above: it has to stat each file,
+    // so its cost genuinely is per-track and leaving it alone is the right
+    // call, not an oversight.
+    const r = await auditLibrary(qp, mdb, { checks: ["missing_files"] });
+    expect(isEngineError(r)).toBe(false);
+    if (isEngineError(r)) return;
+    expect(r.checks[0]!.count).toBe(600);
+    expect(r.checks[0]!.sample_ids.length).toBe(10);
+  }, 30_000);
 });
 
 describe("audit_library — each check against an independently computed truth", () => {

@@ -31,37 +31,72 @@ export type AuditInput = z.input<typeof AuditInput>;
 const SAMPLE = 10;
 
 /**
- * Pure-SQL checks: each returns the offending ids, computed server side so
- * only a bounded sample and a count ever cross into JS. missing_files is
- * handled separately below since it is the one check that touches disk
- * rather than the database.
+ * Pure-SQL checks, stored as the id expression plus the FROM/WHERE body so
+ * the count and the sample can be built from one definition.
+ *
+ * They are issued as `SELECT COUNT(*) <body>` and `SELECT <id> <body> LIMIT
+ * 10`, never as "fetch every offending row and take .length" -- that shipped
+ * the entire result set over IPC into the MCP process just to measure it,
+ * which contradicts the spec's "aggregates on the server" and made this the
+ * one tool whose cost grew with the size of the library. SQLite computes both
+ * numbers without materialising the rows anywhere else.
+ *
+ * missing_files is handled separately below: it is the one check that has to
+ * touch the disk, so it genuinely needs every path.
  */
-const SQL_CHECKS: Record<string, string> = {
-  unavailable: `SELECT t.id FROM Track t WHERE t.isAvailable = 0`,
-  unanalyzed: `SELECT t.id FROM Track t WHERE t.isAnalyzed = 0 OR t.isAnalyzed IS NULL`,
+interface SqlCheck {
+  /** The id expression to sample, also used to order the sample stably. */
+  id: string;
+  /** FROM ... [WHERE ...]; shared verbatim by the count and the sample. */
+  body: string;
+}
+
+const SQL_CHECKS: Record<string, SqlCheck> = {
+  unavailable: { id: "t.id", body: `FROM Track t WHERE t.isAvailable = 0` },
+  unanalyzed: {
+    id: "t.id",
+    body: `FROM Track t WHERE t.isAnalyzed = 0 OR t.isAnalyzed IS NULL`,
+  },
   // "Empty OR NULL", per the spec: a zero-length blob is not a cue list.
   // The same expression backs side.track_derived.has_cues/has_grid (see
   // sidecar/build.ts) and blobs/index.ts's `empty` status, so search, audit
   // and get_track_performance cannot disagree about the same track.
-  no_cues: `SELECT t.id FROM Track t LEFT JOIN PerformanceData p ON p.trackId = t.id
-            WHERE COALESCE(length(p.quickCues), 0) = 0`,
-  no_beatgrid: `SELECT t.id FROM Track t LEFT JOIN PerformanceData p ON p.trackId = t.id
-                WHERE COALESCE(length(p.beatData), 0) = 0`,
-  missing_key: `SELECT t.id FROM Track t WHERE t.key = -1 OR t.key IS NULL`,
+  no_cues: {
+    id: "t.id",
+    body: `FROM Track t LEFT JOIN PerformanceData p ON p.trackId = t.id
+           WHERE COALESCE(length(p.quickCues), 0) = 0`,
+  },
+  no_beatgrid: {
+    id: "t.id",
+    body: `FROM Track t LEFT JOIN PerformanceData p ON p.trackId = t.id
+           WHERE COALESCE(length(p.beatData), 0) = 0`,
+  },
+  missing_key: { id: "t.id", body: `FROM Track t WHERE t.key = -1 OR t.key IS NULL` },
   // bpm is stored at face value (not times 100, as rekordbox does).
-  suspicious_bpm: `SELECT t.id FROM Track t
-                   WHERE (t.bpmAnalyzed IS NOT NULL AND t.bpm IS NOT NULL
-                          AND ABS(t.bpmAnalyzed - t.bpm) > 1.0)
-                      OR COALESCE(t.bpmAnalyzed, t.bpm) NOT BETWEEN 60 AND 200`,
-  empty_metadata: `SELECT t.id FROM Track t
-                   WHERE t.title IS NULL OR TRIM(t.title) = ''
-                      OR t.artist IS NULL OR TRIM(t.artist) = ''`,
-  duplicates: `SELECT t.id FROM Track t WHERE LOWER(TRIM(t.artist)) || '|' || LOWER(TRIM(t.title)) IN (
-                 SELECT LOWER(TRIM(artist)) || '|' || LOWER(TRIM(title)) FROM Track
-                 WHERE artist IS NOT NULL AND title IS NOT NULL
-                 GROUP BY 1 HAVING COUNT(*) > 1)`,
-  orphan_entries: `SELECT e.id FROM PlaylistEntity e
-                   LEFT JOIN Track t ON t.id = e.trackId WHERE t.id IS NULL`,
+  suspicious_bpm: {
+    id: "t.id",
+    body: `FROM Track t
+           WHERE (t.bpmAnalyzed IS NOT NULL AND t.bpm IS NOT NULL
+                  AND ABS(t.bpmAnalyzed - t.bpm) > 1.0)
+              OR COALESCE(t.bpmAnalyzed, t.bpm) NOT BETWEEN 60 AND 200`,
+  },
+  empty_metadata: {
+    id: "t.id",
+    body: `FROM Track t
+           WHERE t.title IS NULL OR TRIM(t.title) = ''
+              OR t.artist IS NULL OR TRIM(t.artist) = ''`,
+  },
+  duplicates: {
+    id: "t.id",
+    body: `FROM Track t WHERE LOWER(TRIM(t.artist)) || '|' || LOWER(TRIM(t.title)) IN (
+             SELECT LOWER(TRIM(artist)) || '|' || LOWER(TRIM(title)) FROM Track
+             WHERE artist IS NOT NULL AND title IS NOT NULL
+             GROUP BY 1 HAVING COUNT(*) > 1)`,
+  },
+  orphan_entries: {
+    id: "e.id",
+    body: `FROM PlaylistEntity e LEFT JOIN Track t ON t.id = e.trackId WHERE t.id IS NULL`,
+  },
 };
 
 export async function auditLibrary(
@@ -108,10 +143,23 @@ export async function auditLibrary(
       out.push({ name, count: missing.length, sample_ids: missing.slice(0, SAMPLE) });
       continue;
     }
-    const res = await qp.run(SQL_CHECKS[name]!);
-    if (isEngineError(res)) return res;
-    const ids = res.rows.map((r) => Number(r[0]));
-    out.push({ name, count: ids.length, sample_ids: ids.slice(0, SAMPLE) });
+    const check = SQL_CHECKS[name]!;
+    const counted = await qp.run(`SELECT COUNT(*) AS c ${check.body}`);
+    if (isEngineError(counted)) return counted;
+    // ORDER BY the id keeps the sample stable between calls; every id
+    // expression here is a primary key, so this is not an extra sort.
+    // SAMPLE is a module constant, never caller input, but bind it anyway
+    // rather than making an exception to "every value is a parameter".
+    const sampled = await qp.run(
+      `SELECT ${check.id} AS id ${check.body} ORDER BY ${check.id} LIMIT ?`,
+      [SAMPLE],
+    );
+    if (isEngineError(sampled)) return sampled;
+    out.push({
+      name,
+      count: Number(counted.rows[0]?.[0] ?? 0),
+      sample_ids: sampled.rows.map((r) => Number(r[0])),
+    });
   }
   return { checks: out };
 }
