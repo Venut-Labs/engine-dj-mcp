@@ -58,8 +58,12 @@ if (opened) {
       }
       const stmt = db.prepare(req.sql!);
       stmt.setReadBigInts(false);
+      // columns() reports the result column names from the prepared statement
+      // itself (respecting AS aliases), so a query that matches zero rows
+      // still reports real names -- Object.keys(rows[0]) has nothing to key
+      // off when there are no rows, and silently degrades to [].
+      const columns = stmt.columns().map((c) => c.name);
       const rows = stmt.all(...((req.params ?? []) as any[])) as Record<string, unknown>[];
-      const columns = rows.length ? Object.keys(rows[0]!) : [];
       process.send!({
         id: req.id,
         ok: true,
