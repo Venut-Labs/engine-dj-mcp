@@ -1,3 +1,4 @@
 node_modules/
 dist/
 .engine-dj-mcp-test/
+*.tgz
