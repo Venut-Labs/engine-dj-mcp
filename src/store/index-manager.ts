@@ -27,6 +27,7 @@ export interface FreshResult {
  */
 export class IndexManager {
   #generation = 0;
+  #attached = false;
 
   constructor(
     private readonly lib: LibraryInfo,
@@ -60,6 +61,22 @@ export class IndexManager {
     }
   }
 
+  /**
+   * Hands the on-disk index to the live query process, unless it is already
+   * attached. A QueryProcess is constructed with no sidecar, so *every* path
+   * out of ensureFresh that leaves an existing index in service has to do
+   * this -- including the two that never rebuild anything (the index is
+   * already fresh; the library was busy and the previous index still
+   * serves). Without it those paths return a success/index_stale result
+   * while `side` is not attached at all, and the next tool query dies on
+   * "no such table: side.track_derived".
+   */
+  async #attach(): Promise<boolean> {
+    if (this.#attached) return true;
+    this.#attached = await this.qp.setSidecar(this.path);
+    return this.#attached;
+  }
+
   async ensureFresh(): Promise<FreshResult | EngineError> {
     if (!this.lib.supported) {
       return err("unsupported_schema", `Schema ${this.lib.schema.join(".")} is not supported`, {
@@ -75,6 +92,14 @@ export class IndexManager {
     }
 
     if (this.#storedCounter() === current) {
+      // A fresh index on disk is not the same as a fresh index in service:
+      // on the first call of a new process nothing is attached yet, and the
+      // index built by a previous run would otherwise never be reached.
+      if (!(await this.#attach())) {
+        return err("index_stale", "The existing index could not be attached", {
+          retry_after_ms: 5000,
+        });
+      }
       // null, not a count: nothing was rebuilt this call, so there is no
       // "tracks indexed just now" number to report. -1 previously stood in
       // here and could be read by a caller as "minus one track indexed".
@@ -109,19 +134,23 @@ export class IndexManager {
       });
     } catch (e) {
       const message = String((e as Error).message);
+      if (!/locked|busy/i.test(message)) {
+        return err("library_busy", "Could not rebuild the index", { detail: message });
+      }
       // Serving the previous index beats refusing to answer: search while
       // Engine DJ is open should keep working on a slightly old index. But
-      // say so honestly: on the very first build there is no previous
-      // index to fall back on.
-      return /locked|busy/i.test(message)
-        ? err(
-            "index_stale",
-            hadPrevious
-              ? "The library was busy; the previous index is still in use"
-              : "The library was busy; the index could not be built yet",
-            { retry_after_ms: 5000 },
-          )
-        : err("library_busy", "Could not rebuild the index", { detail: message });
+      // say so honestly, and only after the previous index is genuinely in
+      // service -- on the very first build there is nothing to fall back on,
+      // and "the previous index is still in use" was previously reported
+      // even when nothing had ever been attached.
+      const serving = hadPrevious && (await this.#attach());
+      return err(
+        "index_stale",
+        serving
+          ? "The library was busy; the previous index is still in use"
+          : "The library was busy; the index could not be built yet",
+        { retry_after_ms: 5000 },
+      );
     }
 
     // rename() is invisible to an already-open connection: the query
@@ -131,16 +160,23 @@ export class IndexManager {
     } catch (e) {
       // A cross-device rename or a filesystem failure here must not throw:
       // the freshly built file just never becomes the active index.
+      const serving = hadPrevious && (await this.#attach());
       return err(
         "index_stale",
-        hadPrevious
+        serving
           ? "The rebuilt index could not be swapped in; the previous index is still in use"
           : "The rebuilt index could not be swapped in; no index is available yet",
-        { detail: String((e as Error).message) },
+        { detail: String((e as Error).message), retry_after_ms: 5000 },
       );
     }
     this.#generation += 1;
-    await this.qp.setSidecar(this.path);
+    // The swap replaced the inode, so an already-attached connection is
+    // still reading the old file: force the re-attach, do not short-circuit
+    // on #attached.
+    this.#attached = await this.qp.setSidecar(this.path);
+    if (!this.#attached) {
+      return err("index_stale", "The rebuilt index could not be attached", { retry_after_ms: 5000 });
+    }
 
     return { rebuilt: true, generation: this.#generation, ...built };
   }

@@ -79,10 +79,22 @@ export async function createServer(
       : err("library_not_found", "No supported Engine DJ library was found");
   };
 
+  /**
+   * `index_stale` is swallowed only when an index is genuinely attached:
+   * "the previous index is still in use" is a reason to answer anyway, but
+   * "the index could not be built yet" is not. Every tool's SQL joins
+   * `side.track_derived`, so letting the call proceed with nothing attached
+   * turned the project's headline scenario -- a first run while Engine DJ
+   * holds a write lock -- into `invalid_argument` carrying the raw SQLite
+   * string "no such table: side.track_derived", instead of `index_stale`
+   * with a `retry_after_ms` the model can act on.
+   */
   const ready = async () => {
     if (!qp || !mgr) return noLibraryError();
     const fresh = await mgr.ensureFresh();
-    return isEngineError(fresh) && fresh.error !== "index_stale" ? fresh : null;
+    if (!isEngineError(fresh)) return null;
+    if (fresh.error === "index_stale" && qp.hasSidecar) return null;
+    return fresh;
   };
 
   /**

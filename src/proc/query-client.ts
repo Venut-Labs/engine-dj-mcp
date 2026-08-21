@@ -162,9 +162,29 @@ export class QueryProcess {
     return { columns: m.columns, rows: m.rows.map((row: unknown[]) => row.map(decodeValue)) };
   }
 
-  async setSidecar(path: string): Promise<void> {
+  /**
+   * True when an index is actually ATTACHed as `side` on the live
+   * connection. Every tool's SQL joins `side.track_derived`, so a caller
+   * that ignores this and queries anyway gets a raw SQLite
+   * "no such table: side.track_derived" rather than a structured error --
+   * which is precisely what happened on a first run against a busy library.
+   */
+  get hasSidecar(): boolean {
+    return this.sidecar !== null;
+  }
+
+  /**
+   * Returns whether the attach actually took. A sidecar that cannot be
+   * attached (missing, corrupt, unreadable) must not leave `hasSidecar`
+   * claiming an index is available, and must not be handed to the next
+   * #spawn as an argv the worker would then fail to open.
+   */
+  async setSidecar(path: string): Promise<boolean> {
     this.sidecar = path;
-    await this.#send({ kind: "sidecar", path });
+    const m = await this.#send({ kind: "sidecar", path });
+    const ok = !("error" in m) && m?.ok === true;
+    if (!ok) this.sidecar = null;
+    return ok;
   }
 
   dispose(): void {
