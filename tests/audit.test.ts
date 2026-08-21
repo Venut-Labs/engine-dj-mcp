@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { makeLibrary } from "./fixtures/gen-library.js";
+import { cueFrame, emptyCue } from "./fixtures/blob-frames.js";
 import { readLibraryInfo } from "../src/discovery.js";
 import { QueryProcess } from "../src/proc/query-client.js";
 import { IndexManager } from "../src/store/index-manager.js";
@@ -45,18 +46,28 @@ beforeAll(async () => {
     const raw = new DatabaseSync(mdb);
     raw.exec("PRAGMA busy_timeout=3000");
     const blob = Buffer.alloc(64, 7);
+    // A real eight-slot frame with hot cue 1 set. no_cues decodes now, so
+    // filler bytes here would mean "no cue set" and every track would count
+    // as an offender -- the check would look busy while proving nothing.
+    const withCue = cueFrame(
+      Array.from({ length: 8 }, (_, i) =>
+        i === 0 ? { label: "", position: 44_100 * 5, colour: 0 } : emptyCue,
+      ),
+    );
 
     raw.prepare("UPDATE Track SET isAvailable = 0 WHERE id = 1").run();
 
-    // Fill every naturally-missing performance row first, then carve out
-    // exactly one no_cues-only and one no_beatgrid-only track.
-    raw
-      .prepare(
-        "UPDATE PerformanceData SET quickCues = ?, beatData = ? WHERE quickCues IS NULL OR beatData IS NULL",
-      )
-      .run(blob, blob);
+    // Give every track a cue and a beatgrid first, then carve out exactly
+    // one no_cues-only and one no_beatgrid-only track.
+    raw.prepare("UPDATE PerformanceData SET quickCues = ?, beatData = ?").run(withCue, blob);
     raw.prepare("UPDATE PerformanceData SET quickCues = NULL WHERE trackId = 3").run();
     raw.prepare("UPDATE PerformanceData SET beatData = NULL WHERE trackId = 2").run();
+    // Track 4 is the case the old check could not see: analysed, carrying a
+    // full eight-slot quickCues blob, with no pad used. It is what almost
+    // every track in a real library looks like.
+    raw
+      .prepare("UPDATE PerformanceData SET quickCues = ? WHERE trackId = 4")
+      .run(cueFrame(Array.from({ length: 8 }, () => emptyCue)));
 
     raw.prepare("UPDATE Track SET bpmAnalyzed = 300 WHERE id = 5").run();
     raw.prepare("UPDATE Track SET title = '' WHERE id = 6").run();
@@ -169,8 +180,9 @@ describe("audit_library", () => {
 
     // Non-vacuous: at least one check must match more rows than the sample
     // size, or "no query returned more than 10 rows" would hold trivially.
-    // The seeded fixture puts no_cues/no_beatgrid at hundreds and
-    // unanalyzed at 50 out of 600.
+    // The seeded fixture puts missing_key and unanalyzed in the dozens out
+    // of 600, well past the sample size. (no_cues and no_beatgrid are down
+    // at 2 and 1 by construction, so they are not what carries this.)
     const biggest = Math.max(...r.checks.map((c) => c.count));
     expect(biggest).toBeGreaterThan(10);
 
@@ -226,13 +238,37 @@ describe("audit_library — each check against an independently computed truth",
     if (isEngineError(r)) return;
     const cues = r.checks.find((c) => c.name === "no_cues")!;
     const grid = r.checks.find((c) => c.name === "no_beatgrid")!;
-    // id 3 has no cues but does have a beatgrid; id 2 is the reverse. If the
-    // two checks were swapped, or both read the same column, these would
-    // come out identical instead.
-    expect(cues.count).toBe(1);
-    expect(cues.sample_ids).toEqual([3]);
+    // id 3 has no quickCues blob at all and id 4 has one with no pad set:
+    // both need cue points, and both have a beatgrid. id 2 is the reverse.
+    // If the two checks were swapped, or both read the same column, these
+    // would come out identical instead.
+    expect(cues.count).toBe(2);
+    expect(cues.sample_ids).toEqual([3, 4]);
     expect(grid.count).toBe(1);
     expect(grid.sample_ids).toEqual([2]);
+  });
+
+  it("no_cues counts a track whose quickCues blob is present but holds no cue", async () => {
+    // The finding this check was rewritten for. Engine writes a full
+    // eight-slot blob to every analysed track, so `length(quickCues) = 0`
+    // returned zero offenders on a real 257-track library where 255 tracks
+    // have no cue at all -- a clean bill of health the data does not
+    // support. Track 4 here is exactly that shape.
+    const shape = expectedIds(
+      mdb,
+      "SELECT trackId AS id FROM PerformanceData WHERE trackId = 4 AND length(quickCues) > 0",
+    );
+    // Non-vacuous: the fixture really does carry a non-empty blob on id 4,
+    // so the old rule would not have counted it.
+    expect(shape).toEqual([4]);
+
+    const r = await auditLibrary(qp, mdb, { checks: ["no_cues"] });
+    expect(isEngineError(r)).toBe(false);
+    if (isEngineError(r)) return;
+    expect(r.checks[0]!.sample_ids).toContain(4);
+    // And id 1, whose blob has a pad set, is not counted -- so this is not
+    // simply "every track with a blob".
+    expect(r.checks[0]!.sample_ids).not.toContain(1);
   });
 
   it("missing_key: count matches the independently computed set from key", async () => {

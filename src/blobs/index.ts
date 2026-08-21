@@ -40,6 +40,14 @@ import { qUncompress, Reader, DecodeError } from "./qcompress.js";
  * contradicting the layout, and nothing more. It survives on `loops` because
  * no track in the 281 examined has a loop set, so while the slot structure is
  * pinned down, the meaning of a *populated* slot is untested.
+ *
+ * The marker is about the *bytes*: which offset holds which field, and what
+ * the numbers there mean. It is not a claim about every English word this
+ * module attaches to them. Three labels are inferred rather than measured and
+ * say so at their own definitions — the cue colour's channel order, the
+ * beatgrid's `grid: "adjusted"` and `main_cue.is_adjusted` naming, and the
+ * waveform's low/mid/high band naming. Each names a field whose *value* is
+ * pinned by the evidence below; only the name is a reading of it.
  */
 export const LAYOUT_VERIFIED = "verified" as const;
 export const LAYOUT_UNVERIFIED = "unverified" as const;
@@ -69,8 +77,25 @@ export interface Cue {
 export interface MainCue {
   position_samples: number | null;
   position_seconds: number | null;
-  /** Engine's stored default, before any adjustment. */
+  /**
+   * The second of the blob's two main-cue doubles. Read as Engine's stored
+   * default, before any adjustment — see `is_adjusted` on why that reading is
+   * inferred rather than measured.
+   */
   default_samples: number | null;
+  /**
+   * The single byte between the two main-cue doubles, as a boolean.
+   *
+   * Not verified: that "adjusted" is what the byte means. Its *position* is
+   * pinned (the layout parses to the last byte on all 281 blobs, and moving
+   * this byte would misalign the double after it), and it is 0 or 1 with no
+   * other value seen. The name comes from a correlation that mostly holds
+   * and does not quite: the byte is set on 10 of the 281 real blobs, and on
+   * 8 of those the two doubles differ — but on 2 it is set while they are
+   * identical, and on 17 more the doubles differ with the byte clear (25
+   * differ in total). Treat it as "a flag Engine sets about the main cue",
+   * not as a measured meaning.
+   */
   is_adjusted: boolean;
 }
 export interface Loop {
@@ -98,11 +123,20 @@ export type BeatgridResult = Decoded<
     duration_seconds: number;
     /** Tempo implied by the anchors, or null if fewer than two anchors. */
     bpm: number | null;
-    /** Which of the blob's two grids `items` holds. */
+    /**
+     * Which of the blob's two grids `items` holds: always the second one.
+     *
+     * Not verified: that "adjusted" is Engine's own name for it. That the
+     * second grid is the one Engine plays *is* measured — on 30 of the 281
+     * real blobs the two grids differ, and on seven of those the first runs
+     * at exactly half `Track.bpmAnalyzed` while the second matches it. The
+     * word is the standard one for that role in the reverse-engineering
+     * literature, not a string read out of the blob.
+     */
     grid: "adjusted";
   }
 >;
-export type WaveformSummary =
+export type WaveformSummary = { layout: LayoutStatus } & (
   | {
       status: "ok";
       /** How many peak values `profile` holds — one per bucket. */
@@ -119,7 +153,8 @@ export type WaveformSummary =
     }
   | { status: "empty" }
   | { status: "unsupported"; detail: string; bytes: number }
-  | { status: "corrupt"; detail: string };
+  | { status: "corrupt"; detail: string }
+);
 
 // Sanity bounds: a corrupt length/count field must be refused rather than
 // attempted, however large it claims to be. These are generous compared to
@@ -188,11 +223,32 @@ function boundedCount(r: Reader, littleEndian: boolean, cap: number, what: strin
   return n;
 }
 
-function guard<T, X extends object>(
+/**
+ * Envelope keys `guard` owns. A body's extra fields are spread *after* them,
+ * so a body that returned one of these would silently overwrite the
+ * envelope — a decode reporting `status: "ok"` because the body happened to
+ * use that name for something of its own. Declaring them as optional `never`
+ * makes it a compile error at the call site instead of a value nobody would
+ * test for.
+ *
+ * The constraint is on the *body's return type*, not only on `X`. Both call
+ * sites pass their type arguments explicitly, so `X` is never inferred from
+ * the body and constraining `X` alone would let the body return whatever it
+ * liked while `X` stayed innocent. Verified by mutation: adding
+ * `status: "ok" as const` to decodeLoops' body compiles under the
+ * `X`-only constraint and fails under this one.
+ *
+ * `items` is not in the list: it is destructured out of the body's result
+ * before the spread, so it cannot reach `extra` to shadow anything.
+ */
+type GuardOwned = "layout" | "status" | "total" | "truncated";
+type Forbidden = { [K in GuardOwned]?: never };
+
+function guard<T, X extends object & Forbidden>(
   buf: Buffer | null,
   layout: LayoutStatus,
   frame: "qcompress" | "raw",
-  body: (r: Reader) => { items: T[] } & X,
+  body: (r: Reader) => { items: T[] } & X & Forbidden,
 ): Decoded<T, X> {
   if (!buf || buf.length === 0) return { layout, status: "empty" };
   try {
@@ -234,10 +290,14 @@ function guard<T, X extends object>(
  * the offset this layout predicts in all 2245 unused slots, so the 13-byte
  * stride is confirmed 2245 times over, not once. The three populated slots
  * decode to 244.94 s of a 300 s track and 0.05 s of a 369 s track — inside
- * the track, which a wrong offset would not be. The main-cue triple lands in
- * range for the 105 tracks that have one set, is -1.0 or 0 for the rest, and
- * its two doubles differ from each other on 25 tracks, which they could not
- * if the layout had merged one field with its neighbour.
+ * the track, which a wrong offset would not be. The main-cue triple's first
+ * double distributes as: 122 blobs at the -1.0 sentinel, 51 at exactly 0,
+ * 105 at a positive offset inside the track, and 3 slightly negative — two
+ * at -1.455e-11 samples and one at -598.8 samples (-0.0136 s), all three
+ * within a beat of zero rather than anywhere random, which is what a
+ * misaligned read would produce. Its two doubles differ from each other on
+ * 25 tracks, which they could not if the layout had merged one field with
+ * its neighbour.
  *
  * Not verified: which of the four colour bytes is which channel. Reading
  * them as (alpha, red, green, blue) makes the one slot carrying an unedited
@@ -287,6 +347,33 @@ export function decodeCues(buf: Buffer | null, sampleRate?: number | null): Cues
       },
     };
   });
+}
+
+/**
+ * Whether this track actually has a hot cue set — the question "which tracks
+ * still need cue points?" is really asking.
+ *
+ * It exists because the cheap SQL answer is not an answer at all. Engine
+ * writes a full eight-slot `quickCues` blob to every analysed track whether
+ * or not a pad is used, so `length(quickCues) > 0` is true for all 281 blobs
+ * in the reference library while exactly 3 of them (two tracks, one of which
+ * is exported to a second library) hold a cue. A check that structurally
+ * cannot report a problem is worse than no check: it answers "none of your
+ * tracks need cue points" for a library where 255 of 257 do.
+ *
+ * The main cue is deliberately excluded. It is set on 159 of the 281 blobs,
+ * including all 71 tracks the library records as played and 88 that it does
+ * not — Engine writes it as a playback start marker, not as something a DJ
+ * placed. Counting it would make this flag answer a third question, closer
+ * to "has this been loaded on a deck" than to "has a cue been set".
+ *
+ * A blob that fails to decode answers `false`: an undecodable blob is not
+ * evidence that a cue exists, and the direction that errs toward flagging a
+ * track for a human to look at is the safe one for an audit.
+ */
+export function hasCueSet(buf: Buffer | null): boolean {
+  const cues = decodeCues(buf, null);
+  return cues.status === "ok" && cues.items.length > 0;
 }
 
 /**
@@ -437,7 +524,7 @@ export function decodeBeatgrid(buf: Buffer | null): BeatgridResult {
  *   int64 BE   number of waveform points
  *   int64 BE   the same number again
  *   float64 BE audio samples per point
- *   three bytes per point (low, mid and high band levels)
+ *   three bytes per point (three band levels)
  *   three trailing bytes: the maximum of each band over the whole track
  *
  * Evidence. Both counts read 1024 on all 281 blobs, and 24 + 3×1024 + 3 =
@@ -447,7 +534,18 @@ export function decodeBeatgrid(buf: Buffer | null): BeatgridResult {
  * in `beatData` on all 281 — for a 345-second track that is 14858.0 × 1024 =
  * 15214592 samples, the same value beatData carries. The three trailing
  * bytes equal the per-band maximum computed over the 1024 points on all 281,
- * a prediction with 255³ ways to fail per track that failed on none.
+ * a prediction with 255³ ways to fail per track that failed on none. That
+ * last check is what makes the three-bytes-per-point *stride* measured
+ * rather than assumed, and it is why this field carries `layout: "verified"`
+ * like cues and the beatgrid.
+ *
+ * Not verified: that the three bytes per point are the low, mid and high
+ * bands, in that order. Three parallel level channels is what the byte
+ * evidence shows; naming them is a reading of Engine's own display, and
+ * nothing in the library distinguishes one ordering from another. Nothing
+ * downstream depends on it — `profile` takes the loudest of the three,
+ * which is order-independent — so the naming is kept out of the response
+ * rather than asserted in it.
  *
  * The raw waveform is never returned to the model; it is reduced to a coarse
  * per-bucket profile (loudest band value in the bucket, normalised to 0..1).
@@ -464,10 +562,10 @@ export function summariseWaveform(
   buckets = 32,
   durationSeconds: number | null = null,
 ): WaveformSummary {
-  if (!buf || buf.length === 0) return { status: "empty" };
+  if (!buf || buf.length === 0) return { layout: LAYOUT_VERIFIED, status: "empty" };
   try {
     const data = qUncompress(buf);
-    if (data.length === 0) return { status: "empty" };
+    if (data.length === 0) return { layout: LAYOUT_VERIFIED, status: "empty" };
     const r = new Reader(data);
     const entries = boundedCount(r, false, MAX_WAVEFORM_ENTRIES, "waveform point count");
     const entriesAgain = boundedCount(r, false, MAX_WAVEFORM_ENTRIES, "waveform point count");
@@ -490,6 +588,7 @@ export function summariseWaveform(
       profile.push(Math.round((peak / 255) * 100) / 100);
     }
     return {
+      layout: LAYOUT_VERIFIED,
       status: "ok",
       peaks: profile.length,
       entries,
@@ -501,8 +600,8 @@ export function summariseWaveform(
   } catch (e) {
     const detail = (e as Error).message;
     return e instanceof DecodeError && /unsupported|signature/i.test(detail)
-      ? { status: "unsupported", detail, bytes: buf.length }
-      : { status: "corrupt", detail };
+      ? { layout: LAYOUT_VERIFIED, status: "unsupported", detail, bytes: buf.length }
+      : { layout: LAYOUT_VERIFIED, status: "corrupt", detail };
   }
 }
 

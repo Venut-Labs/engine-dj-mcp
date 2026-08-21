@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { readChangeCounter } from "../probe.js";
 import { buildSidecar } from "../sidecar/build.js";
+import { SIDECAR_FORMAT } from "../sidecar/schema.js";
 import { sidecarDir } from "../paths.js";
 import { err, type EngineError } from "../errors.js";
 import type { LibraryInfo } from "../discovery.js";
@@ -43,16 +44,32 @@ export class IndexManager {
     return join(this.baseDir, this.lib.uuid, "index.db");
   }
 
+  /**
+   * The change counter the sidecar on disk was built from, or null when
+   * there is no usable sidecar — which forces a rebuild.
+   *
+   * `index_format` is checked alongside it. The change counter alone answers
+   * "is the index's *content* current"; it cannot answer "does the index
+   * still mean what this code thinks it means". When a derived column's
+   * definition changes (has_cues did: from "a blob exists" to "a cue is
+   * set"), a library nobody has touched since keeps the same counter, and
+   * without this check the old meaning would be served from disk for as long
+   * as the user left their library alone. A sidecar predating the column
+   * fails the SELECT outright and lands in the same catch.
+   */
   #storedCounter(): number | null {
     if (!existsSync(this.path)) return null;
     try {
       const db = new DatabaseSync(this.path, { readOnly: true });
       try {
-        const row = db.prepare("SELECT change_counter, generation FROM index_meta LIMIT 1").get() as
-          | { change_counter: number; generation: number }
+        const row = db
+          .prepare("SELECT change_counter, generation, index_format FROM index_meta LIMIT 1")
+          .get() as
+          | { change_counter: number; generation: number; index_format: number | null }
           | undefined;
         if (row?.generation) this.#generation = Number(row.generation);
-        return row ? Number(row.change_counter) : null;
+        if (!row || Number(row.index_format) !== SIDECAR_FORMAT) return null;
+        return Number(row.change_counter);
       } finally {
         db.close();
       }

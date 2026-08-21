@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { makeLibrary } from "./fixtures/gen-library.js";
+import { cueFrame, emptyCue } from "./fixtures/blob-frames.js";
 import { buildSidecar } from "../src/sidecar/build.js";
 
 let dir: string, mdb: string, side: string;
@@ -82,12 +83,16 @@ describe("sidecar", () => {
       // Clear existing PerformanceData
       engineDb.exec("DELETE FROM PerformanceData");
 
-      // First track: add quickCues only (has_cues = 1, has_grid = 0)
+      // First track: a quickCues blob with a cue actually set, and no
+      // beatData (has_cues = 1, has_grid = 0). It has to be a real frame
+      // now: has_cues is decoded, so three arbitrary bytes would answer 0
+      // and this test would pass for the wrong reason under a swap.
       engineDb.prepare(
         "INSERT INTO PerformanceData (trackId, quickCues) VALUES (?, ?)"
-      ).run(trackIds[0], Buffer.from([1, 2, 3]));
+      ).run(trackIds[0], cueFrame([{ label: "", position: 44_100, colour: 0 }, emptyCue]));
 
-      // Second track: add beatData only (has_cues = 0, has_grid = 1)
+      // Second track: beatData only (has_cues = 0, has_grid = 1). has_grid
+      // is still a presence test, so any non-empty blob is the right input.
       engineDb.prepare(
         "INSERT INTO PerformanceData (trackId, beatData) VALUES (?, ?)"
       ).run(trackIds[1], Buffer.from([4, 5, 6]));
@@ -108,6 +113,58 @@ describe("sidecar", () => {
       expect(rows[1].has_grid).toBe(1);
 
       sideDb.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("has_cues means a cue is set, not that a quickCues blob exists", () => {
+    // The whole point of decoding during the rebuild. Engine writes a full
+    // eight-slot blob to every analysed track, so a SQL-only rule answers
+    // the same thing for both tracks below -- and it answered "has cues"
+    // for all 281 blobs of a real library where 3 hold a cue.
+    const dir = mkdtempSync(join(tmpdir(), "edj-side-cueset-"));
+    try {
+      const mdb = makeLibrary(dir, { tracks: 3 });
+      const side = join(dir, "index.db");
+      const bare = cueFrame(Array.from({ length: 8 }, () => emptyCue));
+      const set = cueFrame(
+        Array.from({ length: 8 }, (_, i) =>
+          i === 7 ? { label: "Cue 8", position: 44_100 * 10, colour: 0 } : emptyCue,
+        ),
+      );
+
+      const engineDb = new DatabaseSync(mdb);
+      engineDb.exec("DELETE FROM PerformanceData");
+      const ins = engineDb.prepare("INSERT INTO PerformanceData (trackId, quickCues) VALUES (?, ?)");
+      ins.run(1, bare); // analysed, no pad used
+      ins.run(2, set); // analysed, hot cue 8 set
+      ins.run(3, null); // never analysed
+
+      // Both blobs are present and non-empty, so every SQL-visible property
+      // of them agrees: if the two rows below were not identical here, the
+      // assertion further down would not be testing what it claims to.
+      const lens = engineDb
+        .prepare("SELECT trackId, quickCues IS NOT NULL AS present, length(quickCues) > 0 AS nonempty FROM PerformanceData WHERE trackId IN (1,2) ORDER BY trackId")
+        .all() as { trackId: number; present: number; nonempty: number }[];
+      expect(lens).toEqual([
+        { trackId: 1, present: 1, nonempty: 1 },
+        { trackId: 2, present: 1, nonempty: 1 },
+      ]);
+      engineDb.close();
+
+      buildSidecar({ mdbPath: mdb, outPath: side, uuid: "u", schema: "3.0.2" });
+
+      const sideDb = new DatabaseSync(side, { readOnly: true });
+      const rows = sideDb
+        .prepare("SELECT track_id, has_cues FROM track_derived ORDER BY track_id")
+        .all() as { track_id: number; has_cues: number }[];
+      sideDb.close();
+      expect(rows).toEqual([
+        { track_id: 1, has_cues: 0 },
+        { track_id: 2, has_cues: 1 },
+        { track_id: 3, has_cues: 0 },
+      ]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

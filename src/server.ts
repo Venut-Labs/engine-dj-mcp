@@ -275,6 +275,9 @@ export async function createServer(
         "flags. Set include_total for a count alongside the page: it is capped at 1000, and a " +
         "capped result comes back as total: 1000 with total_capped: true -- treat that as " +
         "'at least 1000', never as an exact count. " +
+        "flags.has_cues means a hot cue is actually set (the blob is decoded when the index " +
+        "is built), not merely that Engine analysed the track; flags.has_beatgrid means a " +
+        "beatData blob is present. " +
         LIBRARY_SELECTION_NOTE,
       inputSchema: { ...SearchInput.shape, library: LibraryArg },
       annotations: RO,
@@ -311,10 +314,11 @@ export async function createServer(
         "Decode PerformanceData for one track: hot cues, the main cue, saved loops, the " +
         "beatgrid and a coarse waveform profile. Each field carries its own decode status " +
         "and its own layout marker. " +
-        "layout: \"verified\" (cues, beatgrid) means the binary layout was confirmed against " +
-        "a real Engine DJ library -- cue positions land inside the track and the beatgrid's " +
-        "implied tempo matches the analysed BPM -- so status: \"ok\" there is a claim about " +
-        "the values, not just about the parse. " +
+        "layout: \"verified\" (cues, beatgrid, waveform_summary) means the binary layout was " +
+        "confirmed against a real Engine DJ library -- cue positions land inside the track, " +
+        "the beatgrid's implied tempo matches the analysed BPM, and the waveform's declared " +
+        "point spacing multiplies back out to the track's sample count -- so status: \"ok\" " +
+        "there is a claim about the values, not just about the parse. " +
         "layout: \"unverified\" (loops) still means only that the bytes parsed: the loop slot " +
         "structure is known, but no library was available with a loop actually saved, so " +
         "loop bounds must not be reported to a user as fact. " +
@@ -341,6 +345,9 @@ export async function createServer(
       description:
         `Run collection health checks. Available: ${AUDIT_CHECKS.join(", ")}. ` +
         `missing_files resolves each track against the selected library's own folder. ` +
+        `no_cues means "no hot cue is set" -- the quickCues blob is decoded for this, since ` +
+        `Engine writes one to every analysed track whether or not a pad is used -- while ` +
+        `no_beatgrid means the beatData blob is absent or empty. ` +
         LIBRARY_SELECTION_NOTE,
       inputSchema: { ...AuditInput.shape, library: LibraryArg },
       annotations: RO,
@@ -487,8 +494,8 @@ other.
   \`overviewWaveFormData\` to **every analysed track** whether or not the DJ
   set anything, so \`quickCues IS NOT NULL\` means "analysed", not "has
   cues": a track with no hot cues still carries a full eight-slot blob.
-  \`get_track_performance\` decodes them and is the only way to tell the
-  difference.
+  \`get_track_performance\` decodes one track's blobs; for the whole library,
+  \`side.track_derived.has_cues\` below holds the decoded answer.
 
 ## SQL functions
 Registered on the query connection, all deterministic:
@@ -501,10 +508,12 @@ where \`side.track_derived\` is indexed and these are not.
 - \`side.fts_track\` — FTS5 over title, artist, album, genre, comment, label,
   with diacritics folded. Join via \`side.fts_map(rowid, track_id)\`.
 - \`side.track_derived(track_id, camelot, tempo, has_cues, has_grid)\` — indexed.
-  \`has_cues\`/\`has_grid\` mirror "the blob is present and non-empty", which
-  on a real library means "analysed" rather than "a cue is set" — see the
-  \`PerformanceData\` note above before answering "which tracks have no
-  cues?" from these columns.
+  \`has_cues\` is **not** \`quickCues IS NOT NULL\`: the blob is decoded when
+  this index is built, and the column means "at least one hot cue is actually
+  set". It is the right column for "which tracks have no cues?", and the
+  matching \`audit_library\` check is \`no_cues\`. \`has_grid\` does mean "a
+  \`beatData\` blob is present and non-empty", which on a real library is the
+  same thing as an analysed beatgrid.
 
 ## Limits
 The connection is read-only at the kernel level, not by convention: writes

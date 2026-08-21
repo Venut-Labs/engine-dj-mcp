@@ -39,6 +39,11 @@ export const FIELD_SQL: Record<string, string> = {
   filename: "t.filename",
   bpm: "d.tempo",
   camelot: "d.camelot",
+  // has_cues means "a hot cue is actually set": the quickCues blob is
+  // decoded when the sidecar is built, because Engine writes one to every
+  // analysed track whether or not a pad is used (see sidecar/build.ts).
+  // has_beatgrid means the beatData blob is present, which on every real
+  // track measured is the same thing as an analysed beatgrid.
   has_cues: "d.has_cues",
   has_beatgrid: "d.has_grid",
   date_added: "t.dateAdded",

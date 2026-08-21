@@ -61,10 +61,10 @@ function makeWellFormedLibrary(dir: string): { dbPath: string; db: DatabaseSync 
 
 describe("get_track_performance", () => {
   it("returns a per-field status instead of failing the call", async () => {
-    // The fixture is deterministic (seeded PRNG): track 1 carries a
-    // 128-byte zero-filled quickCues and a 64-byte zero-filled beatData --
-    // neither is a valid qCompress frame -- and no loops or waveform at all.
-    // Asserting the single expected status per field, rather than
+    // The fixture is deterministic (seeded PRNG): track 1 carries a real
+    // eight-slot quickCues frame with no pad used, a 64-byte zero-filled
+    // beatData -- not a valid qCompress frame -- and no loops or waveform at
+    // all. Asserting the single expected status per field, rather than
     // "one of ok/empty/corrupt/unsupported", is the difference between
     // covering the behaviour and covering nothing: the loose form passes
     // whatever the decoders do.
@@ -72,7 +72,12 @@ describe("get_track_performance", () => {
     expect(isEngineError(r)).toBe(false);
     if (isEngineError(r)) return;
     expect(r.track_id).toBe(1);
-    expect((r as any).cues.status).toBe("corrupt");
+    // ok with nothing in it: an analysed track that has no cue set. This is
+    // the state Engine leaves on almost every track, and the reason
+    // has_cues cannot be answered by asking whether the blob is there.
+    expect((r as any).cues.status).toBe("ok");
+    expect((r as any).cues.items).toEqual([]);
+    expect((r as any).cues.slots).toBe(8);
     expect((r as any).beatgrid.status).toBe("corrupt");
     expect((r as any).loops.status).toBe("empty");
     expect((r as any).waveform_summary.status).toBe("empty");

@@ -32,6 +32,7 @@ afterAll(() => { qp.dispose(); rmSync(dir, { recursive: true, force: true }); })
  * task-17-brief.md), at 50k synthetic tracks:
  *  - staleness probe: ~0.03 ms (a direct file read) -> 1 ms budget.
  *  - full rebuild: ~104 ms (same-process, no IPC) -> 300 ms budget (~2.9x).
+ *    Since raised to 500 ms; see the rebuild case for the measurement.
  *  - search page: ~0.2 ms for the raw SQL query alone -> 25 ms budget.
  *
  * The search-page number is not directly comparable to its budget the way
@@ -56,9 +57,9 @@ afterAll(() => { qp.dispose(); rmSync(dir, { recursive: true, force: true }); })
  * hides the margin: a drift from "8 ms against a 25 ms budget" to "24 ms
  * against a 25 ms budget" reads identically until the day it breaks. Run
  * with `--disable-console-intercept` to see the numbers on a passing run;
- * they are in the assertion messages either way. Measured 2026-08-21:
- * probe 0.01 ms, rebuild 134 ms, search page 8.18 ms,
- * get_track_performance 0.33 ms, audit 195.53 ms.
+ * they are in the assertion messages either way. Measured 2026-08-21, after
+ * the rebuild began decoding quickCues: probe 0.02 ms, rebuild 225 ms,
+ * search page 8.02 ms, get_track_performance 0.26 ms, audit 170.14 ms.
  */
 function report(label: string, measured: number, budget: number): void {
   const line = `[budget] ${label}: ${measured.toFixed(2)} ms (budget ${budget} ms, ${(
@@ -77,13 +78,30 @@ describe(`performance budgets at ${N} tracks`, () => {
     expect(measured, `staleness probe took ${measured.toFixed(3)} ms`).toBeLessThan(1);
   });
 
-  it("rebuilds the whole index in under 300 ms", () => {
+  /**
+   * Raised from 300 ms, deliberately, and not because a regression needed
+   * somewhere to hide: the rebuild now decodes every track's quickCues blob
+   * so has_cues can mean "a cue is set" rather than "Engine analysed this".
+   *
+   * Attributed by measurement rather than by inference — the same 50k
+   * fixture built twice, once with each rule, five runs each, medians:
+   *   presence only (the old rule):  135 ms  [136,140,135,132,132]
+   *   decoding (this rule):          238 ms  [263,230,238,238,228]
+   * so the decode costs ~103 ms at 50k tracks, about 2 us per blob. On the
+   * real 257-track library the whole rebuild went from 2 ms to 3 ms.
+   *
+   * This is a real cost increase, accepted for a correct answer, not a
+   * regression rebaselined. 500 ms keeps roughly the margin the 300 ms
+   * budget had before it (~2.1x over the measurement, against ~2.9x then),
+   * and a rebuild only runs when the library changes.
+   */
+  it("rebuilds the whole index in under 500 ms, decoding every cue blob on the way", () => {
     const r = buildSidecar({
       mdbPath: mdb, outPath: join(dir, "budget.db"), uuid: "u", schema: "3.0.2",
     });
     expect(r.indexed).toBe(N);
-    report("full rebuild", r.elapsed_ms, 300);
-    expect(r.elapsed_ms, `rebuild took ${r.elapsed_ms} ms`).toBeLessThan(300);
+    report("full rebuild", r.elapsed_ms, 500);
+    expect(r.elapsed_ms, `rebuild took ${r.elapsed_ms} ms`).toBeLessThan(500);
   }, 60_000);
 
   it("returns a search page in under 25 ms", async () => {

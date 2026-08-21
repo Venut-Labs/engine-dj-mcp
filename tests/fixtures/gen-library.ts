@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { cueFrame, emptyCue, type CueSlot } from "./blob-frames.js";
 
 const TRACK_DDL = `CREATE TABLE Track (
  id INTEGER PRIMARY KEY AUTOINCREMENT, playOrder INTEGER, length INTEGER, bpm INTEGER, year INTEGER,
@@ -17,6 +18,30 @@ const TRACK_DDL = `CREATE TABLE Track (
 const GENRES = ["Deep House", "Techno", "Melodic Techno", "Drum & Bass", "Minimal", "Dub Techno"];
 const WORDS = ["dark", "rolling", "hypnotic", "warm", "peak", "tool", "acid", "dubby", "raw"];
 const ARTISTS = ["Ämbient Ünit", "Nachtbräu", "Kollektiv", "Sonja Vex", "Björk Edit", "Röyksopp"];
+
+/**
+ * The two quickCues blobs a generated track can carry, in the real Engine
+ * layout rather than as filler bytes.
+ *
+ * This matters more than it looks. Engine writes a full eight-slot blob to
+ * every analysed track whether or not a pad is used, so "the blob exists"
+ * and "a cue is set" are different questions with different answers — and a
+ * fixture that wrote `Buffer.alloc(128)` could not tell them apart, because
+ * neither blob decodes at all. `has_cues` is now computed by decoding, so a
+ * generator that emits undecodable bytes would make every track cue-less and
+ * every assertion about the flag vacuous in the same direction.
+ *
+ * CUE_SET carries a hot cue in slot 7 at a sample offset inside every
+ * generated track; NO_CUE_SET is Engine's ordinary analysed-but-untouched
+ * blob, eight slots all at the -1.0 sentinel.
+ */
+const CUE_SLOTS = 8;
+const CUE_SET = cueFrame(
+  Array.from({ length: CUE_SLOTS }, (_, i): CueSlot =>
+    i === 7 ? { label: "", position: 44_100 * 30, colour: 0xff158ee2 } : emptyCue,
+  ),
+);
+const NO_CUE_SET = cueFrame(Array.from({ length: CUE_SLOTS }, () => emptyCue));
 
 /** Deterministic PRNG so fixtures are reproducible across runs. */
 function rng(seed: number) {
@@ -107,7 +132,12 @@ export function makeLibrary(
       uuid, i,
     );
     const hasPerf = r() < 0.85;
-    insP.run(i, hasPerf ? Buffer.alloc(64) : null, hasPerf ? Buffer.alloc(128) : null);
+    // `i % 4`, not another r(): drawing again here would shift the PRNG
+    // sequence for every field generated after it and silently change every
+    // other fixture in the suite. This keeps the rest byte-identical while
+    // making "analysed" and "has a cue set" two different populations.
+    const cueIsSet = hasPerf && i % 4 === 0;
+    insP.run(i, hasPerf ? Buffer.alloc(64) : null, hasPerf ? (cueIsSet ? CUE_SET : NO_CUE_SET) : null);
   }
   db.exec("COMMIT");
   db.close();

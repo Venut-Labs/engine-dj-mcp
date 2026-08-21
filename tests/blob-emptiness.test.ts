@@ -5,14 +5,23 @@
 // NULL`, tools/audit.ts counted `IS NULL`, and blobs/index.ts reports a
 // zero-length blob as `empty`. A track whose quickCues is a present but
 // zero-length blob was therefore has_cues: 1 in search, absent from audit's
-// no_cues, and `empty` in get_track_performance. The spec says "empty or
-// NULL"; these tests pin all three to that one rule.
+// no_cues, and `empty` in get_track_performance. These tests pin all three
+// to one rule.
+//
+// That rule has since become stricter than "empty or NULL": has_cues and
+// no_cues decode the blob and mean "a hot cue is actually set", because
+// Engine writes a full eight-slot blob to every analysed track. A
+// zero-length blob is still "no cues" under it -- that is what this file
+// checks -- and the third fixture below now carries a blob with a pad
+// actually set, since an undecodable one would be "no cues" too and could
+// no longer play the "not everything answers 0" role it is here for.
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { makeLibrary } from "./fixtures/gen-library.js";
+import { cueFrame, emptyCue } from "./fixtures/blob-frames.js";
 import { readLibraryInfo } from "../src/discovery.js";
 import { QueryProcess } from "../src/proc/query-client.js";
 import { IndexManager } from "../src/store/index-manager.js";
@@ -42,25 +51,33 @@ beforeAll(async () => {
     .run(NULL_BLOB_TRACK);
   raw
     .prepare("UPDATE PerformanceData SET quickCues = ?, beatData = ? WHERE trackId = ?")
-    .run(Buffer.alloc(32, 7), Buffer.alloc(32, 7), REAL_BLOB_TRACK);
+    .run(
+      cueFrame(
+        Array.from({ length: 8 }, (_, i) =>
+          i === 0 ? { label: "", position: 44_100 * 5, colour: 0 } : emptyCue,
+        ),
+      ),
+      Buffer.alloc(32, 7),
+      REAL_BLOB_TRACK,
+    );
 
   // The whole finding turns on the distinction between a present-but-empty
   // blob and a NULL one, so prove the fixture really holds that distinction
   // rather than node:sqlite having quietly folded Buffer.alloc(0) to NULL.
   const shape = raw
     .prepare(
-      "SELECT trackId, quickCues IS NULL AS is_null, length(quickCues) AS len FROM PerformanceData WHERE trackId IN (?,?,?) ORDER BY trackId",
+      "SELECT trackId, quickCues IS NULL AS is_null, COALESCE(length(quickCues), 0) > 0 AS non_empty FROM PerformanceData WHERE trackId IN (?,?,?) ORDER BY trackId",
     )
     .all(EMPTY_BLOB_TRACK, NULL_BLOB_TRACK, REAL_BLOB_TRACK) as {
     trackId: number;
     is_null: number;
-    len: number | null;
+    non_empty: number;
   }[];
   raw.close();
   expect(shape).toEqual([
-    { trackId: EMPTY_BLOB_TRACK, is_null: 0, len: 0 },
-    { trackId: NULL_BLOB_TRACK, is_null: 1, len: null },
-    { trackId: REAL_BLOB_TRACK, is_null: 0, len: 32 },
+    { trackId: EMPTY_BLOB_TRACK, is_null: 0, non_empty: 0 },
+    { trackId: NULL_BLOB_TRACK, is_null: 1, non_empty: 0 },
+    { trackId: REAL_BLOB_TRACK, is_null: 0, non_empty: 1 },
   ]);
 
   const lib = readLibraryInfo(mdb);

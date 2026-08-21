@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { makeLibrary } from "./fixtures/gen-library.js";
+import { cueFrame, emptyCue } from "./fixtures/blob-frames.js";
 import { readLibraryInfo } from "../src/discovery.js";
 import { QueryProcess } from "../src/proc/query-client.js";
 import { IndexManager } from "../src/store/index-manager.js";
@@ -18,13 +19,22 @@ beforeAll(async () => {
 
   // Deliberately decorrelate has_cues from has_beatgrid for two known ids:
   // the default generator ties quickCues and beatData to the same hasPerf
-  // flag, so without this, has_cues and has_beatgrid are always equal for
-  // every track and a field-mapping swap between them would go undetected
+  // flag, so without this, has_cues and has_beatgrid would agree for nearly
+  // every track and a field-mapping swap between them could go undetected
   // by any assertion that only checks the two flags against each other.
+  //
+  // Track 1's blob is a real cue frame with a pad set, not filler bytes:
+  // has_cues is decoded now, so arbitrary bytes would decode to "no cue"
+  // and the two ids would stop being decorrelated at all.
   {
     const raw = new DatabaseSync(mdb);
     raw.exec("PRAGMA busy_timeout=3000");
-    raw.prepare("UPDATE PerformanceData SET quickCues = ?, beatData = NULL WHERE trackId = 1").run(Buffer.alloc(8));
+    const withCue = cueFrame(
+      Array.from({ length: 8 }, (_, i) =>
+        i === 0 ? { label: "", position: 44_100 * 5, colour: 0 } : emptyCue,
+      ),
+    );
+    raw.prepare("UPDATE PerformanceData SET quickCues = ?, beatData = NULL WHERE trackId = 1").run(withCue);
     raw.prepare("UPDATE PerformanceData SET quickCues = NULL, beatData = ? WHERE trackId = 2").run(Buffer.alloc(8));
     raw.close();
   }
@@ -314,10 +324,33 @@ describe("search_tracks — other filters", () => {
     expect(gridTrue.tracks.map((t) => t.id)).toContain(2);
     expect(gridTrue.tracks.map((t) => t.id)).not.toContain(1);
 
+    // The distinction the column exists to make: tracks that carry a
+    // quickCues blob and still have no cue set. Engine writes one to every
+    // analysed track, so a has_cues that meant "the blob is there" would
+    // put this count at zero and answer "nothing to do" to a DJ asking
+    // which tracks still need cue points.
+    const blobButNoCue = await qp.run(
+      `SELECT COUNT(*) FROM main.PerformanceData p
+       JOIN side.track_derived d ON d.track_id = p.trackId
+       WHERE length(p.quickCues) > 0 AND d.has_cues = 0`,
+    );
+    const blobAndCue = await qp.run(
+      `SELECT COUNT(*) FROM main.PerformanceData p
+       JOIN side.track_derived d ON d.track_id = p.trackId
+       WHERE length(p.quickCues) > 0 AND d.has_cues = 1`,
+    );
+    expect(isEngineError(blobButNoCue)).toBe(false);
+    expect(isEngineError(blobAndCue)).toBe(false);
+    if (isEngineError(blobButNoCue) || isEngineError(blobAndCue)) return;
+    // Both non-zero, so the column is neither "the blob is present" nor a
+    // constant: the same SQL-visible blob yields both answers.
+    expect(Number(blobButNoCue.rows[0]![0])).toBeGreaterThan(0);
+    expect(Number(blobAndCue.rows[0]![0])).toBeGreaterThan(0);
+
     // Non-vacuous in both directions: confirmed by execution that
-    // has_cues:true totals 1000 (capped; the true ~85% exceeds the cap) and
-    // has_cues:false totals 239 (exact, well under the cap) — so neither
-    // "matches nothing" nor "matches everything" is possible here.
+    // has_cues:true totals 320 and has_cues:false totals 1000 (capped) at
+    // 1500 tracks — so neither "matches nothing" nor "matches everything"
+    // is possible here.
     const cuesFalse = await searchTracks(qp, { flags: { has_cues: false }, limit: 1, include_total: true });
     const gridFalse = await searchTracks(qp, { flags: { has_beatgrid: false }, limit: 1, include_total: true });
     expect(isEngineError(cuesFalse)).toBe(false);

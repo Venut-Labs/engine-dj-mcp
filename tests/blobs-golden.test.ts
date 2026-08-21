@@ -50,6 +50,25 @@ function decode(f: Fixture) {
   return decodePerformance({ ...blobs(f.name), durationSeconds: f.track_length_seconds });
 }
 
+/**
+ * The blob size a quickCues frame inflates to when all eight slots are unused
+ * and unlabelled: 8 (slot count) + 8×13 (empty label byte + float64 + four
+ * colour bytes) + 17 (the main-cue triple). Every label byte a track carries
+ * is one byte over this, which is what makes the size an independent handle
+ * on how much text is in the blob.
+ */
+const BARE_CUE_BLOB_BYTES = 129;
+
+/**
+ * The fixtures split by whether a hot cue is set, so each group can be
+ * asserted on what is actually true of it. Before this split, one shared
+ * "places every cue inside the track" case ran over both, and for a
+ * cue-less fixture its loop body executed zero times — leaving `slots === 8`
+ * as the only thing that could fail, on six of the eight fixtures.
+ */
+const WITH_CUES = manifest.fixtures.filter((f) => f.expect.cues.status === "ok" && f.expect.cues.items.length > 0);
+const WITHOUT_CUES = manifest.fixtures.filter((f) => f.expect.cues.status === "ok" && f.expect.cues.items.length === 0);
+
 describe("golden fixtures from a real Engine library", () => {
   it("covers tracks that differ in the ways the layouts turn on", () => {
     // A fixture set that happened to be seven copies of the same shape would
@@ -62,6 +81,16 @@ describe("golden fixtures from a real Engine library", () => {
     expect(cueBlobSizes).toEqual(new Set([129, 134])); // both real quickCues sizes
     expect(decoded.some((d) => d.cues.status === "ok" && d.cues.items.length > 0)).toBe(true);
     expect(decoded.some((d) => d.cues.status === "ok" && d.cues.items.length === 0)).toBe(true);
+    // Both halves of the split below have to be populated, or a whole group
+    // of per-fixture assertions would run over nothing and still pass.
+    expect(WITH_CUES.length).toBeGreaterThan(0);
+    expect(WITHOUT_CUES.length).toBeGreaterThan(0);
+    expect(WITH_CUES.length + WITHOUT_CUES.length).toBe(manifest.fixtures.length);
+    // main_cue.is_adjusted is set on ten of the 281 real blobs, and was
+    // false on every fixture until one of those ten was added — so the flag
+    // could have been hard-wired to false without a single test noticing.
+    expect(decoded.some((d) => d.cues.status === "ok" && d.cues.main_cue.is_adjusted)).toBe(true);
+    expect(decoded.some((d) => d.cues.status === "ok" && !d.cues.main_cue.is_adjusted)).toBe(true);
     expect(new Set(decoded.map((d) => d.sample_rate))).toEqual(new Set([44100, 48000]));
     const tempos = manifest.fixtures.map((f) => f.bpm_analyzed);
     expect(Math.max(...tempos) - Math.min(...tempos)).toBeGreaterThan(50);
@@ -90,25 +119,11 @@ describe("golden fixtures from a real Engine library", () => {
         for (const field of FIELDS) expect(b[field].length, field).toBe(f.blob_bytes[field]);
       });
 
-      it("places every cue inside the track", () => {
+      it("reports eight hot-cue slots", () => {
         const d = decode(f);
         expect(d.cues.status).toBe("ok");
         if (d.cues.status !== "ok") return;
         expect(d.cues.slots).toBe(8); // eight hot-cue pads
-        for (const cue of d.cues.items) {
-          expect(cue.position_samples, cue.label).toBeGreaterThanOrEqual(0);
-          expect(cue.position_seconds, cue.label).not.toBeNull();
-          expect(cue.position_seconds!, cue.label).toBeLessThanOrEqual(f.track_length_seconds);
-          expect(cue.index).toBeGreaterThanOrEqual(0);
-          expect(cue.index).toBeLessThan(8);
-        }
-        const main = d.cues.main_cue.position_seconds;
-        if (main !== null) {
-          // Engine stores a main cue a hair before zero on some tracks, so
-          // the floor is "not meaningfully negative", not "not negative".
-          expect(main).toBeGreaterThanOrEqual(-1);
-          expect(main).toBeLessThanOrEqual(f.track_length_seconds);
-        }
       });
 
       it("implies the tempo Engine analysed, from a grid spanning the track", () => {
@@ -154,11 +169,61 @@ describe("golden fixtures from a real Engine library", () => {
         expect(d.loops.items).toEqual([]);
       });
 
-      it("says the cue and beatgrid layouts are verified", () => {
+      it("says the cue, beatgrid and waveform layouts are verified", () => {
         const d = decode(f);
         expect(d.cues.layout).toBe("verified");
         expect(d.beatgrid.layout).toBe("verified");
+        // The waveform's marker is earned by the same kind of evidence as
+        // the other two (declared spacing × 1024 = beatData's sample count,
+        // asserted below), and was the one field whose result carried no
+        // marker at all while the README promised one.
+        expect(d.waveform_summary.layout).toBe("verified");
       });
+    });
+  }
+
+  for (const f of WITH_CUES) {
+    it(`${f.name}: places every cue it reports inside the track`, () => {
+      const d = decode(f);
+      expect(d.cues.status).toBe("ok");
+      if (d.cues.status !== "ok") return;
+      expect(d.cues.items.length).toBeGreaterThan(0); // the point of this group
+      for (const cue of d.cues.items) {
+        expect(cue.position_samples, cue.label).toBeGreaterThanOrEqual(0);
+        expect(cue.position_seconds, cue.label).not.toBeNull();
+        expect(cue.position_seconds!, cue.label).toBeLessThanOrEqual(f.track_length_seconds);
+        expect(cue.index).toBeGreaterThanOrEqual(0);
+        expect(cue.index).toBeLessThan(8);
+      }
+    });
+  }
+
+  for (const f of WITHOUT_CUES) {
+    it(`${f.name}: has all eight slots unused, and still reads the main cue correctly`, () => {
+      // What can fail here, on a fixture with no cue to place. The blob is
+      // still 129 bytes — eight slots, every label empty — so "no cues" is a
+      // fact about these bytes rather than a decoder that stopped early; and
+      // the main-cue triple sits *after* all eight slots, so reading it back
+      // in range is a check on the whole slot stride at once. A layout that
+      // walked the slots wrongly would land the main cue on colour bytes or
+      // on a sentinel and produce a wild value or a null, not 0.026 s of a
+      // 283-second track.
+      const d = decode(f);
+      expect(d.cues.status).toBe("ok");
+      if (d.cues.status !== "ok") return;
+      expect(d.cues.items).toEqual([]);
+      expect(qUncompress(blobs(f.name).quickCues).length).toBe(BARE_CUE_BLOB_BYTES);
+
+      const main = d.cues.main_cue;
+      // Recorded as a fact about these six fixtures, not an aspiration:
+      // every cue-less fixture in the set does carry a main cue, which is
+      // what gives the range check below something to fail on.
+      expect(main.position_seconds).not.toBeNull();
+      expect(main.default_samples).not.toBeNull();
+      // Engine stores a main cue a hair before zero on some tracks, so the
+      // floor is "not meaningfully negative", not "not negative".
+      expect(main.position_seconds!).toBeGreaterThanOrEqual(-1);
+      expect(main.position_seconds!).toBeLessThanOrEqual(f.track_length_seconds);
     });
   }
 
@@ -195,6 +260,25 @@ describe("golden fixtures from a real Engine library", () => {
     expect(f.bpm_analyzed).toBeCloseTo(170, 1);
   });
 
+  it("carries the main-cue adjusted flag on the one track that has it set", () => {
+    // Ten of the 281 real blobs set the byte between the two main-cue
+    // doubles; on eight of them the doubles differ. This fixture is one of
+    // those eight: the stored position is 32.7 s into the track while the
+    // default is 0, so a decoder that read one double twice, or dropped the
+    // flag byte and slid into the second double, could not produce this.
+    const f = manifest.fixtures.find((x) => x.name === "adjusted-main-cue")!;
+    const d = decode(f);
+    expect(d.cues.status).toBe("ok");
+    if (d.cues.status !== "ok") return;
+    const main = d.cues.main_cue;
+    expect(main.is_adjusted).toBe(true);
+    expect(main.default_samples).toBe(0);
+    expect(main.position_samples).toBeCloseTo(1441461.028, 3);
+    expect(main.position_samples).not.toBe(main.default_samples);
+    expect(main.position_seconds).toBeCloseTo(32.686, 3);
+    expect(main.position_seconds!).toBeLessThan(f.track_length_seconds);
+  });
+
   it("keeps the fixtures free of anything identifying the user's music", () => {
     // These are the user's own library bytes. The blobs are cue offsets,
     // beat markers and waveform levels; the manifest must not turn them back
@@ -202,6 +286,43 @@ describe("golden fixtures from a real Engine library", () => {
     const raw = readFileSync(join(DIR, "expected.json"), "utf8");
     for (const key of ["title", "artist", "album", "path", "filename", "genre", "uri"]) {
       expect(raw.toLowerCase()).not.toContain(`"${key}"`);
+    }
+  });
+
+  it("keeps the .bin files free of it too, where the only text a blob can hold is a cue label", () => {
+    // The manifest is not the only copy of the user's bytes in this
+    // directory. A cue or loop label is free text a DJ types, so it is the
+    // one place a track name could reach these fixtures — and checking
+    // expected.json alone would not see it, since a label only appears there
+    // if the decoder reports it.
+    //
+    // Only quickCues and loops are scanned: those are the two layouts with
+    // a label field at all. beatData and overviewWaveFormData are floats and
+    // level bytes, which throw off printable-ASCII runs by chance (measured:
+    // 46 of them in one waveform), so scanning those would be noise, not a
+    // guard.
+    const ENGINE_DEFAULT_LABEL = /^Cue [1-8]/;
+    for (const f of manifest.fixtures) {
+      const b = blobs(f.name);
+      const cueBytes = qUncompress(b.quickCues);
+      for (const [what, bytes] of [["quickCues", cueBytes], ["loops", b.loops]] as const) {
+        const runs = bytes.toString("latin1").match(/[A-Za-z0-9 ]{4,}/g) ?? [];
+        for (const run of runs) {
+          expect(run, `${f.name}.${what}`).toMatch(ENGINE_DEFAULT_LABEL);
+        }
+      }
+      // And close the loophole a prefix match leaves open: the inflated blob
+      // is exactly the bare size plus the label bytes the decoder reports,
+      // so there is no room in it for a string nobody accounted for.
+      const d = decode(f);
+      const labelled = d.cues.status === "ok" ? d.cues.items : [];
+      const labelBytes = labelled.reduce((n, c) => n + Buffer.byteLength(c.label, "utf8"), 0);
+      expect(cueBytes.length, f.name).toBe(BARE_CUE_BLOB_BYTES + labelBytes);
+      for (const cue of labelled) {
+        if (cue.label !== "") expect(cue.label, f.name).toMatch(/^Cue [1-8]$/);
+      }
+      // loops: 8 + 8×23, every label empty. Any label byte would grow it.
+      expect(b.loops.length, f.name).toBe(192);
     }
   });
 });

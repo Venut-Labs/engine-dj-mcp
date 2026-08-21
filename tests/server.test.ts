@@ -326,7 +326,7 @@ describe("createServer", () => {
     expect(perf.description).toMatch(/verified/);
     expect(perf.description).toMatch(/unverified/);
     // Which is which, not merely that both words appear.
-    expect(perf.description).toMatch(/layout: "verified" \(cues, beatgrid\)/);
+    expect(perf.description).toMatch(/layout: "verified" \(cues, beatgrid, waveform_summary\)/);
     expect(perf.description).toMatch(/layout: "unverified" \(loops\)/);
     expect(perf.description).toMatch(/must not be reported to a user as fact/i);
     await client.close();

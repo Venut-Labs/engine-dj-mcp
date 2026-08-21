@@ -78,7 +78,8 @@ can recover the library itself.
 
 Read this before deciding what to trust.
 
-- **Cue and beatgrid layouts are validated; the loop layout is not.** The
+- **Cue, beatgrid and waveform layouts are validated; the loop layout is
+  not.** The
   binary layouts inside `PerformanceData` are reverse-engineered, so every
   decoded field says which kind it is:
 
@@ -95,21 +96,39 @@ Read this before deciding what to trust.
     meaning of a *populated* loop slot is untested. Do not report loop
     bounds to a user as fact.
 
-  One further detail is unconfirmed even on the verified fields: which of a
-  cue's four colour bytes is which channel. They are reported as stored, as
-  one 32-bit value, with no channel claim attached.
+  A `layout` marker is a claim about the **bytes** — which offset holds
+  which field, and what the number there means. It is not a claim about
+  every name this server puts on them. Three labels are inferred rather than
+  measured, and the code says so where each is defined: which of a cue's
+  four colour bytes is which channel (they are reported as stored, as one
+  32-bit value, with no channel claim attached); that the second beatgrid is
+  the one Engine calls "adjusted" (that it is the one Engine *plays* is
+  measured — on seven tracks the other grid runs at exactly half the
+  analysed tempo); that `main_cue.is_adjusted` is what its flag byte means;
+  and that the waveform's three bytes per point are the low, mid and high
+  bands in that order. None of these affects a value you get back.
 
   Everything else the server reports — titles, artists, tempo, key, ratings,
   play history, file paths — is read straight from the database and carries
   no such caveat.
-- **`has_cues` and the `no_cues` audit mean "the blob exists", not "a cue is
-  set".** Engine writes a `quickCues` blob to every analysed track whether or
-  not any pad is used, so `search_tracks(flags: { has_cues: true })` and
-  `audit_library`'s `no_cues` currently answer a question about analysis, not
-  about cues: in the 281-track reference library all 281 count as having
-  cues while only two actually do. `get_track_performance` is the tool that
-  answers it properly — an analysed track with no cues comes back as
-  `items: []` with `slots: 8`.
+- **`has_cues` and `no_cues` mean "a hot cue is set", and cost a little to
+  say so.** Engine writes a `quickCues` blob to every analysed track whether
+  or not any pad is used, so the cheap SQL test (`quickCues` present and
+  non-empty) answers a question about *analysis*: in the 281-blob reference
+  library all 281 would count as having cues, while two tracks (three rows,
+  one track being exported to a second library) actually do. The blob is
+  therefore decoded when the search index is built, and
+  `search_tracks(flags: { has_cues: true })` and `audit_library`'s `no_cues`
+  both read the decoded answer. That costs about 100 ms of extra rebuild
+  time at 50,000 tracks, and a rebuild only runs when your library changes.
+
+  The track's **main cue** does not count towards it: Engine sets that as a
+  playback start marker rather than the DJ placing it (it is set on 159 of
+  the 281 blobs, including every track the library records as played), so
+  counting it would answer a third question again. `has_beatgrid` and
+  `no_beatgrid` do still test for the blob — a `beatData` blob has no
+  "written but empty" state, and on all 281 real blobs presence and a usable
+  grid have never disagreed.
 - **It never writes to your library.** Not to add a cue, not to fix a tag,
   not even to recover a journal Engine DJ left behind. The connection is
   read-only at the kernel level, so a write is refused by SQLite itself

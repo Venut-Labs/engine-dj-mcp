@@ -68,6 +68,7 @@
           "grid": "adjusted"
         },
         "waveform_summary": {
+          "layout": "verified",
           "status": "ok",
           "peaks": 32,
           "entries": 1024,
@@ -178,6 +179,7 @@
           "grid": "adjusted"
         },
         "waveform_summary": {
+          "layout": "verified",
           "status": "ok",
           "peaks": 32,
           "entries": 1024,
@@ -280,6 +282,7 @@
           "grid": "adjusted"
         },
         "waveform_summary": {
+          "layout": "verified",
           "status": "ok",
           "peaks": 32,
           "entries": 1024,
@@ -382,6 +385,7 @@
           "grid": "adjusted"
         },
         "waveform_summary": {
+          "layout": "verified",
           "status": "ok",
           "peaks": 32,
           "entries": 1024,
@@ -484,6 +488,7 @@
           "grid": "adjusted"
         },
         "waveform_summary": {
+          "layout": "verified",
           "status": "ok",
           "peaks": 32,
           "entries": 1024,
@@ -586,6 +591,7 @@
           "grid": "adjusted"
         },
         "waveform_summary": {
+          "layout": "verified",
           "status": "ok",
           "peaks": 32,
           "entries": 1024,
@@ -688,6 +694,7 @@
           "grid": "adjusted"
         },
         "waveform_summary": {
+          "layout": "verified",
           "status": "ok",
           "peaks": 32,
           "entries": 1024,
@@ -727,6 +734,109 @@
             0.51,
             0.45,
             0.49
+          ]
+        }
+      }
+    },
+    {
+      "name": "adjusted-main-cue",
+      "why": "main_cue.is_adjusted set, with the two main-cue doubles differing — the flag no other fixture exercises",
+      "track_length_seconds": 337,
+      "bpm_analyzed": 118,
+      "blob_bytes": {
+        "quickCues": 35,
+        "loops": 192,
+        "beatData": 89,
+        "overviewWaveFormData": 2892
+      },
+      "expect": {
+        "sample_rate": 44100,
+        "cues": {
+          "layout": "verified",
+          "status": "ok",
+          "items": [],
+          "total": 0,
+          "truncated": false,
+          "slots": 8,
+          "main_cue": {
+            "position_samples": 1441461.0283670034,
+            "position_seconds": 32.686,
+            "default_samples": 0,
+            "is_adjusted": true
+          }
+        },
+        "loops": {
+          "layout": "unverified",
+          "status": "ok",
+          "items": [],
+          "total": 0,
+          "truncated": false,
+          "slots": 8
+        },
+        "beatgrid": {
+          "layout": "verified",
+          "status": "ok",
+          "items": [
+            {
+              "sample": -83598.83339611892,
+              "beat": -4,
+              "seconds": -1.896
+            },
+            {
+              "sample": 14873028.285247948,
+              "beat": 663,
+              "seconds": 337.257
+            }
+          ],
+          "total": 2,
+          "truncated": false,
+          "sample_rate": 44100,
+          "sample_count": 14861952,
+          "duration_seconds": 337.006,
+          "bpm": 118,
+          "grid": "adjusted"
+        },
+        "waveform_summary": {
+          "layout": "verified",
+          "status": "ok",
+          "peaks": 32,
+          "entries": 1024,
+          "samples_per_entry": 14513.625,
+          "bytes": 3099,
+          "duration_seconds": 337,
+          "profile": [
+            0.25,
+            0.24,
+            0.27,
+            0.86,
+            0.84,
+            0.77,
+            0.82,
+            0.87,
+            0.86,
+            0.82,
+            0.81,
+            0.78,
+            0.76,
+            0.69,
+            0.69,
+            0.8,
+            0.78,
+            0.79,
+            0.76,
+            0.69,
+            0.67,
+            0.67,
+            0.24,
+            0.69,
+            0.79,
+            0.83,
+            0.84,
+            0.79,
+            0.8,
+            0.67,
+            0.67,
+            0.67
           ]
         }
       }

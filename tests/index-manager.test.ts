@@ -8,6 +8,7 @@ import { makeLibrary } from "./fixtures/gen-library.js";
 import { readLibraryInfo } from "../src/discovery.js";
 import { QueryProcess } from "../src/proc/query-client.js";
 import { IndexManager } from "../src/store/index-manager.js";
+import { SIDECAR_FORMAT } from "../src/sidecar/schema.js";
 import { isEngineError } from "../src/errors.js";
 
 let dir: string, mdb: string, qp: QueryProcess, mgr: IndexManager;
@@ -57,6 +58,38 @@ describe("index lifecycle", () => {
     expect(isEngineError(hit)).toBe(false);
     if (isEngineError(hit)) return;
     expect(hit.rows).toEqual([[7]]);
+  });
+
+  it("rebuilds a sidecar written by a different index format, even though the library has not changed", async () => {
+    // The staleness probe compares the library's change counter, and the
+    // change counter does not move when *this code's* idea of a column
+    // changes. has_cues did change meaning (from "a quickCues blob exists"
+    // to "a hot cue is set"), so without a format check a user whose
+    // library sits untouched would go on being served the old answer off
+    // disk for as long as they left it alone.
+    const fresh = await mgr.ensureFresh();
+    expect(isEngineError(fresh)).toBe(false);
+    if (isEngineError(fresh)) return;
+    expect(fresh.rebuilt).toBe(false); // nothing has changed: the baseline
+
+    // Only the format marker is touched -- the change counter still matches
+    // the library exactly, so a rebuild here can only be the format check.
+    const w = new DatabaseSync(mgr.path);
+    w.exec(`UPDATE index_meta SET index_format = ${SIDECAR_FORMAT - 1}`);
+    w.close();
+
+    const r = await mgr.ensureFresh();
+    expect(isEngineError(r)).toBe(false);
+    if (isEngineError(r)) return;
+    expect(r.rebuilt).toBe(true);
+    expect(r.indexed).toBe(300);
+
+    const after = new DatabaseSync(mgr.path, { readOnly: true });
+    const meta = after.prepare("SELECT index_format FROM index_meta").get() as {
+      index_format: number;
+    };
+    after.close();
+    expect(meta.index_format).toBe(SIDECAR_FORMAT);
   });
 
   it("returns a structured error instead of throwing when the sidecar directory cannot be created", async () => {

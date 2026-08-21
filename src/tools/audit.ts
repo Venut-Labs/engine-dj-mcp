@@ -57,15 +57,32 @@ const SQL_CHECKS: Record<string, SqlCheck> = {
     id: "t.id",
     body: `FROM Track t WHERE t.isAnalyzed = 0 OR t.isAnalyzed IS NULL`,
   },
-  // "Empty OR NULL", per the spec: a zero-length blob is not a cue list.
-  // The same expression backs side.track_derived.has_cues/has_grid (see
-  // sidecar/build.ts) and blobs/index.ts's `empty` status, so search, audit
-  // and get_track_performance cannot disagree about the same track.
+  // "No cue is set", not "no quickCues blob" -- and therefore read from the
+  // sidecar rather than computed here.
+  //
+  // SQL cannot decode a blob, and Engine writes a full eight-slot quickCues
+  // blob to every analysed track, so `length(quickCues) = 0` reported zero
+  // offenders on a reference library where 255 of 257 tracks have no cue at
+  // all. The check named the right thing and structurally could not report
+  // it -- the one shape of wrong answer this tool exists to avoid.
+  // side.track_derived.has_cues is decoded during the rebuild (see
+  // sidecar/build.ts), which is our code and not limited to SQL, so the
+  // check reads it from there.
+  //
+  // Every Track gets a track_derived row, so this still counts tracks,
+  // exactly as the LEFT JOIN version did. The sidecar is attached by the
+  // time any tool runs: every gated tool goes through IndexManager
+  // .ensureFresh first, and search_tracks has always read the same table.
   no_cues: {
-    id: "t.id",
-    body: `FROM Track t LEFT JOIN PerformanceData p ON p.trackId = t.id
-           WHERE COALESCE(length(p.quickCues), 0) = 0`,
+    id: "d.track_id",
+    body: `FROM side.track_derived d WHERE d.has_cues = 0`,
   },
+  // Still "empty OR NULL": a zero-length blob is not a beatgrid. Unlike
+  // quickCues, beatData has no "written but empty" state to see through --
+  // all 281 blobs in the reference library decode to a real two-marker grid
+  // whose implied tempo matches Track.bpmAnalyzed, so presence and a usable
+  // grid have not once disagreed. sidecar/build.ts records why decoding it
+  // as well would buy nothing.
   no_beatgrid: {
     id: "t.id",
     body: `FROM Track t LEFT JOIN PerformanceData p ON p.trackId = t.id
