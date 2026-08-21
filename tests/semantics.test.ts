@@ -25,6 +25,16 @@ describe("camelot", () => {
     for (let k = 0; k < 24; k++) labels.add(camelot(k)!);
     expect(labels.size).toBe(24);
   });
+
+  it("puts the wheel where Engine DJ itself puts it", () => {
+    // Bijectivity, parity and monotonicity all hold for *any* rotation of
+    // the wheel, so none of them pin the anchor. Only a concrete observed
+    // pair does: the track stored as key = 20 displays as 6B in Engine DJ's
+    // own interface, which is what fixes key = 0 at 8B (C major) rather
+    // than leaving it an assumption.
+    expect(camelot(20)).toBe("6B");
+    expect(camelot(0)).toBe("8B");
+  });
 });
 
 describe("keyName", () => {

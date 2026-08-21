@@ -18,6 +18,14 @@
 > the track stored as 102. Every code block below has been corrected. The
 > defect survived 147 passing tests because the fixture generator encoded the
 > same false assumption as the implementation.
+>
+> **Correction, 2026-08-21 (second pass).** The banner above claimed every
+> code block had been corrected; two had not. The `tempo` test block in Task
+> 1 still asserted `tempo(null, 12800) === 128.0`, which fails against the
+> shipped implementation, and the `semantics.ts` block beside it still called
+> the `key = 0` → C major anchor an assumption. Both are fixed below. The
+> anchor is confirmed, not assumed: the track stored as `key = 20` displays
+> as 6B in Engine DJ, exactly what the formula produces.
 
 ## Global Constraints
 
@@ -755,9 +763,9 @@ describe("camelot", () => {
 });
 
 describe("tempo", () => {
-  it("prefers the analysed value and scales the stored integer by 100", () => {
-    expect(tempo(128.03, 12800)).toBeCloseTo(128.03, 2);
-    expect(tempo(null, 12800)).toBeCloseTo(128.0, 2);
+  it("prefers the analysed value and uses the stored bpm at face value", () => {
+    expect(tempo(128.03, 128)).toBeCloseTo(128.03, 2);
+    expect(tempo(null, 128)).toBeCloseTo(128.0, 2);
     expect(tempo(null, null)).toBeNull();
   });
 });
@@ -794,8 +802,12 @@ import type { DatabaseSync } from "node:sqlite";
  * Engine's own conversion, taken from the application binary:
  *   CASE key WHEN -1 THEN NULL ELSE (key + 15 - 2 * (key % 2)) % 24 END
  * The result is a wheel index: even `key` gives mode B, odd gives A, and the
- * wheel number is floor(index / 2) + 1. key=0 is assumed to be C major, which
- * makes it 8B — the standard Camelot anchor.
+ * wheel number is floor(index / 2) + 1. key=0 is C major, so 8B — the
+ * standard Camelot anchor. That anchor is confirmed against Engine DJ's own
+ * display, not assumed: the track stored as key=20 shows as 6B in Engine,
+ * which is exactly what this formula produces ((20 + 15) % 24 = 11, wheel
+ * number 6, mode B). A wrongly-anchored wheel would put that track on a
+ * different number.
  */
 export function camelotIndex(key: number | null): number | null {
   if (key === null || key === undefined || key < 0 || key > 23) return null;

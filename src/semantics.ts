@@ -5,8 +5,12 @@ import { absTrackPath, redactPath } from "./paths.js";
  * Engine's own conversion, taken from the application binary:
  *   CASE key WHEN -1 THEN NULL ELSE (key + 15 - 2 * (key % 2)) % 24 END
  * The result is a wheel index: even `key` gives mode B, odd gives A, and the
- * wheel number is floor(index / 2) + 1. key=0 is assumed to be C major, which
- * makes it 8B — the standard Camelot anchor.
+ * wheel number is floor(index / 2) + 1. key=0 is C major, so 8B — the
+ * standard Camelot anchor. That anchor is confirmed against Engine DJ's own
+ * display, not assumed: the track stored as key=20 shows as 6B in Engine,
+ * which is exactly what this formula produces ((20 + 15) % 24 = 11, wheel
+ * number 6, mode B). A wrongly-anchored wheel would put that track on a
+ * different number.
  */
 export function camelotIndex(key: number | null): number | null {
   if (key === null || key === undefined || !Number.isFinite(key) || key < 0 || key > 23) return null;
