@@ -1,6 +1,6 @@
 {
   "name": "engine-dj-mcp",
-  "version": "0.1.0",
+  "version": "0.9.0",
   "description": "Read-only MCP server for searching and auditing an Engine DJ library. Not affiliated with inMusic or Denon DJ.",
   "keywords": [
     "mcp",
@@ -24,9 +24,15 @@
     "url": "https://github.com/Venut-Labs/engine-dj-mcp/issues"
   },
   "type": "module",
-  "engines": { "node": ">=22.13.0" },
-  "bin": { "engine-dj-mcp": "dist/index.js" },
-  "files": ["dist"],
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "bin": {
+    "engine-dj-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "prepare": "npm run build",
     "pretest": "npm run build",
