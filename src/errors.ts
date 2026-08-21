@@ -1,6 +1,17 @@
 export const ERROR_CODES = [
   "library_busy",
   "library_not_found",
+  // The library was found and opened, but a read against it failed for a
+  // reason that has nothing to do with schema version -- corruption, a
+  // permissions problem, an oversized column node:sqlite refuses to convert.
+  // Distinct from unsupported_schema (below), which is specifically "this
+  // version is outside the allowlist", and from library_needs_recovery,
+  // which is specifically a hot journal: discovery.ts checks for that first
+  // and reports it precisely, so this is only the remainder. Previously
+  // every one of these landed on unsupported_schema, which sent debugging
+  // toward "check the schema version" for a failure that was never about
+  // the schema at all.
+  "library_unreadable",
   "unsupported_schema",
   "query_timeout",
   "query_process_crashed",

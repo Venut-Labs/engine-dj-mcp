@@ -68,9 +68,10 @@ function reply(value: unknown) {
  * design (a permissions error on one candidate must not blank out every
  * other one). That means a hot journal on the *only* library on this
  * machine looks identical to no library existing at all -- both come back
- * as an empty list, verified: opening it raises "attempt to write a
- * readonly database", which readLibraryInfo currently folds into
- * unsupported_schema and then drops entirely.
+ * as an empty list, verified: readLibraryInfo (discovery.ts) does report a
+ * hot journal precisely, as library_needs_recovery, but discoverLibraries()
+ * still drops it along with every other unreadable candidate, by that same
+ * design.
  *
  * This walks the same candidate paths independently, purely to tell those
  * two cases apart, so `ready()` below can report library_needs_recovery

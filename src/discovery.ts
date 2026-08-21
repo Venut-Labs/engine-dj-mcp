@@ -2,7 +2,8 @@ import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { err, type EngineError } from "./errors.js";
+import { err, isEngineError, libraryNeedsRecovery, type EngineError } from "./errors.js";
+import { hasHotJournal } from "./store/connections.js";
 import { libraryCandidates } from "./paths.js";
 
 export const SUPPORTED_SCHEMAS = ["3.0.0", "3.0.1", "3.0.2"] as const;
@@ -18,6 +19,17 @@ export interface LibraryInfo {
 export function readLibraryInfo(mdbPath: string): LibraryInfo | EngineError {
   if (!existsSync(mdbPath)) {
     return err("library_not_found", `No Engine library database at ${mdbPath}`);
+  }
+  if (hasHotJournal(mdbPath)) {
+    // Same check openQueryConnection makes before opening (store/connections.ts):
+    // recovering a hot journal needs a write, which this project never
+    // performs, even to probe a library. Caught here first so the specific,
+    // actionable library_needs_recovery reaches the caller instead of the
+    // SELECT below failing with the raw "attempt to write a readonly
+    // database" and landing in the generic library_unreadable catch --
+    // that conflation is exactly what made this condition hard to diagnose
+    // in practice.
+    return libraryNeedsRecovery();
   }
   let db: DatabaseSync;
   try {
@@ -48,7 +60,8 @@ export function readLibraryInfo(mdbPath: string): LibraryInfo | EngineError {
     // with Number(); nothing here forces an oversized column through it.
     stmt.setReadBigInts(true);
     const row = stmt.get() as Record<string, unknown> | undefined;
-    if (!row) return err("unsupported_schema", "Information table is empty");
+    // Not a version problem -- there is no row to read a version from.
+    if (!row) return err("library_unreadable", "Information table is empty");
 
     const schema: [number, number, number] = [
       Number(row.schemaVersionMajor ?? 0),
@@ -65,7 +78,12 @@ export function readLibraryInfo(mdbPath: string): LibraryInfo | EngineError {
     }
     return { path: mdbPath, uuid: String(row.uuid ?? ""), schema, supported, trackCount };
   } catch (e) {
-    return err("unsupported_schema", "Could not read Information", {
+    // Whatever this is -- corruption, a permissions problem, a lock the
+    // open survived but the read did not -- it was never about the schema
+    // version: that is only known once this SELECT has actually returned a
+    // row, which it did not. The hot-journal case is carved out above, so
+    // this is the genuine remainder.
+    return err("library_unreadable", "Could not read Information", {
       detail: String((e as Error).message),
     });
   } finally {
@@ -108,7 +126,7 @@ export function probeLibraries(roots: string[] = defaultRoots()): LibraryProbe[]
       if (!existsSync(candidate)) continue;
       const info = readLibraryInfo(candidate);
       out.push(
-        "error" in info
+        isEngineError(info)
           ? { path: candidate, info: null, error: info }
           : { path: candidate, info, error: null },
       );

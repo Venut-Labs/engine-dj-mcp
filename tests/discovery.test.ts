@@ -1,10 +1,18 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, rmSync, readdirSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { makeLibrary } from "./fixtures/gen-library.js";
 import { readLibraryInfo, discoverLibraries, defaultRoots } from "../src/discovery.js";
 import { isEngineError } from "../src/errors.js";
+import { IndexManager } from "../src/store/index-manager.js";
+import type { QueryProcess } from "../src/proc/query-client.js";
+
+// Same magic as store/connections.ts's HOT_JOURNAL_MAGIC, duplicated here
+// (as readonly-guarantees.test.ts also does) rather than exported from src
+// for a test-only constant.
+const HOT_JOURNAL_MAGIC = "d9d505f920a163d7";
 
 let dir: string;
 beforeAll(() => { dir = mkdtempSync(join(tmpdir(), "edj-disc-")); });
@@ -46,6 +54,69 @@ describe("discovery", () => {
     expect(info.schema).toEqual([2, 18, 0]);
     expect(info.supported).toBe(false);
     rmSync(other, { recursive: true, force: true });
+  });
+
+  it("tells an unsupported version, an unreadable database and a hot journal apart", async () => {
+    // The regression this guards: all three used to be, or could be,
+    // reported as unsupported_schema -- an unreadable database because
+    // readLibraryInfo's catch-all used that code for any SELECT failure,
+    // and a hot journal because that catch-all is exactly what "attempt to
+    // write a readonly database" landed in. Three different real
+    // conditions must produce three different codes, not the same one
+    // three times over.
+
+    // 1) Unsupported version: a fully readable library outside
+    // SUPPORTED_SCHEMAS. readLibraryInfo succeeds -- this was never its
+    // error to report -- and IndexManager.ensureFresh() is what turns
+    // `supported: false` into the unsupported_schema EngineError a caller
+    // actually sees, without ever touching the query process (the
+    // unsupported branch returns first), so a stub stands in for it.
+    const oldDir = mkdtempSync(join(tmpdir(), "edj-disc-old2-"));
+    const oldInfo = readLibraryInfo(makeLibrary(oldDir, { tracks: 5, schema: [2, 18, 0] }));
+    expect(isEngineError(oldInfo)).toBe(false);
+    if (isEngineError(oldInfo)) return;
+    const mgr = new IndexManager(oldInfo, {} as unknown as QueryProcess, join(oldDir, "sidecars"));
+    const unsupported = await mgr.ensureFresh();
+    expect(isEngineError(unsupported)).toBe(true);
+    if (!isEngineError(unsupported)) return;
+    expect(unsupported.error).toBe("unsupported_schema");
+
+    // 2) Unreadable database: a version-supported library whose SELECT
+    // fails for a reason unrelated to schema -- a real SQLite EXCLUSIVE
+    // lock, the same technique degraded.test.ts uses.
+    const lockedDir = mkdtempSync(join(tmpdir(), "edj-disc-locked-"));
+    const lockedMdb = makeLibrary(lockedDir, { tracks: 5 });
+    const holder = new DatabaseSync(lockedMdb);
+    holder.exec("BEGIN EXCLUSIVE");
+    holder.exec("UPDATE Track SET rating = 3 WHERE id = 1");
+    let unreadable: ReturnType<typeof readLibraryInfo>;
+    try {
+      unreadable = readLibraryInfo(lockedMdb);
+    } finally {
+      holder.exec("ROLLBACK");
+      holder.close();
+    }
+    expect(isEngineError(unreadable), JSON.stringify(unreadable)).toBe(true);
+    if (!isEngineError(unreadable)) return;
+    expect(unreadable.error).toBe("library_unreadable");
+
+    // 3) Hot journal: a rollback journal carrying SQLite's real hot-journal
+    // magic -- the same synthetic technique readonly-guarantees.test.ts
+    // uses to unit-test hasHotJournal() itself.
+    const hotDir = mkdtempSync(join(tmpdir(), "edj-disc-hot-"));
+    const hotMdb = makeLibrary(hotDir, { tracks: 5 });
+    writeFileSync(`${hotMdb}-journal`, Buffer.from(HOT_JOURNAL_MAGIC + "00".repeat(16), "hex"));
+    const hot = readLibraryInfo(hotMdb);
+    expect(isEngineError(hot)).toBe(true);
+    if (!isEngineError(hot)) return;
+    expect(hot.error).toBe("library_needs_recovery");
+
+    // The actual point: three different codes, not one code three times.
+    expect(new Set([unsupported.error, unreadable.error, hot.error]).size).toBe(3);
+
+    rmSync(oldDir, { recursive: true, force: true });
+    rmSync(lockedDir, { recursive: true, force: true });
+    rmSync(hotDir, { recursive: true, force: true });
   });
 
   it("returns library_not_found for a missing file", () => {
