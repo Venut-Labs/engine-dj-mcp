@@ -12,6 +12,7 @@ import { getTracks } from "../src/tools/tracks.js";
 import { listLibraries } from "../src/tools/libraries.js";
 import { refreshIndex } from "../src/tools/refresh.js";
 import { isEngineError } from "../src/errors.js";
+import { absTrackPath, redactPath } from "../src/paths.js";
 import { tempo, camelot } from "../src/semantics.js";
 
 let dir: string, mdb: string, qp: QueryProcess, mgr: IndexManager;
@@ -25,6 +26,52 @@ beforeAll(async () => {
   await mgr.ensureFresh();
 });
 afterAll(() => { qp.dispose(); rmSync(dir, { recursive: true, force: true }); });
+
+describe("SQL functions on the query connection", () => {
+  it("registers all five the spec's table lists, abs_path included", async () => {
+    // abs_path was in the spec's SQL-function table and simply never
+    // registered, so `SELECT abs_path(path)` was a hard SQL error through
+    // run_sql. Calling each one is the only way to tell "registered" from
+    // "documented".
+    const r = await qp.run(
+      `SELECT camelot(t.key) AS c, key_name(t.key) AS k,
+              tempo(t.bpmAnalyzed, t.bpm) AS bpm,
+              key_distance('8A', '9A') AS d,
+              abs_path(t.path) AS p
+       FROM Track t WHERE t.key != -1 LIMIT 1`,
+    );
+    expect(isEngineError(r), JSON.stringify(r)).toBe(false);
+    if (isEngineError(r)) return;
+    const [c, k, bpm, d, p] = r.rows[0]!;
+    expect(typeof c).toBe("string");
+    expect(typeof k).toBe("string");
+    expect(Number(bpm)).toBeGreaterThan(0);
+    expect(Number(d)).toBe(1);
+    expect(typeof p).toBe("string");
+  });
+
+  it("resolves abs_path against the Engine Library folder, matching absTrackPath", async () => {
+    // Track.path is relative and normally begins with "..", so a naive
+    // join against the Database2 directory would produce a path that does
+    // not exist. Compare against the shipped resolver rather than a
+    // hand-rolled expectation.
+    const r = await qp.run("SELECT t.path, abs_path(t.path) FROM Track t WHERE t.id = 1");
+    expect(isEngineError(r)).toBe(false);
+    if (isEngineError(r)) return;
+    const [relative, absolute] = r.rows[0]! as [string, string];
+    expect(relative.startsWith("..")).toBe(true); // the case that makes this non-trivial
+    expect(absolute).toBe(redactPath(absTrackPath(mdb, relative)));
+    expect(absolute.startsWith("/")).toBe(true);
+    expect(absolute).not.toContain("Database2");
+  });
+
+  it("returns null for a null path rather than the string 'null'", async () => {
+    const r = await qp.run("SELECT abs_path(NULL)");
+    expect(isEngineError(r)).toBe(false);
+    if (isEngineError(r)) return;
+    expect(r.rows[0]![0]).toBeNull();
+  });
+});
 
 describe("get_tracks", () => {
   it("returns the requested ids in request order", async () => {

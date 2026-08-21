@@ -141,6 +141,25 @@ describe("get_tracks path redaction", () => {
   });
 });
 
+describe("abs_path SQL function", () => {
+  // abs_path exists precisely to turn a relative Track.path into an
+  // absolute one, so it is the newest way for the user's account name to
+  // reach a model provider -- through run_sql, which has no redact_paths
+  // switch of its own. It folds the home prefix like every other absolute
+  // path this project hands back.
+  it("folds the home prefix on a path it resolves under $HOME", async () => {
+    const r = await qp.run("SELECT abs_path(t.path) FROM Track t WHERE t.id = 1");
+    expect(isEngineError(r)).toBe(false);
+    if (isEngineError(r)) return;
+    const resolved = String(r.rows[0]![0]);
+    // The fixture's track 1 path was rewritten to an absolute path under
+    // $HOME in beforeAll, so this really does exercise the home branch.
+    expect(ABS_UNDER_HOME.startsWith(homedir() + "/")).toBe(true);
+    expect(resolved).not.toContain(homedir());
+    expect(resolved).toBe(redactPath(ABS_UNDER_HOME));
+  });
+});
+
 describe("list_libraries path redaction", () => {
   let homeDir: string, homeMdb: string;
   let outsideDir: string, outsideMdb: string;

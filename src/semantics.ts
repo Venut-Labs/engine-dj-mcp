@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { absTrackPath, redactPath } from "./paths.js";
 
 /**
  * Engine's own conversion, taken from the application binary:
@@ -69,11 +70,17 @@ export function keyDistance(a: string, b: string): number | null {
 }
 
 /**
- * SQL-callable versions. These are an escape hatch for run_sql; filtering by
- * key or tempo in a WHERE clause should use the indexed sidecar columns in
- * side.track_derived, because a JS callback runs per row and defeats indexes.
+ * SQL-callable versions of all five functions the spec lists. These are an
+ * escape hatch for run_sql; filtering by key or tempo in a WHERE clause
+ * should use the indexed sidecar columns in side.track_derived, because a JS
+ * callback runs per row and defeats indexes.
+ *
+ * `mdbPath` is what makes `abs_path` possible: Track.path is relative to the
+ * `Engine Library` folder (and usually starts with `..`), so resolving it
+ * needs to know where m.db lives. It is a parameter rather than a lookup so
+ * a connection can never resolve paths against the wrong library.
  */
-export function registerFunctions(db: DatabaseSync): void {
+export function registerFunctions(db: DatabaseSync, mdbPath: string): void {
   const opts = { deterministic: true } as const;
   db.function("camelot", opts, (key: unknown) => camelot(key === null ? null : Number(key)));
   db.function("key_name", opts, (key: unknown) => keyName(key === null ? null : Number(key)));
@@ -81,4 +88,9 @@ export function registerFunctions(db: DatabaseSync): void {
     tempo(a === null ? null : Number(a), b === null ? null : Number(b)));
   db.function("key_distance", opts, (a: unknown, b: unknown) =>
     a === null || b === null ? null : keyDistance(String(a), String(b)));
+  // Redacted, like every other absolute path this project hands back: the
+  // result of this function goes to a model provider through run_sql, and
+  // the home prefix carries the user's account name.
+  db.function("abs_path", opts, (p: unknown) =>
+    p === null || p === undefined ? null : redactPath(absTrackPath(mdbPath, String(p))));
 }

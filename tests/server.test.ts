@@ -324,6 +324,19 @@ describe("createServer", () => {
     await client.close();
   });
 
+  it("names every registered SQL function in engine://schema, abs_path included", async () => {
+    // The resource is the only place a model learns which functions exist
+    // before writing run_sql against them, and abs_path was in the spec's
+    // table but neither registered nor documented.
+    const { client } = await connectedClient([libDir], libSidecars);
+    const { contents } = await client.readResource({ uri: "engine://schema" });
+    const text = String((contents[0] as { text: string }).text);
+    for (const fn of ["camelot(key)", "key_name(key)", "tempo(bpmAnalyzed, bpm)", "key_distance(a, b)", "abs_path(path)"]) {
+      expect(text, fn).toContain(fn);
+    }
+    await client.close();
+  });
+
   it("reports a real index_generation once an index has been built, through both the resource and the tool", async () => {
     const { client } = await connectedClient([libDir], libSidecars);
     // Force a build via the gated path, same as any other tool would.

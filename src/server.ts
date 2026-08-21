@@ -262,7 +262,15 @@ Tables live in \`m.db\` (attached as \`main\`); the search index lives in \`side
   the track stored as 102). \`side.track_derived.tempo\` holds the resolved
   value and is indexed.
 - \`Track.path\` is relative to the \`Engine Library\` folder and usually
-  contains \`..\`.
+  contains \`..\`. The SQL function \`abs_path(path)\` resolves it against
+  this library's location; the home prefix comes back folded to \`~\`.
+
+## SQL functions
+Registered on the query connection, all deterministic:
+\`camelot(key)\`, \`key_name(key)\`, \`tempo(bpmAnalyzed, bpm)\`,
+\`key_distance(a, b)\` and \`abs_path(path)\`. Each runs a callback per row,
+so use them for projection and one-off questions, not in a \`WHERE\` clause
+where \`side.track_derived\` is indexed and these are not.
 - Playlists are singly linked lists: order lives in \`Playlist.nextListId\`
   and \`PlaylistEntity.nextEntityId\`, not in any position column.
 - A track's natural key across drives is \`(originDatabaseUuid, originTrackId)\`.

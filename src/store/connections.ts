@@ -95,7 +95,7 @@ export function openQueryConnection(mdbPath: string, sidecar: string | null): Da
   const db = new DatabaseSync(mdbPath, { readOnly: true });
   db.exec("PRAGMA busy_timeout = 3000");
   if (sidecar) db.prepare("ATTACH DATABASE ? AS side").run(toReadOnlyUri(sidecar));
-  registerFunctions(db);
+  registerFunctions(db, mdbPath);
   return db;
 }
 
@@ -104,7 +104,7 @@ export function openSyncConnection(sidecar: string, mdbPath: string): DatabaseSy
   const db = new DatabaseSync(sidecar);
   db.exec("PRAGMA busy_timeout = 3000");
   db.prepare("ATTACH DATABASE ? AS engine").run(toReadOnlyUri(mdbPath));
-  registerFunctions(db);
+  registerFunctions(db, mdbPath);
   return db;
 }
 
