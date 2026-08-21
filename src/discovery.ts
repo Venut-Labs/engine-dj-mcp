@@ -38,9 +38,16 @@ export function readLibraryInfo(mdbPath: string): LibraryInfo | EngineError {
   }
   try {
     // SELECT * on purpose: the Information column set differs between versions.
-    const row = db.prepare("SELECT * FROM Information LIMIT 1").get() as
-      | Record<string, unknown>
-      | undefined;
+    const stmt = db.prepare("SELECT * FROM Information LIMIT 1");
+    // Information.currentPlayedIndiciator is a 64-bit value on a real
+    // library (measured: -8676408967926364917, far outside
+    // Number.MAX_SAFE_INTEGER), and node:sqlite throws instead of returning
+    // it unless a statement opts into BigInt reads. Without this, SELECT *
+    // threw on every real library and discoverLibraries() silently dropped
+    // all of them. Only the small schema/id fields below are ever converted
+    // with Number(); nothing here forces an oversized column through it.
+    stmt.setReadBigInts(true);
+    const row = stmt.get() as Record<string, unknown> | undefined;
     if (!row) return err("unsupported_schema", "Information table is empty");
 
     const schema: [number, number, number] = [

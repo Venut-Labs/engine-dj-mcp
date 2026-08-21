@@ -20,6 +20,23 @@ describe("discovery", () => {
     expect(info.trackCount).toBe(10);
   });
 
+  it("reads a library whose currentPlayedIndiciator overflows a JS number", () => {
+    // Measured on two independent real Engine libraries: Information.
+    // currentPlayedIndiciator holds -8676408967926364917, a 64-bit value far
+    // outside Number.MAX_SAFE_INTEGER. node:sqlite throws rather than
+    // returning it unless the statement opts into BigInt reads, and that
+    // throw used to be caught and reported as unsupported_schema -- dropping
+    // every real library from discoverLibraries() and leaving list_libraries
+    // permanently empty. gen-library.ts now bakes in the real value, so this
+    // is what discoverLibraries() would actually see against a real library.
+    const info = readLibraryInfo(makeLibrary(dir, { tracks: 3 }));
+    expect(isEngineError(info), JSON.stringify(info)).toBe(false);
+    if (isEngineError(info)) return;
+    expect(info.schema).toEqual([3, 0, 2]);
+    expect(info.supported).toBe(true);
+    expect(info.trackCount).toBe(3);
+  });
+
   it("reports an unsupported schema instead of failing silently", () => {
     const other = mkdtempSync(join(tmpdir(), "edj-old-"));
     const info = readLibraryInfo(makeLibrary(other, { tracks: 5, schema: [2, 18, 0] }));

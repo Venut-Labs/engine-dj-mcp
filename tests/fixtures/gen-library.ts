@@ -54,9 +54,16 @@ export function makeLibrary(
   db.exec(`CREATE INDEX index_Track_bpmAnalyzed ON Track(CAST(bpmAnalyzed + 0.5 AS int))`);
 
   const uuid = "00000000-0000-4000-8000-0000000000" + String(maj).padStart(2, "0");
+  // Measured on two independent real Engine libraries: currentPlayedIndiciator
+  // is a 64-bit value far outside Number.MAX_SAFE_INTEGER (9007199254740991),
+  // not a corrupt or unusual one. A fixture that wrote 0 here let the code
+  // and the fixture agree with each other and disagree with reality -- the
+  // same failure shape as the BPM scaling defect this project already had to
+  // correct once.
+  const REAL_CURRENT_PLAYED_INDICATOR = -8676408967926364917n;
   db.prepare(`INSERT INTO Information (uuid, schemaVersionMajor, schemaVersionMinor,
     schemaVersionPatch, currentPlayedIndiciator, lastRekordBoxLibraryImportReadCounter)
-    VALUES (?,?,?,?,0,0)`).run(uuid, maj, min, pat);
+    VALUES (?,?,?,?,?,0)`).run(uuid, maj, min, pat, REAL_CURRENT_PLAYED_INDICATOR);
 
   const r = rng(42);
   const pick = <T>(a: T[]) => a[Math.floor(r() * a.length)]!;
