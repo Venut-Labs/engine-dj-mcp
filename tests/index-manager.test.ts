@@ -1,6 +1,6 @@
 // tests/index-manager.test.ts
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, rmSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, chmodSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -113,6 +113,65 @@ describe("index lifecycle", () => {
       qp2.dispose();
       chmodSync(roRoot, 0o700);
       rmSync(roRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("peekGeneration", () => {
+  // The cheap half of ensureFresh(), used by list_libraries so that asking
+  // "what libraries do I have" is never the call that pays for a first (or
+  // renewed) index build. Both tests below would fail if peekGeneration()
+  // ever called ensureFresh() (or buildSidecar) internally: a fresh library
+  // would end up with a sidecar file on disk and an attached query
+  // connection, neither of which this method is allowed to cause.
+  it("reads 0 without building or attaching anything, on a library never indexed", async () => {
+    const freshDir = mkdtempSync(join(tmpdir(), "edj-mgr-peek-fresh-"));
+    const freshMdb = makeLibrary(freshDir, { tracks: 50 });
+    const lib = readLibraryInfo(freshMdb);
+    if (isEngineError(lib)) throw new Error("fixture library unreadable");
+    const freshQp = new QueryProcess(freshMdb, null, 5000);
+    const freshMgr = new IndexManager(lib, freshQp, join(freshDir, "sidecars"));
+    try {
+      expect(freshMgr.peekGeneration()).toBe(0);
+      expect(existsSync(freshMgr.path)).toBe(false);
+      expect(freshQp.hasSidecar).toBe(false);
+    } finally {
+      freshQp.dispose();
+      rmSync(freshDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reads a generation a previous IndexManager instance actually built, without calling ensureFresh", async () => {
+    const sharedDir = mkdtempSync(join(tmpdir(), "edj-mgr-peek-shared-"));
+    const sharedMdb = makeLibrary(sharedDir, { tracks: 20 });
+    const lib = readLibraryInfo(sharedMdb);
+    if (isEngineError(lib)) throw new Error("fixture library unreadable");
+    const sidecars = join(sharedDir, "sidecars");
+
+    const qpA = new QueryProcess(sharedMdb, null, 5000);
+    const mgrA = new IndexManager(lib, qpA, sidecars);
+    try {
+      const built = await mgrA.ensureFresh();
+      expect(isEngineError(built)).toBe(false);
+      if (isEngineError(built)) return;
+      expect(built.generation).toBe(1);
+    } finally {
+      qpA.dispose();
+    }
+
+    // A second instance over the same sidecar directory, standing in for a
+    // fresh server process (or list_libraries reading a library another
+    // tool call already indexed): peekGeneration() must report the real
+    // on-disk generation without ever calling ensureFresh() on this
+    // instance, and without attaching the sidecar to this qp either.
+    const qpB = new QueryProcess(sharedMdb, null, 5000);
+    const mgrB = new IndexManager(lib, qpB, sidecars);
+    try {
+      expect(mgrB.peekGeneration()).toBe(1);
+      expect(qpB.hasSidecar).toBe(false);
+    } finally {
+      qpB.dispose();
+      rmSync(sharedDir, { recursive: true, force: true });
     }
   });
 });

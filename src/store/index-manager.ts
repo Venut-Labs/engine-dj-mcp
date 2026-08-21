@@ -45,6 +45,22 @@ export class IndexManager {
   }
 
   /**
+   * The generation of whatever index currently exists on disk, read
+   * directly from the sidecar's own index_meta table -- never built,
+   * rebuilt or attached. This is the cheap half of ensureFresh() (the part
+   * that does not open the main library at all), used by list_libraries so
+   * that asking "what libraries do I have" is never the call that pays for
+   * a first (or renewed) index build: that cost belongs to whichever tool
+   * call actually needs a fresh index, through ensureFresh(). Returns 0,
+   * the same "not a real generation" value ensureFresh() reports before
+   * ever building one, when no usable sidecar exists yet.
+   */
+  peekGeneration(): number {
+    this.#storedCounter();
+    return this.#generation;
+  }
+
+  /**
    * The change counter the sidecar on disk was built from, or null when
    * there is no usable sidecar — which forces a rebuild.
    *

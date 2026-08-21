@@ -262,12 +262,24 @@ export async function createServer(
    * null, not as "generation zero". A library nobody has queried yet has no
    * IndexManager at all and reports null for the same reason: listing the
    * libraries must not fork a query child per drive to fill in a number.
+   *
+   * Reads each known IndexManager's generation via peekGeneration(), not
+   * ensureFresh(): ensureFresh() also rebuilds when the library has
+   * changed, which is exactly right for a tool that is about to query the
+   * index and exactly wrong here. list_libraries is what a user reaches
+   * for when something looks broken, and list_libraries re-scans on every
+   * call (see below) -- so making it pay for a first, or renewed, index
+   * build on a big or currently-locked library would make the one
+   * diagnostic tool that must stay fast the one most likely to block.
+   * peekGeneration() only reads the sidecar already on disk, so this stays
+   * honest (a real, current generation number, never a fabricated one) and
+   * never forces work list_libraries does not itself need to answer.
    */
-  const libraryReport = async (discovered: LibraryEntry[]) => {
+  const libraryReport = (discovered: LibraryEntry[]) => {
     const generations = new Map<string, number>();
     for (const state of states.values()) {
-      await state.mgr.ensureFresh(); // best effort: keeps a live library's generation accurate
-      if (state.mgr.generation > 0) generations.set(state.lib.uuid, state.mgr.generation);
+      const generation = state.mgr.peekGeneration();
+      if (generation > 0) generations.set(state.lib.uuid, generation);
     }
     return listLibraries(generations, discovered);
   };
@@ -283,7 +295,7 @@ export async function createServer(
     "libraries",
     "engine://libraries",
     { title: "Discovered Engine DJ libraries", mimeType: "application/json" },
-    async (uri) => ({ contents: [{ uri: uri.href, text: JSON.stringify(await libraryReport(libs), null, 2) }] }),
+    async (uri) => ({ contents: [{ uri: uri.href, text: JSON.stringify(libraryReport(libs), null, 2) }] }),
   );
 
   server.registerTool(
@@ -418,7 +430,7 @@ export async function createServer(
       inputSchema: {},
       annotations: RO,
     },
-    async () => reply(await libraryReport(rescanLibraries())),
+    async () => reply(libraryReport(rescanLibraries())),
   );
 
   server.registerTool(
