@@ -1,0 +1,173 @@
+import { describe, it, expect } from "vitest";
+import { checkStatement, enforceLimit } from "../src/guard.js";
+
+describe("statement guard", () => {
+  it("allows basic SELECT statements", () => {
+    for (const sql of ["SELECT 1", "select * from Track", "SELECT * FROM Track limit 5"]) {
+      expect(checkStatement(sql)).toBeNull();
+    }
+  });
+
+  it("allows WITH (CTE) statements", () => {
+    expect(checkStatement("WITH x AS (SELECT 1) SELECT * FROM x")).toBeNull();
+  });
+
+  it("allows read-only PRAGMA introspection", () => {
+    for (const sql of [
+      "PRAGMA table_info('Track')",
+      "PRAGMA table_list",
+      "pragma table_list",
+      "PRAGMA index_list('Track')",
+      "PRAGMA index_info('idx_name')",
+      "PRAGMA foreign_key_list('Track')",
+      "PRAGMA main.table_info('Track')",
+      "PRAGMA temp.table_list",
+      "PRAGMA side.index_info('idx')",
+    ]) {
+      expect(checkStatement(sql)).toBeNull();
+    }
+  });
+
+  it("allows EXPLAIN QUERY PLAN", () => {
+    expect(checkStatement("EXPLAIN QUERY PLAN SELECT 1")).toBeNull();
+  });
+
+  it("allows trailing semicolon and trailing comments", () => {
+    for (const sql of [
+      "SELECT 1;",
+      "SELECT 1; -- trailing note",
+      "SELECT 1; /* comment */",
+      "SELECT 1; -- 'a;b' trailing comment",
+      "SELECT 1; /* a;b trailing comment */",
+    ]) {
+      expect(checkStatement(sql)).toBeNull();
+    }
+  });
+
+  it("allows semicolons and VACUUM inside string literals", () => {
+    for (const sql of ["SELECT ';' AS x", "SELECT 'a;b'", "SELECT 'VACUUM INTO' AS text"]) {
+      expect(checkStatement(sql)).toBeNull();
+    }
+  });
+
+  it("rejects VACUUM, ATTACH, DETACH statements", () => {
+    for (const sql of [
+      "VACUUM",
+      "VACUUM INTO '/tmp/exfil.db'",
+      "ATTACH DATABASE '/tmp/x.db' AS rw",
+      "DETACH DATABASE side",
+    ]) {
+      const e = checkStatement(sql);
+      expect(e?.error).toBe("invalid_argument");
+    }
+  });
+
+  it("rejects VACUUM/ATTACH/DETACH hidden by comments", () => {
+    for (const sql of [
+      "-- harmless\nVACUUM INTO '/tmp/exfil.db'",
+      "/* comment */ VACUUM INTO '/tmp/exfil.db'",
+      "-- comment\nATTACH DATABASE '/tmp/x.db' AS rw",
+      "/* c */ DETACH DATABASE side",
+    ]) {
+      const e = checkStatement(sql);
+      expect(e?.error).toBe("invalid_argument");
+    }
+  });
+
+  it("rejects VACUUM/ATTACH/DETACH with unusual spacing and case", () => {
+    for (const sql of [
+      "VaCuUm   InTo '/tmp/x.db'",
+      "vacuum\nINTO '/tmp/exfil.db'",
+      "ATTACH\n  DATABASE '/tmp/x.db' AS rw",
+    ]) {
+      const e = checkStatement(sql);
+      expect(e?.error).toBe("invalid_argument");
+    }
+  });
+
+  it("rejects write-mode PRAGMA statements", () => {
+    for (const sql of ["PRAGMA journal_mode = WAL", "PRAGMA cache_size = 2000", "PRAGMA synchronous = OFF"]) {
+      const e = checkStatement(sql);
+      expect(e?.error).toBe("invalid_argument");
+    }
+  });
+
+  it("rejects PRAGMA names that look similar but are not permitted", () => {
+    for (const sql of ["PRAGMA table_infoX", "PRAGMA table_info_extra('Track')", "PRAGMA index_listX"]) {
+      const e = checkStatement(sql);
+      expect(e?.error).toBe("invalid_argument");
+    }
+  });
+
+  it("rejects chained statements", () => {
+    for (const sql of [
+      "SELECT 1; VACUUM INTO '/tmp/x.db'",
+      "SELECT 1; SELECT 2",
+      "SELECT 1; DELETE FROM Track",
+      "SELECT 1; /* c */ VACUUM INTO '/tmp/x.db'",
+    ]) {
+      const e = checkStatement(sql);
+      expect(e?.error).toBe("invalid_argument");
+    }
+  });
+
+  it("wraps a SELECT that has no LIMIT of its own", () => {
+    expect(enforceLimit("SELECT * FROM Track", 50)).toBe("SELECT * FROM (SELECT * FROM Track) LIMIT 50");
+    expect(enforceLimit("SELECT * FROM Track WHERE 1 = 1", 50)).toBe(
+      "SELECT * FROM (SELECT * FROM Track WHERE 1 = 1) LIMIT 50"
+    );
+  });
+
+  it("wraps even when the query already carries its own top-level LIMIT", () => {
+    // The inner LIMIT is preserved verbatim inside the wrapper -- and, being
+    // smaller, still wins at execution time (see server.test.ts, which
+    // checks that at the row-count level, not just the string level).
+    expect(enforceLimit("SELECT * FROM Track LIMIT 10", 50)).toBe(
+      "SELECT * FROM (SELECT * FROM Track LIMIT 10) LIMIT 50"
+    );
+    expect(enforceLimit("SELECT * FROM Track LIMIT 100", 50)).toBe(
+      "SELECT * FROM (SELECT * FROM Track LIMIT 100) LIMIT 50"
+    );
+  });
+
+  it("wraps a query whose only LIMIT is hidden inside a subquery", () => {
+    // Under the old "append only if the scanner found no LIMIT anywhere"
+    // rule, this read as already-limited (the scanner has no
+    // parenthesis-depth tracking) and was left completely unbounded,
+    // however many rows the outer WHERE actually matched.
+    expect(enforceLimit("SELECT * FROM Track WHERE id IN (SELECT id FROM Track LIMIT 1)", 50)).toBe(
+      "SELECT * FROM (SELECT * FROM Track WHERE id IN (SELECT id FROM Track LIMIT 1)) LIMIT 50"
+    );
+  });
+
+  it("wraps even when LIMIT appears only inside a string literal", () => {
+    expect(enforceLimit("SELECT * FROM Track WHERE title = 'limit break'", 50)).toBe(
+      "SELECT * FROM (SELECT * FROM Track WHERE title = 'limit break') LIMIT 50"
+    );
+  });
+
+  it("handles WITH statements for enforceLimit", () => {
+    expect(enforceLimit("WITH x AS (SELECT 1) SELECT * FROM x", 50)).toBe(
+      "SELECT * FROM (WITH x AS (SELECT 1) SELECT * FROM x) LIMIT 50"
+    );
+    expect(enforceLimit("WITH x AS (SELECT 1) SELECT * FROM x LIMIT 10", 50)).toBe(
+      "SELECT * FROM (WITH x AS (SELECT 1) SELECT * FROM x LIMIT 10) LIMIT 50"
+    );
+  });
+
+  it("does not modify PRAGMA statements with enforceLimit", () => {
+    expect(enforceLimit("PRAGMA table_info('Track')", 50)).toBe("PRAGMA table_info('Track')");
+    expect(enforceLimit("PRAGMA table_list", 50)).toBe("PRAGMA table_list");
+  });
+
+  it("does not modify other statement types with enforceLimit", () => {
+    expect(enforceLimit("EXPLAIN QUERY PLAN SELECT 1", 50)).toBe("EXPLAIN QUERY PLAN SELECT 1");
+  });
+
+  it("trims a trailing semicolon before wrapping", () => {
+    expect(enforceLimit("SELECT * FROM Track;", 50)).toBe("SELECT * FROM (SELECT * FROM Track) LIMIT 50");
+    expect(enforceLimit("SELECT * FROM Track LIMIT 10;", 50)).toBe(
+      "SELECT * FROM (SELECT * FROM Track LIMIT 10) LIMIT 50"
+    );
+  });
+});
