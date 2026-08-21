@@ -2,3 +2,7 @@ node_modules/
 dist/
 .engine-dj-mcp-test/
 *.tgz
+
+# superpowers artefacts stay local
+docs/superpowers/
+.superpowers/

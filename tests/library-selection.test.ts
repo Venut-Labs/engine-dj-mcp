@@ -91,7 +91,7 @@ describe("pickDefaultLibrary", () => {
 
 describe("findLibrary", () => {
   const home = info({ path: join(homedir(), "Music/Engine Library/Database2/m.db") });
-  const drive = info({ path: "/Volumes/VENUTDISK/Engine Library/Database2/m.db" });
+  const drive = info({ path: "/Volumes/DJ-USB/Engine Library/Database2/m.db" });
   const libs = [home, drive];
 
   it("resolves a uuid, case-insensitively and ignoring surrounding whitespace", () => {
