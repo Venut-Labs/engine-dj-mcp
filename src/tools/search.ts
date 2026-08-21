@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { err, isEngineError, type EngineError } from "../errors.js";
 import { camelotNeighbours } from "../semantics.js";
 import { redactPath } from "../paths.js";
-import { resolvePlaylist } from "../playlists.js";
+import { ENTRY_TRACK_MATCH, resolvePlaylist } from "../playlists.js";
 import type { QueryProcess } from "../proc/query-client.js";
 
 export const DEFAULT_FIELDS = ["id", "artist", "title", "bpm", "camelot", "rating"] as const;
@@ -240,6 +240,12 @@ export async function searchTracks(
   // an entry may point at a track that is gone, and joining would then be
   // one more way for row counts to drift. Membership is the whole question
   // here.
+  //
+  // It matches on the natural key (see ENTRY_TRACK_MATCH), not on
+  // `t.id = e.trackId`: an entry made on another drive carries that drive's
+  // track id, so the id form both drops the playlist's real members and
+  // admits unrelated local tracks whose row id happens to collide with a
+  // foreign one.
   let resolvedPlaylist: { id: number; name: string; path: string } | undefined;
   if (input.playlist) {
     const resolved = await resolvePlaylist(qp, input.playlist, {
@@ -252,7 +258,10 @@ export async function searchTracks(
       name: resolved.playlist.name,
       path: resolved.playlist.path,
     };
-    filterWhere.push("t.id IN (SELECT e.trackId FROM main.PlaylistEntity e WHERE e.listId = ?)");
+    filterWhere.push(
+      `EXISTS (SELECT 1 FROM main.PlaylistEntity e
+                WHERE e.listId = ? AND ${ENTRY_TRACK_MATCH})`,
+    );
     filterParams.push(resolved.playlist.id);
   }
 

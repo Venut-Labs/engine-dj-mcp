@@ -210,7 +210,17 @@ export interface PlaylistSpec {
   /** Next sibling under the same parent; 0 ends the chain. Required, never guessed. */
   nextListId: number;
   isPersisted?: boolean;
-  entries?: { id: number; trackId: number; next: number }[];
+  /**
+   * `trackId` is the track's ORIGIN id, paired with `databaseUuid` -- not the
+   * local row id. They coincide in a generated library unless reoriginTracks
+   * has been used, which is precisely what makes the wrong join invisible.
+   */
+  entries?: {
+    id: number;
+    trackId: number;
+    next: number;
+    databaseUuid?: string;
+  }[];
 }
 
 /**
@@ -235,8 +245,36 @@ export function addPlaylists(dbPath: string, specs: PlaylistSpec[]): void {
       s.id, s.title, s.parentId ?? 0, s.isPersisted === false ? 0 : 1, s.nextListId,
       new Date().toISOString(), 1,
     );
-    for (const e of s.entries ?? []) insEntry.run(e.id, s.id, e.trackId, uuid, e.next);
+    for (const e of s.entries ?? [])
+      insEntry.run(e.id, s.id, e.trackId, e.databaseUuid ?? uuid, e.next);
   }
+  db.exec("COMMIT");
+  db.close();
+}
+
+/**
+ * Give specific tracks a different origin identity from their local row id.
+ *
+ * Engine identifies a track across libraries by `(originDatabaseUuid,
+ * originTrackId)`, and a playlist entry references that pair -- not the local
+ * `id`. In a library this generator builds, the two coincide, so a join on
+ * `e.trackId = t.id` and the correct join on the pair return identical
+ * results and no test can tell them apart. That is not hypothetical: it is
+ * exactly why a wrong join shipped, and why a real 43-track playlist came
+ * back with 42 holes.
+ *
+ * Call this to make a fixture that can distinguish them.
+ */
+export function reoriginTracks(
+  dbPath: string,
+  rows: { id: number; originUuid: string; originTrackId: number }[],
+): void {
+  const db = new DatabaseSync(dbPath);
+  const stmt = db.prepare(
+    "UPDATE Track SET originDatabaseUuid = ?, originTrackId = ? WHERE id = ?",
+  );
+  db.exec("BEGIN");
+  for (const r of rows) stmt.run(r.originUuid, r.originTrackId, r.id);
   db.exec("COMMIT");
   db.close();
 }

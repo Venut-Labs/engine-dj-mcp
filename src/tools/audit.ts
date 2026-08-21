@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { z } from "zod";
 import { err, isEngineError, type EngineError } from "../errors.js";
 import { absTrackPath } from "../paths.js";
+import { ENTRY_TRACK_MATCH } from "../playlists.js";
 import type { QueryProcess } from "../proc/query-client.js";
 
 export const AUDIT_CHECKS = [
@@ -110,9 +111,19 @@ const SQL_CHECKS: Record<string, SqlCheck> = {
              WHERE artist IS NOT NULL AND title IS NOT NULL
              GROUP BY 1 HAVING COUNT(*) > 1)`,
   },
+  // "No track answers to this entry" — asked on the natural key
+  // `(databaseUuid, trackId)` -> `(originDatabaseUuid, originTrackId)`, never
+  // on `Track.id`. ENTRY_TRACK_MATCH carries the measurement: on the
+  // reference library the id join reported 105 orphans of 202 entries on a
+  // library that has none, which is this check's whole user-visible failure
+  // mode — a DJ told their playlists are full of holes.
+  //
+  // NOT EXISTS rather than a LEFT JOIN so the count is entries, not matched
+  // pairs, whatever the file on disk happens to contain.
   orphan_entries: {
     id: "e.id",
-    body: `FROM PlaylistEntity e LEFT JOIN Track t ON t.id = e.trackId WHERE t.id IS NULL`,
+    body: `FROM PlaylistEntity e
+           WHERE NOT EXISTS (SELECT 1 FROM Track t WHERE ${ENTRY_TRACK_MATCH})`,
   },
 };
 

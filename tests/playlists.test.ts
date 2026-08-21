@@ -504,13 +504,17 @@ describe("get_playlist_tracks: entries whose track is gone", () => {
     expect(r.tracks).toHaveLength(3);
     expect(r.tracks[0]).toMatchObject({ position: 1, id: 41 });
     expect(r.tracks[0]!.missing).toBeUndefined();
-    expect(r.tracks[1]).toEqual({
+    // A hole is identified by the pair, not by track_id alone: the same
+    // trackId from a different library is a different track, which is the
+    // whole reason the join is on (databaseUuid, trackId).
+    expect(r.tracks[1]).toMatchObject({
       position: 2,
       entry_id: 403,
       track_id: MISSING_TRACK_A,
       missing: true,
     });
-    expect(r.tracks[2]).toEqual({
+    expect(r.tracks[1]!.database_uuid).toBeTypeOf("string");
+    expect(r.tracks[2]).toMatchObject({
       position: 3,
       entry_id: 402,
       track_id: MISSING_TRACK_B,

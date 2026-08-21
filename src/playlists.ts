@@ -31,6 +31,40 @@ import type { QueryProcess } from "./proc/query-client.js";
  * back as a silently short list that reads like a complete one.
  */
 
+/**
+ * The predicate that connects one `PlaylistEntity` (`e`) to its `Track` (`t`).
+ *
+ * A playlist entry does not name a local row id. It carries
+ * `(databaseUuid, trackId)`, which identifies the track **in the library the
+ * entry was made in**, and `Track` preserves that same identity in
+ * `(originDatabaseUuid, originTrackId)` — a pair that need not equal, and
+ * usually does not equal, `Track.id`. Engine's own schema says as much: the
+ * pair carries `CONSTRAINT C_originDatabaseUuid_originTrackId UNIQUE`, making
+ * it the track's natural key across drives, and a pair of triggers
+ * (`trigger_after_insert_Track_fix_origin` and its update twin) stamps it
+ * from `Information.uuid` whenever a row arrives without one. Engine's
+ * application binary embeds the same join verbatim:
+ *
+ *   SELECT COUNT(DISTINCT databaseUuid || trackId) FROM PlaylistEntity
+ *   JOIN Track ON (originDatabaseUuid, originTrackId) = (databaseUuid, trackId)
+ *
+ * Joining on `e.trackId = t.id` instead reads naturally and is wrong in both
+ * directions. Measured on the reference USB library (257 tracks, 16
+ * playlists, 202 entries): the id join reports 105 of 202 entries as orphans
+ * where the pair join finds 0, because 178 entries name a *third* library
+ * (`33be3313-…`) that is neither of the two attached and only 91 of the 257
+ * tracks carry this database's own uuid — a healthy library reported as
+ * riddled with holes, and one 43-entry playlist reduced to a single playable
+ * track. In the other direction it silently answers with the *wrong track*
+ * whenever a foreign entry's `trackId` happens to collide with a local row
+ * id, and calls a genuinely missing entry present.
+ *
+ * Written once and shared, so the three places that ask the question cannot
+ * drift apart. It names the aliases `t` and `e`; every call site uses them.
+ */
+export const ENTRY_TRACK_MATCH =
+  "t.originDatabaseUuid = e.databaseUuid AND t.originTrackId = e.trackId";
+
 /** One node of an Engine linked list. `next` is 0 at the end of the chain. */
 export interface Linked {
   id: number;
@@ -313,11 +347,17 @@ export interface PlaylistTree {
 /**
  * Reads every playlist plus its entry counts, and orders the result.
  *
- * The counts come from one grouped LEFT JOIN rather than a correlated
- * subquery per playlist, and `missing_count` is computed in the same pass:
- * on the reference library 105 of 202 entries name a track from another
- * database, so "how many of these can I actually play" is not a rare
- * question and must not cost a second round trip per list.
+ * The counts come from one grouped pass over `PlaylistEntity` rather than a
+ * correlated subquery per playlist, and `missing_count` is computed in the
+ * same pass: "how many of these can I actually play" is not a rare question
+ * and must not cost a second round trip per list.
+ *
+ * `missing` is an EXISTS semi-join on the natural key (see
+ * ENTRY_TRACK_MATCH), not a LEFT JOIN to Track. Membership is the whole
+ * question, and a semi-join cannot inflate `n`: a joined row set would count
+ * one entry twice if two tracks ever answered to the same origin key, which
+ * Engine's UNIQUE constraint forbids but this server has no way to enforce
+ * on a file it does not own.
  */
 export async function loadPlaylistTree(qp: QueryProcess): Promise<PlaylistTree | EngineError> {
   const res = await qp.run(
@@ -325,9 +365,10 @@ export async function loadPlaylistTree(qp: QueryProcess): Promise<PlaylistTree |
             COALESCE(c.n, 0) AS entry_count, COALESCE(c.missing, 0) AS missing_count
        FROM main.Playlist p
        LEFT JOIN (SELECT e.listId AS listId, COUNT(*) AS n,
-                         SUM(CASE WHEN t.id IS NULL THEN 1 ELSE 0 END) AS missing
+                         SUM(CASE WHEN EXISTS (SELECT 1 FROM main.Track t
+                                                WHERE ${ENTRY_TRACK_MATCH})
+                                  THEN 0 ELSE 1 END) AS missing
                     FROM main.PlaylistEntity e
-                    LEFT JOIN main.Track t ON t.id = e.trackId
                    GROUP BY e.listId) c ON c.listId = p.id
       ORDER BY p.id
       LIMIT ?`,
@@ -485,8 +526,15 @@ export async function resolvePlaylist(
 
 /** One entry of a playlist, in playlist order. */
 export interface OrderedEntry extends Linked {
-  /** `Track.id` this entry names. Not necessarily a track that still exists. */
+  /**
+   * `PlaylistEntity.trackId` — the track's `originTrackId` in the library
+   * `databaseUuid` names, **not** a local `Track.id`. The two halves only
+   * mean anything together (see ENTRY_TRACK_MATCH), and together they need
+   * not name a track this library holds.
+   */
   trackId: number;
+  /** The library this entry was made in. Null only in a malformed row. */
+  databaseUuid: string | null;
   /** 1-based position within the playlist. */
   position: number;
 }
@@ -511,7 +559,7 @@ export async function loadPlaylistEntries(
   playlist: PlaylistItem,
 ): Promise<PlaylistEntries | EngineError> {
   const res = await qp.run(
-    `SELECT e.id, e.trackId, e.nextEntityId
+    `SELECT e.id, e.trackId, e.databaseUuid, e.nextEntityId
        FROM main.PlaylistEntity e
       WHERE e.listId = ?
       ORDER BY e.id
@@ -526,6 +574,9 @@ export async function loadPlaylistEntries(
   const nodes = kept.map((r) => ({
     id: Number(r[idx.id!]),
     trackId: Number(r[idx.trackId!] ?? 0),
+    databaseUuid: r[idx.databaseUuid!] === null || r[idx.databaseUuid!] === undefined
+      ? null
+      : String(r[idx.databaseUuid!]),
     next: Number(r[idx.nextEntityId!] ?? 0),
   }));
 

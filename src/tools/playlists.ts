@@ -78,16 +78,17 @@ export type GetPlaylistTracksInput = z.input<typeof GetPlaylistTracksInput>;
  * position) or a hole where a track used to be.
  *
  * A hole is a real, ordinary state, not corruption: `PlaylistEntity` rows
- * survive their track and also arrive from other databases when a DJ merges
- * drives, which is why `audit_library` has an `orphan_entries` check at all.
- * On the reference USB library 105 of 202 entries are holes, and one
- * 43-entry playlist resolves to a single playable track.
+ * survive their track, which is why `audit_library` has an `orphan_entries`
+ * check at all. What a hole is *not* is an entry that merely came from
+ * another drive — those resolve perfectly well through the natural key (see
+ * ENTRY_TRACK_MATCH), and on the reference USB library all 202 entries do,
+ * including the 178 stamped with a third library's uuid.
  *
- * They are kept in the list rather than filtered out, at their real
+ * Genuine holes are kept in the list rather than filtered out, at their real
  * positions, precisely so `tracks.length` still equals the playlist's own
  * length and position 12 is still the twelfth thing the DJ sees in Engine.
- * Dropping them would make a 43-entry playlist silently return 1 row and
- * look like a paging bug.
+ * Dropping them would make a 43-entry playlist silently return fewer rows
+ * and look like a paging bug.
  */
 export type PlaylistTrackRow = Record<string, unknown>;
 
@@ -113,6 +114,17 @@ export interface GetPlaylistTracksResult {
  */
 function encodeCursor(playlistId: number, position: number): string {
   return Buffer.from(JSON.stringify([playlistId, position])).toString("base64url");
+}
+
+/**
+ * A track's natural key, flattened for use as a Map key.
+ *
+ * `\u0000` cannot occur inside an Engine uuid, so no two distinct pairs
+ * flatten to the same string — which a plain `uuid + trackId` concatenation
+ * could not promise.
+ */
+function entryKey(databaseUuid: string, trackId: number): string {
+  return `${databaseUuid}\u0000${trackId}`;
 }
 
 function decodeCursor(cursor: string): [number, number] | null {
@@ -181,15 +193,32 @@ export async function getPlaylistTracks(
   // One lookup for the page, then reordered in memory -- SQL has no ordering
   // to offer here, since playlist order lives in a linked list and not in
   // any column that could appear in ORDER BY.
-  const ids = [...new Set(page.map((e) => e.trackId).filter((id) => id > 0))];
-  const byId = new Map<number, Record<string, unknown>>();
-  if (ids.length) {
+  //
+  // Looked up by the natural key (see ENTRY_TRACK_MATCH), never by Track.id.
+  // An entry's `trackId` is a row id in *its own* library, so on a drive that
+  // has travelled -- which is the ordinary case -- resolving it as a local id
+  // finds nothing for most entries and, where a foreign id happens to collide
+  // with a local one, confidently returns an entirely different track.
+  //
+  // An entry with no databaseUuid is skipped rather than bound: SQL equality
+  // never matches NULL, so it is a hole by construction and a bind slot spent
+  // on it could only find the wrong row.
+  const wanted = new Map<string, { uuid: string; trackId: number }>();
+  for (const e of page) {
+    if (e.trackId > 0 && e.databaseUuid !== null) {
+      wanted.set(entryKey(e.databaseUuid, e.trackId), { uuid: e.databaseUuid, trackId: e.trackId });
+    }
+  }
+  const byKey = new Map<string, Record<string, unknown>>();
+  if (wanted.size) {
+    const keys = [...wanted.values()];
     const select = fields.map((f) => `${FIELD_SQL[f]} AS "${f}"`).join(", ");
     const res = await qp.run(
-      `SELECT ${select}, t.id AS __id
+      `SELECT ${select}, t.originDatabaseUuid AS __uuid, t.originTrackId AS __origin
          FROM main.Track t JOIN side.track_derived d ON d.track_id = t.id
-        WHERE t.id IN (${ids.map(() => "?").join(",")})`,
-      ids,
+        WHERE (t.originDatabaseUuid, t.originTrackId)
+              IN (VALUES ${keys.map(() => "(?,?)").join(",")})`,
+      keys.flatMap((k) => [k.uuid, k.trackId]),
     );
     if (isEngineError(res)) return res;
     const idx = Object.fromEntries(res.columns.map((c, i) => [c, i]));
@@ -205,18 +234,23 @@ export async function getPlaylistTracks(
           ];
         }),
       );
-      byId.set(Number(row[idx.__id!]), track);
+      byKey.set(entryKey(String(row[idx.__uuid!]), Number(row[idx.__origin!])), track);
     }
   }
 
   const tracks: PlaylistTrackRow[] = page.map((entry) => {
-    const track = byId.get(entry.trackId);
+    const track =
+      entry.databaseUuid === null ? undefined : byKey.get(entryKey(entry.databaseUuid, entry.trackId));
     return track
       ? { position: entry.position, ...track }
       : {
           position: entry.position,
           entry_id: entry.id,
+          // Both halves of the key, because neither is meaningful alone:
+          // track_id is a row id in the library database_uuid names, and the
+          // same number means a different track in every other library.
           track_id: entry.trackId,
+          database_uuid: entry.databaseUuid,
           // Named, not implied by absent fields: a model must be able to tell
           // "this slot has no track in this library" from "this track has no
           // artist tag".
