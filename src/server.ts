@@ -1,7 +1,7 @@
 // src/server.ts
 import { existsSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { discoverLibraries, defaultRoots } from "./discovery.js";
+import { discoverLibraries, defaultRoots, type LibraryInfo } from "./discovery.js";
 import { libraryCandidates } from "./paths.js";
 import { hasHotJournal } from "./store/connections.js";
 import { QueryProcess } from "./proc/query-client.js";
@@ -99,16 +99,25 @@ export async function createServer(
 
   /**
    * Shared by the engine://libraries resource and the list_libraries tool so
-   * neither can drift from the other. index_generation only appears once a
-   * sidecar has actually been built at least once in this process -- a
-   * never-built IndexManager still reports generation 0, which is not a real
-   * generation number and must read as null, not as "generation zero".
+   * the two cannot drift in shape, while differing in exactly one respect:
+   * which library list they are given.
+   *
+   * The resource is passed the start-time snapshot, which is what the spec
+   * claims a resource is. The tool re-discovers on every call, because a
+   * USB drive plugged in after the server started is the ordinary case for
+   * a DJ, and "restart your assistant to see the drive you just plugged in"
+   * is not an answer.
+   *
+   * index_generation only appears once a sidecar has actually been built at
+   * least once in this process -- a never-built IndexManager still reports
+   * generation 0, which is not a real generation number and must read as
+   * null, not as "generation zero".
    */
-  const libraryReport = async () => {
+  const libraryReport = async (discovered: LibraryInfo[]) => {
     if (mgr) await mgr.ensureFresh(); // best effort: keeps the generation accurate even as the first call of a session
     const generations = new Map<string, number>();
     if (mgr && primary && mgr.generation > 0) generations.set(primary.uuid, mgr.generation);
-    return listLibraries(generations, libs);
+    return listLibraries(generations, discovered);
   };
 
   server.registerResource(
@@ -122,7 +131,7 @@ export async function createServer(
     "libraries",
     "engine://libraries",
     { title: "Discovered Engine DJ libraries", mimeType: "application/json" },
-    async (uri) => ({ contents: [{ uri: uri.href, text: JSON.stringify(await libraryReport(), null, 2) }] }),
+    async (uri) => ({ contents: [{ uri: uri.href, text: JSON.stringify(await libraryReport(libs), null, 2) }] }),
   );
 
   server.registerTool(
@@ -220,11 +229,14 @@ export async function createServer(
     "list_libraries",
     {
       title: "List Engine DJ libraries",
-      description: "List every discovered library, including ones whose schema is unsupported.",
+      description:
+        "List every discovered library, including ones whose schema is unsupported. " +
+        "Re-scans on every call, so a drive plugged in after this server started is visible " +
+        "without a restart (the engine://libraries resource is a start-time snapshot).",
       inputSchema: {},
       annotations: RO,
     },
-    async () => reply(await libraryReport()),
+    async () => reply(await libraryReport(discoverLibraries(opts.roots))),
   );
 
   server.registerTool(

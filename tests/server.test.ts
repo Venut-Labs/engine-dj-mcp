@@ -417,6 +417,34 @@ describe("createServer", () => {
     }
   });
 
+  it("re-scans in the tool but not in the resource, so a drive plugged in later is visible", async () => {
+    // createServer captures discoverLibraries() once. A DJ plugging a USB
+    // drive in after starting their assistant is the ordinary case, and
+    // "restart it" is not an answer -- but a resource is defined as a
+    // snapshot, so only the tool re-scans, and this pins both halves.
+    const root = mkdtempSync(join(tmpdir(), "edj-srv-latecomer-"));
+    try {
+      const { client } = await connectedClient([root], join(root, "sidecars"));
+
+      const before = await client.callTool({ name: "list_libraries", arguments: {} });
+      expect((before.structuredContent as any).libraries).toEqual([]);
+
+      // Appears only after the server was constructed.
+      const lateMdb = makeLibrary(root, { tracks: 5 });
+
+      const after = await client.callTool({ name: "list_libraries", arguments: {} });
+      expect((after.structuredContent as any).libraries.map((l: any) => l.path)).toEqual([lateMdb]);
+
+      const resource = await client.readResource({ uri: "engine://libraries" });
+      const resBody = JSON.parse(String((resource.contents[0] as { text: string }).text));
+      expect(resBody.libraries).toEqual([]);
+
+      await client.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("returns library_not_found when nothing was discovered at all", async () => {
     const empty = mkdtempSync(join(tmpdir(), "edj-srv-empty-"));
     const { client } = await connectedClient([empty], join(empty, "sidecars"));
