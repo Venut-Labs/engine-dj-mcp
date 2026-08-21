@@ -21,6 +21,8 @@ Once connected, these are ordinary questions in chat:
 - *"Something dark around 124 in a minor key I haven't played in six months."*
 - *"Which tracks still have no hot cue set?"*
 - *"Find me anything harmonically compatible with 8A between 138 and 142."*
+- *"What's in my ACID Beach playlist, in order?"*
+- *"Anything around 128 in ACID Beach?"*
 - *"What's broken in my collection — missing files, duplicates, bad tempos?"*
 - *"Where are the cue points on this track, and what tempo did Engine analyse?"*
 
@@ -46,7 +48,7 @@ through 3.0.2 — Engine DJ 4.5 and 5.x.
 
 ## Tools
 
-Seven tools, all read-only. Every tool that reads library data also accepts
+Nine tools, all read-only. Every tool that reads library data also accepts
 an optional `library` argument — see [Choosing a library](#choosing-a-library).
 
 ### `search_tracks`
@@ -63,6 +65,7 @@ tempo, key, rating, when a track was added and when it was last played.
 | `played` | `{ never: true }`, or `{ before, after }` taking an ISO date or a relative form like `-6 months`. |
 | `added` | `{ before, after }`, same date forms. |
 | `flags` | `analyzed`, `available`, `has_cues`, `has_beatgrid`. `has_cues` means a hot cue is genuinely set — see [Limitations](#limitations). |
+| `playlist` | `{ id }` or `{ name }` — search inside one playlist. Results still come back by relevance or id; `get_playlist_tracks` is what preserves playlist order. |
 | `fields` | Which columns to return. Defaults to `id, artist, title, bpm, camelot, rating`. |
 | `limit`, `cursor` | Page size (default 25, max 200) and an opaque cursor for the next page. |
 | `include_total` | Off by default because counting costs far more than the page. Capped at 1000 — a capped result carries `total_capped: true` and means "at least 1000". |
@@ -73,6 +76,46 @@ Full metadata for specific track ids, returned in the order you asked for.
 Unknown ids are omitted rather than failing the call.
 
 `ids` (required), `fields`, `redact_paths`.
+
+### `get_playlists`
+
+Your playlist tree, in the order Engine DJ shows it — folders included.
+
+The list is flat and in the order you would read down the sidebar with every
+folder expanded: `depth` and `path` carry the nesting, `parent_id` names the
+folder a list sits in.
+
+| Field | Meaning |
+| --- | --- |
+| `name`, `id`, `path` | `path` is the full `Folder/Sub/Name`, and is unique — a bare `name` need not be. |
+| `depth`, `parent_id` | The nesting. `parent_id` is `null` at the top level. |
+| `is_folder` | The list has child lists. Engine has no folder flag — a folder *is* a playlist that other playlists sit under — so an emptied folder reads as an empty playlist. |
+| `is_persisted` | Engine's own flag for a list saved to the device. Both values appear on lists Engine displays, so nothing is filtered on it. |
+| `track_count` | Entries in that list alone, never rolled up from its children — the number Engine shows beside it. |
+| `missing_count` | How many of those entries name a track this library does not have. |
+
+`limit` (default 200, max 1000). `warnings` appears if a playlist's link
+chain is damaged; nothing is ever dropped from the list because of one.
+
+### `get_playlist_tracks`
+
+The tracks of one playlist, **in playlist order**.
+
+Name it with `playlist_id` or with `playlist_name` — exactly one of the two.
+Playlist names are unique only within a folder, so a name matching more than
+one is refused with every candidate's id and full path rather than guessed
+at; pass the `path` from `get_playlists` to say which you meant.
+
+Every row carries `position`, its 1-based place in the playlist. Same
+`fields`, `limit` and `cursor` conventions as `search_tracks`.
+
+An entry whose track is not in this library keeps its slot and comes back as
+`{ position, entry_id, track_id, missing: true }`, with `missing_count`
+alongside `entry_count`. That is ordinary rather than corruption — playlist
+entries outlive their tracks and travel between drives — and they are kept in
+place so the number of rows still matches the playlist's own length. On one
+reference library a 43-entry playlist holds exactly one track that library
+can actually play.
 
 ### `get_track_performance`
 
@@ -107,7 +150,7 @@ tracks should not fill an assistant's context.
 | `suspicious_bpm` | Analysed and tagged tempo disagree, or tempo is outside 60–200 |
 | `duplicates` | Same artist and title, or same size and length |
 | `empty_metadata` | No artist or no title |
-| `orphan_entries` | Playlist entries pointing at tracks that no longer exist |
+| `orphan_entries` | Playlist entries pointing at tracks not in this library — `get_playlist_tracks` shows where each one sits |
 
 `checks` — omit it to run all ten.
 
@@ -143,8 +186,8 @@ server checks staleness itself before answering.
 
 - **`engine://schema`** — the field semantics an assistant needs before
   writing SQL: how Engine encodes musical key, why tempo is
-  `COALESCE(bpmAnalyzed, bpm)`, that `Track.path` is relative, and which
-  helper columns are indexed.
+  `COALESCE(bpmAnalyzed, bpm)`, that `Track.path` is relative, where playlist
+  order really lives, and which helper columns are indexed.
 - **`engine://libraries`** — what was discovered at startup and whether each
   library's schema is supported. A snapshot; `list_libraries` is the live view.
 
@@ -228,8 +271,19 @@ even to recover a journal Engine DJ left behind.
 not played in six months?", but the separate Engine history database —
 sessions, decks, what followed what — is not opened at all.
 
-**It does not build set lists**, reorder playlists, or suggest transitions. It
-answers questions about the collection; the mixing is yours.
+**Smartlists are not reported.** Engine's rule-based lists live in a separate
+`Smartlist` table with its own ordering and a JSON rule column, and nothing
+here reads it. `get_playlists` reports ordinary playlists and folders only, so
+a smartlist you can see in Engine will not appear.
+
+**An empty folder reads as an empty playlist.** Engine's schema has no folder
+flag — a folder is simply a playlist that other playlists sit under — so
+`is_folder` means "has child lists". A folder you have emptied is
+indistinguishable from a playlist with no tracks.
+
+**It reads playlists; it does not write them.** No creating, reordering,
+renaming or adding to a playlist, and no set lists or suggested transitions.
+It answers questions about the collection; the mixing is yours.
 
 **Schema 3.0.0 through 3.0.2 only.** Older and newer libraries are listed with
 their version and reported as unsupported rather than read on a guess.
