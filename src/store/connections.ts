@@ -25,11 +25,32 @@ const HOT_JOURNAL_MAGIC = "d9d505f920a163d7";
 export function hasHotJournal(mdbPath: string): boolean {
   const journalPath = `${mdbPath}-journal`;
   if (!existsSync(journalPath)) return false;
-  const fd = openSync(journalPath, "r");
+
+  // A journal that exists but cannot be opened or read (a permissions
+  // problem on the sibling file, say) is "cannot determine", not "is hot".
+  // Folding that to false -- rather than throwing, or assuming the worst --
+  // is a deliberate choice: this function's only three callers use a true
+  // result to skip the real open/query attempt and report a specific,
+  // actionable claim ("launch Engine DJ to recover it") without ever
+  // checking the actual database. If the real problem is unrelated to a hot
+  // journal, that claim would be false, and a healthy library would be
+  // permanently unusable through this server for a reason relaunching
+  // Engine DJ cannot fix. Returning false instead lets the real attempt
+  // proceed and surface whatever is actually wrong through the paths that
+  // already handle it as a structured error (library_busy,
+  // query_process_crashed, ...).
+  let fd: number;
+  try {
+    fd = openSync(journalPath, "r");
+  } catch {
+    return false;
+  }
   try {
     const buf = Buffer.alloc(8);
     const n = readSync(fd, buf, 0, 8, 0);
     return n === 8 && buf.toString("hex") === HOT_JOURNAL_MAGIC;
+  } catch {
+    return false;
   } finally {
     closeSync(fd);
   }

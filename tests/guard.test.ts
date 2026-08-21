@@ -111,28 +111,47 @@ describe("statement guard", () => {
     }
   });
 
-  it("adds LIMIT when the query has none", () => {
-    expect(enforceLimit("SELECT * FROM Track", 50)).toBe("SELECT * FROM Track LIMIT 50");
-    expect(enforceLimit("SELECT * FROM Track WHERE 1 = 1", 50)).toBe("SELECT * FROM Track WHERE 1 = 1 LIMIT 50");
+  it("wraps a SELECT that has no LIMIT of its own", () => {
+    expect(enforceLimit("SELECT * FROM Track", 50)).toBe("SELECT * FROM (SELECT * FROM Track) LIMIT 50");
+    expect(enforceLimit("SELECT * FROM Track WHERE 1 = 1", 50)).toBe(
+      "SELECT * FROM (SELECT * FROM Track WHERE 1 = 1) LIMIT 50"
+    );
   });
 
-  it("preserves existing LIMIT clauses", () => {
-    expect(enforceLimit("SELECT * FROM Track LIMIT 10", 50)).toBe("SELECT * FROM Track LIMIT 10");
-    expect(enforceLimit("SELECT * FROM Track LIMIT 100", 50)).toBe("SELECT * FROM Track LIMIT 100");
+  it("wraps even when the query already carries its own top-level LIMIT", () => {
+    // The inner LIMIT is preserved verbatim inside the wrapper -- and, being
+    // smaller, still wins at execution time (see server.test.ts, which
+    // checks that at the row-count level, not just the string level).
+    expect(enforceLimit("SELECT * FROM Track LIMIT 10", 50)).toBe(
+      "SELECT * FROM (SELECT * FROM Track LIMIT 10) LIMIT 50"
+    );
+    expect(enforceLimit("SELECT * FROM Track LIMIT 100", 50)).toBe(
+      "SELECT * FROM (SELECT * FROM Track LIMIT 100) LIMIT 50"
+    );
   });
 
-  it("appends LIMIT even when LIMIT appears in a string literal", () => {
+  it("wraps a query whose only LIMIT is hidden inside a subquery", () => {
+    // Under the old "append only if the scanner found no LIMIT anywhere"
+    // rule, this read as already-limited (the scanner has no
+    // parenthesis-depth tracking) and was left completely unbounded,
+    // however many rows the outer WHERE actually matched.
+    expect(enforceLimit("SELECT * FROM Track WHERE id IN (SELECT id FROM Track LIMIT 1)", 50)).toBe(
+      "SELECT * FROM (SELECT * FROM Track WHERE id IN (SELECT id FROM Track LIMIT 1)) LIMIT 50"
+    );
+  });
+
+  it("wraps even when LIMIT appears only inside a string literal", () => {
     expect(enforceLimit("SELECT * FROM Track WHERE title = 'limit break'", 50)).toBe(
-      "SELECT * FROM Track WHERE title = 'limit break' LIMIT 50"
+      "SELECT * FROM (SELECT * FROM Track WHERE title = 'limit break') LIMIT 50"
     );
   });
 
   it("handles WITH statements for enforceLimit", () => {
     expect(enforceLimit("WITH x AS (SELECT 1) SELECT * FROM x", 50)).toBe(
-      "WITH x AS (SELECT 1) SELECT * FROM x LIMIT 50"
+      "SELECT * FROM (WITH x AS (SELECT 1) SELECT * FROM x) LIMIT 50"
     );
     expect(enforceLimit("WITH x AS (SELECT 1) SELECT * FROM x LIMIT 10", 50)).toBe(
-      "WITH x AS (SELECT 1) SELECT * FROM x LIMIT 10"
+      "SELECT * FROM (WITH x AS (SELECT 1) SELECT * FROM x LIMIT 10) LIMIT 50"
     );
   });
 
@@ -145,8 +164,10 @@ describe("statement guard", () => {
     expect(enforceLimit("EXPLAIN QUERY PLAN SELECT 1", 50)).toBe("EXPLAIN QUERY PLAN SELECT 1");
   });
 
-  it("handles trailing semicolons in enforceLimit", () => {
-    expect(enforceLimit("SELECT * FROM Track;", 50)).toBe("SELECT * FROM Track LIMIT 50");
-    expect(enforceLimit("SELECT * FROM Track LIMIT 10;", 50)).toBe("SELECT * FROM Track LIMIT 10;");
+  it("trims a trailing semicolon before wrapping", () => {
+    expect(enforceLimit("SELECT * FROM Track;", 50)).toBe("SELECT * FROM (SELECT * FROM Track) LIMIT 50");
+    expect(enforceLimit("SELECT * FROM Track LIMIT 10;", 50)).toBe(
+      "SELECT * FROM (SELECT * FROM Track LIMIT 10) LIMIT 50"
+    );
   });
 });

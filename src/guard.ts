@@ -3,7 +3,6 @@ import { err, type EngineError } from "./errors.js";
 interface ScanResult {
   firstTokenIndex: number;
   hasChainedStatement: boolean;
-  hasLimit: boolean;
   lastSemicolonIndex: number; // Position of last top-level semicolon, or -1 if none
 }
 
@@ -15,7 +14,6 @@ function scanStatement(sql: string): ScanResult {
   let i = 0;
   let firstTokenIndex = -1;
   let hasChainedStatement = false;
-  let hasLimit = false;
   let semicolonCount = 0;
   let lastSemicolonIndex = -1;
 
@@ -109,12 +107,8 @@ function scanStatement(sql: string): ScanResult {
       firstTokenIndex = i;
     }
 
-    // Check if this token is LIMIT
     const restOfStatement = sql.substring(i);
     const wordMatch = restOfStatement.match(/^([a-zA-Z_]\w*)/);
-    if (wordMatch && wordMatch[1].toUpperCase() === "LIMIT") {
-      hasLimit = true;
-    }
 
     // Skip this token
     if (wordMatch) {
@@ -155,7 +149,7 @@ function scanStatement(sql: string): ScanResult {
     }
   }
 
-  return { firstTokenIndex, hasChainedStatement, hasLimit, lastSemicolonIndex };
+  return { firstTokenIndex, hasChainedStatement, lastSemicolonIndex };
 }
 
 /**
@@ -218,6 +212,27 @@ export function checkStatement(sql: string): EngineError | null {
   return null;
 }
 
+/**
+ * Wraps rather than negotiates with the inner query. Appending a LIMIT only
+ * when the scanner found none at the top level let any caller-supplied
+ * LIMIT satisfy the check regardless of its size -- including one nested
+ * inside a subquery, which this scanner cannot distinguish from a
+ * top-level LIMIT at all (it has no parenthesis-depth tracking, by design,
+ * since it only needs to find keywords and quoted spans). For example,
+ * "SELECT * FROM Track WHERE id IN (SELECT id FROM Track LIMIT 1)" reads
+ * as "already limited" and was left untouched, however many rows the outer
+ * WHERE actually matched.
+ *
+ * Composing "SELECT * FROM (<sql>) LIMIT n" bounds the result no matter
+ * what the inner statement contains, because the wrapper is the outermost
+ * statement executed. A genuinely smaller inner LIMIT still wins: SQLite
+ * applies it to the subquery first, so fewer than n rows ever reach the
+ * wrapper's own LIMIT.
+ *
+ * Only SELECT and WITH can be wrapped this way -- PRAGMA (the only other
+ * statement checkStatement allows through) would become invalid SQL if
+ * wrapped, which is why the leading keyword is still checked here at all.
+ */
 export function enforceLimit(sql: string, limit: number): string {
   const scan = scanStatement(sql);
 
@@ -231,12 +246,8 @@ export function enforceLimit(sql: string, limit: number): string {
   if (!keywordMatch) return sql;
 
   const keyword = keywordMatch[1].toUpperCase();
+  if (keyword !== "SELECT" && keyword !== "WITH") return sql;
 
-  // Only append LIMIT for SELECT or WITH statements without LIMIT
-  if ((keyword === "SELECT" || keyword === "WITH") && !scan.hasLimit) {
-    const trimmed = sql.trim().replace(/;\s*$/, "");
-    return `${trimmed} LIMIT ${limit}`;
-  }
-
-  return sql;
+  const trimmed = sql.trim().replace(/;\s*$/, "");
+  return `SELECT * FROM (${trimmed}) LIMIT ${limit}`;
 }

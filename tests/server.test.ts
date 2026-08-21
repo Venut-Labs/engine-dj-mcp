@@ -82,6 +82,61 @@ describe("run_sql", () => {
   });
 });
 
+describe("run_sql and a caller-supplied LIMIT that would otherwise bypass the cap", () => {
+  it("bounds a query whose own top-level LIMIT exceeds the tool's cap", async () => {
+    // The old "append only if the scanner found no LIMIT" rule saw this
+    // LIMIT and left the statement untouched, so it ran effectively
+    // unbounded (limited only by the fixture's own 100 rows, not by the
+    // tool's requested cap of 10).
+    const r = await runSql(qp, { sql: "SELECT id FROM Track LIMIT 100000", limit: 10 });
+    expect(isEngineError(r)).toBe(false);
+    if (isEngineError(r)) return;
+    expect(r.rows.length).toBe(10);
+    expect(r.truncated).toBe(true);
+  });
+
+  it("bounds a WHERE ... IN (subquery LIMIT ...) query that fooled the old scanner", async () => {
+    // The scanner has no parenthesis-depth tracking, so a LIMIT nested
+    // inside a subquery reads as "the statement already has a LIMIT" --
+    // even though it is the *outer* WHERE, not the inner subquery, that
+    // determines how many rows actually come back. NOT IN here matches
+    // 99 of the fixture's 100 tracks, so an unbounded run would return far
+    // more than the requested cap of 10.
+    const r = await runSql(qp, {
+      sql: "SELECT * FROM Track WHERE id NOT IN (SELECT id FROM Track LIMIT 1)",
+      limit: 10,
+    });
+    expect(isEngineError(r)).toBe(false);
+    if (isEngineError(r)) return;
+    expect(r.rows.length).toBe(10);
+    expect(r.truncated).toBe(true);
+  });
+
+  it("still executes the exact shape from the finding correctly", async () => {
+    // Literally the second example from the review finding. It happens to
+    // match only 1 row regardless of bounding (id IN a one-row subquery),
+    // so this is a regression check that wrapping a WHERE ... IN (...)
+    // query is not itself broken -- the row-count bound is covered above.
+    const r = await runSql(qp, {
+      sql: "SELECT * FROM Track WHERE id IN (SELECT id FROM Track LIMIT 1)",
+      limit: 10,
+    });
+    expect(isEngineError(r)).toBe(false);
+    if (isEngineError(r)) return;
+    expect(r.rows.length).toBe(1);
+  });
+
+  it("does not inflate a deliberately small inner LIMIT", async () => {
+    // Wrapping must not turn "give me 3 rows" into "give me up to the
+    // tool's cap" -- the inner LIMIT is genuinely smaller and must win.
+    const r = await runSql(qp, { sql: "SELECT id FROM Track LIMIT 3" }); // default tool limit is 200
+    expect(isEngineError(r)).toBe(false);
+    if (isEngineError(r)) return;
+    expect(r.rows.length).toBe(3);
+    expect(r.truncated).toBe(false);
+  });
+});
+
 describe("run_sql and a zero-row result", () => {
   it("still reports real column names, not an empty array", async () => {
     // id -1 cannot exist (the fixture generates positive autoincrement ids),
@@ -209,6 +264,12 @@ describe("createServer", () => {
     expect(text).not.toMatch(/times\s*100/i);
     expect(text).toMatch(/bpmAnalyzed/);
     expect(text).toMatch(/6B/);
+    // Loose matches on /bpmAnalyzed/ and /6B/ alone would still pass an
+    // empty or vague BPM section -- this resource exists solely to be
+    // true, so pin down the actual claim: bpm is stored at face value
+    // (not scaled), backed by the measured example, not just the phrase.
+    expect(text).toMatch(/stored at face\s+value/i);
+    expect(text).toMatch(/102 means 102 BPM/i);
     await client.close();
   });
 

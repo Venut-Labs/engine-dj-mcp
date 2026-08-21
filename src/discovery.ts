@@ -58,7 +58,7 @@ export function readLibraryInfo(mdbPath: string): LibraryInfo | EngineError {
   }
 }
 
-function defaultRoots(): string[] {
+export function defaultRoots(): string[] {
   const roots = [join(homedir(), "Music")];
   try {
     for (const vol of readdirSync("/Volumes")) roots.push(join("/Volumes", vol));

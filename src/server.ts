@@ -1,9 +1,7 @@
 // src/server.ts
-import { existsSync, readdirSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { discoverLibraries } from "./discovery.js";
+import { discoverLibraries, defaultRoots } from "./discovery.js";
 import { libraryCandidates } from "./paths.js";
 import { hasHotJournal } from "./store/connections.js";
 import { QueryProcess } from "./proc/query-client.js";
@@ -25,24 +23,6 @@ function reply(value: unknown) {
     structuredContent: value as Record<string, unknown>,
     isError: isEngineError(value),
   };
-}
-
-/**
- * discovery.ts's own default-root walk (home `Music` folder, then every
- * `/Volumes` mount) is a private implementation detail and its exported
- * interface is locked for this task, so it cannot be reused directly.
- * Duplicated here -- deliberately tiny -- only so a hot journal can still be
- * located when discoverLibraries() has already silently dropped the one
- * candidate that carries it (see findHotJournalCandidate below).
- */
-function defaultRoots(): string[] {
-  const roots = [join(homedir(), "Music")];
-  try {
-    for (const vol of readdirSync("/Volumes")) roots.push(join("/Volumes", vol));
-  } catch {
-    // /Volumes does not exist off macOS; ignore.
-  }
-  return roots;
 }
 
 /**

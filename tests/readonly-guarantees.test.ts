@@ -152,6 +152,19 @@ describe("hasHotJournal", () => {
     writeFileSync(`${p}-journal`, Buffer.from(HOT_JOURNAL_MAGIC + "00".repeat(16), "hex"));
     expect(hasHotJournal(p)).toBe(true);
   });
+
+  it("is false, not thrown, when the journal cannot be read", () => {
+    // A directory at the "-journal" path is a portable way to force a read
+    // failure regardless of which user runs the test (unlike chmod, which a
+    // root-run test would simply ignore): existsSync sees it, openSync
+    // succeeds on a directory, and readSync then fails with EISDIR -- so
+    // this exercises the read-time catch, not just the open-time one.
+    const p = join(dir, "unreadable-journal.db");
+    writeFileSync(p, "");
+    mkdirSync(`${p}-journal`);
+    expect(() => hasHotJournal(p)).not.toThrow();
+    expect(hasHotJournal(p)).toBe(false);
+  });
 });
 
 describe("hot journal recovery", () => {
