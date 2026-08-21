@@ -70,6 +70,28 @@ describe("qCompress framing", () => {
     bad.writeUInt32BE(9999, 0);
     expect(() => qUncompress(bad)).toThrow();
   });
+
+  it("stops inflating at the declared length instead of expanding the whole stream", () => {
+    // 64 MiB of zeros compresses to a few dozen kilobytes. Blob decoding runs
+    // in the MCP server process, not in the killable query child, so an
+    // unbounded inflateSync here is an out-of-memory kill of the entire
+    // server -- and the input is not necessarily the user's own file, since
+    // defaultRoots() scans /Volumes.
+    const bomb = Buffer.concat([u32(16), deflateSync(Buffer.alloc(64 * 1024 * 1024))]);
+    expect(bomb.length).toBeLessThan(200_000); // the frame really is small
+    const before = process.memoryUsage().heapUsed;
+    expect(() => qUncompress(bomb)).toThrow(/zlib/i);
+    // A decode that ran to completion would have had to materialise 64 MiB;
+    // aborting at the declared 16 bytes cannot.
+    expect(process.memoryUsage().heapUsed - before).toBeLessThan(32 * 1024 * 1024);
+  });
+
+  it("refuses a declared length beyond any real Engine blob before inflating at all", () => {
+    // maxOutputLength: expected alone still trusts four attacker-controlled
+    // header bytes, so a ~4 GiB claim would still be honoured.
+    const huge = Buffer.concat([u32(0xffffffff), deflateSync(Buffer.alloc(1024))]);
+    expect(() => qUncompress(huge)).toThrow(/unsupported uncompressed length/i);
+  });
 });
 
 describe("Reader bounds checking", () => {
