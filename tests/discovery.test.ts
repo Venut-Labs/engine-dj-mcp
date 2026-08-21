@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, rmSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, mkdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { makeLibrary } from "./fixtures/gen-library.js";
@@ -42,6 +42,33 @@ describe("discovery", () => {
     const found = discoverLibraries([dir]);
     expect(found.length).toBe(1);
     expect(found[0]!.supported).toBe(true);
+  });
+
+  it("opens a library whose folder name contains a hash, an apostrophe and spaces", () => {
+    // readLibraryInfo used to hand-build `file:<path>?mode=ro`, and SQLite's
+    // URI syntax cuts a filename at `#`. The result was not an error a user
+    // could act on: discoverLibraries drops any candidate that fails to
+    // read, so the whole library vanished and the server reported
+    // library_not_found -- while openQueryConnection, which escapes
+    // properly, opened the very same file without complaint.
+    const oddRoot = mkdtempSync(join(tmpdir(), "edj-odd-"));
+    try {
+      const oddDir = join(oddRoot, "Rock 'n' Roll #1 Mix");
+      mkdirSync(oddDir, { recursive: true });
+      const oddMdb = makeLibrary(oddDir, { tracks: 7 });
+      expect(oddMdb).toContain("#");
+
+      const info = readLibraryInfo(oddMdb);
+      expect(isEngineError(info), JSON.stringify(info)).toBe(false);
+      if (isEngineError(info)) return;
+      expect(info.trackCount).toBe(7);
+      expect(info.supported).toBe(true);
+
+      const found = discoverLibraries([oddDir]);
+      expect(found.map((l) => l.path)).toEqual([oddMdb]);
+    } finally {
+      rmSync(oddRoot, { recursive: true, force: true });
+    }
   });
 });
 

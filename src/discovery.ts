@@ -21,7 +21,15 @@ export function readLibraryInfo(mdbPath: string): LibraryInfo | EngineError {
   }
   let db: DatabaseSync;
   try {
-    db = new DatabaseSync(`file:${mdbPath}?mode=ro`, { readOnly: true });
+    // A plain path, never a hand-built "file:" URI. SQLite's URI syntax
+    // treats `#` and `?` as delimiters, so a library under a folder named
+    // `Rock 'n' Roll #1 Mix` truncated at the `#` and failed to open --
+    // discoverLibraries then dropped it and the server reported
+    // library_not_found, while openQueryConnection on the same file worked.
+    // The `readOnly` flag is the actual guarantee; the `?mode=ro` in the URI
+    // was redundant with it, and duplicated store/connections.ts's escaping
+    // rules badly enough to drift.
+    db = new DatabaseSync(mdbPath, { readOnly: true });
   } catch (e) {
     return err("library_busy", "Could not open the Engine library", {
       detail: String((e as Error).message),
