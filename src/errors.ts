@@ -19,10 +19,11 @@ export const ERROR_CODES = [
   "decode_failed",
   "invalid_argument",
   "library_needs_recovery",
-  // Write-path codes. The tool is not registered at all without
-  // --allow-writes, so writes_not_enabled only fires for a client that
-  // cached an older tool list.
-  "writes_not_enabled",
+  // Write-path codes. There is no writes_not_enabled code: the tool is not
+  // registered at all without --allow-writes, and the MCP SDK's own
+  // dispatcher rejects a call to an unregistered tool name before any
+  // handler in this project runs, so this project never gets the chance to
+  // report that condition itself.
   "playlist_exists",
   "unknown_track",
   "duplicate_track",

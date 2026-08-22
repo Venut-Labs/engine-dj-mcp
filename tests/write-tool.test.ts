@@ -66,6 +66,10 @@ describe("create_playlist tool", () => {
     });
     expect(res.isError).toBeFalsy();
     expect(res.structuredContent.tracks_added).toBe(2);
+    // The user's way back from a write; prove it survives the MCP layer,
+    // not just the store function it comes from.
+    expect(typeof res.structuredContent.backup_path).toBe("string");
+    expect(res.structuredContent.backup_path.length).toBeGreaterThan(0);
 
     const db = new DatabaseSync(dbPath, { readOnly: true });
     expect((db.prepare("SELECT COUNT(*) c FROM Playlist WHERE title='From MCP'").get() as any).c).toBe(1);
