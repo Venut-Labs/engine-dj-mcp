@@ -84,8 +84,10 @@ function reply(value: unknown) {
  * This walks the same candidate paths independently, purely to tell those
  * two cases apart, so `ready()` below can report library_needs_recovery
  * instead of the misleading library_not_found -- never to open the file:
- * recovering a hot journal requires a write, and this project never writes
- * to the user's library, even to heal it.
+ * recovering a hot journal requires a write, and nothing here opens a
+ * library writably to heal one. Not even create_playlist, which refuses a
+ * library in this state outright (store/write.ts) rather than letting
+ * SQLite roll the journal forward on its way in.
  */
 export function findHotJournalCandidate(roots: string[]): string | null {
   for (const root of roots) {
@@ -527,14 +529,20 @@ export async function createServer(
           "search_tracks or get_tracks -- track_ids sets both membership and order. " +
           "Unlike every other tool here, this WRITES to the library, so do not call it " +
           "speculatively: only call it once you actually intend to add the playlist. " +
-          "Before writing, a full snapshot of the library file is taken and its path is " +
-          "returned as backup_path -- keep it, since it is how the write can be undone. " +
+          "To undo it, delete the playlist in Engine DJ -- Engine's own delete trigger and " +
+          "cascade remove the playlist and its entries cleanly. " +
+          "backup_path in the result names a whole-database snapshot taken before the first " +
+          "write of this session; it is a recovery route for a damaged library, NOT an undo. " +
+          "Restoring it reverts the entire library to that moment, discarding everything " +
+          "Engine DJ has written since (play counts, imports, cue and beatgrid edits). " +
           "No existing playlist or entry is ever modified; this only adds a new one. " +
           "Fails with playlist_exists if a top-level playlist already has that title, and " +
-          "with library_busy if Engine DJ or a player currently has the library open -- " +
-          "nothing is written in that case, so close the library and retry rather than " +
-          "treating it as permanent. track_ids may be empty (an empty playlist); a track " +
-          "id may appear at most once. " +
+          "with library_busy if Engine DJ or a player is holding a conflicting lock on the " +
+          "library right then -- nothing is written in that case, so retry rather than " +
+          "treating it as permanent. On any error, `detail` is \"not_committed\" when the " +
+          "library is unchanged and \"committed_unverified\" when the write may have gone " +
+          "through but could not be verified. track_ids may be empty (an empty playlist); a " +
+          "track id may appear at most once. " +
           LIBRARY_SELECTION_NOTE,
         inputSchema: { ...CreatePlaylistInput.shape, library: LibraryArg },
         annotations: RW,
@@ -595,7 +603,8 @@ More than one library can be connected at once — the local one under
 (\`search_tracks\`, \`get_tracks\`, \`get_playlists\`,
 \`get_playlist_tracks\`, \`get_track_performance\`, \`audit_library\`,
 \`run_sql\`, \`refresh_index\`) takes an optional
-\`library\` argument naming one of them: either the \`uuid\` or the
+\`library\` argument naming one of them — as does \`create_playlist\`, when
+the server was started with \`--allow-writes\` — either the \`uuid\` or the
 \`path\`, in the \`~/...\` form \`list_libraries\` prints or the absolute
 one. A value matching neither comes back as \`library_not_found\` listing
 the libraries that are selectable.
