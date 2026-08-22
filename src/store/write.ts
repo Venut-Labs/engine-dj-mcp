@@ -7,7 +7,8 @@
 // whose connection is opened readOnly: true, and that guarantee is the
 // product's core promise -- teaching it to write would dissolve it for reads
 // as well. Writes therefore get their own short-lived connection here:
-// validate read-only, snapshot, open, one transaction, verify, commit, close.
+// validate read-only, open, take the write lock, snapshot, one transaction,
+// verify, commit, check, close.
 import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { err, libraryNeedsRecovery, type EngineError } from "../errors.js";
