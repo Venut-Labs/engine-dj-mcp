@@ -35,6 +35,12 @@ export interface EngineError {
   message: string;
   detail?: string;
   retry_after_ms?: number;
+  /**
+   * Path to a pre-write snapshot the caller can restore from. Only ever set
+   * by the write path, and only on the one error a client cannot safely
+   * ignore: a commit that then failed its own post-write check.
+   */
+  backup_path?: string;
 }
 
 export function err(

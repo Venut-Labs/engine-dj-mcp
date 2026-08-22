@@ -7,7 +7,7 @@
 // whose connection is opened readOnly: true, and that guarantee is the
 // product's core promise -- teaching it to write would dissolve it for reads
 // as well. Writes therefore get their own short-lived connection here:
-// open, one transaction, verify, commit, close.
+// validate read-only, snapshot, open, one transaction, verify, commit, close.
 import { DatabaseSync } from "node:sqlite";
 import { err, type EngineError } from "../errors.js";
 import { snapshotLibrary } from "./backup.js";
@@ -25,6 +25,19 @@ interface OriginRef {
 }
 
 /**
+ * `detail` discriminator values for the EngineError this module returns.
+ * Stable across releases so a caller can decide "is the library still what
+ * it was" without parsing message prose. Everything before COMMIT --
+ * including validation that never reaches the database at all -- collapses
+ * to the same NOT_COMMITTED answer; only the post-commit check below can
+ * produce COMMITTED_UNVERIFIED, and that is the one case where backup_path
+ * is also set, because it is the only case where restoring from it is ever
+ * the right next step.
+ */
+const NOT_COMMITTED = "not_committed";
+const COMMITTED_UNVERIFIED = "committed_unverified";
+
+/**
  * Engine stores a playlist entry's track as the pair the track was *born*
  * with, not as a local row id. On both libraries measured, originTrackId
  * happens to equal id -- which is exactly why this translation has to be
@@ -35,7 +48,11 @@ function resolveOrigins(db: DatabaseSync, trackIds: number[]): OriginRef[] | Eng
   const seen = new Set<number>();
   for (const id of trackIds) {
     if (seen.has(id)) {
-      return err("duplicate_track", `Track ${id} appears more than once; Engine allows a track in a playlist only once.`);
+      return err(
+        "duplicate_track",
+        `Track ${id} appears more than once; Engine allows a track in a playlist only once.`,
+        { detail: NOT_COMMITTED },
+      );
     }
     seen.add(id);
   }
@@ -45,8 +62,10 @@ function resolveOrigins(db: DatabaseSync, trackIds: number[]): OriginRef[] | Eng
   const refs: OriginRef[] = [];
   for (const id of trackIds) {
     const row = stmt.get(id) as { uuid: string | null; trackId: number | null } | undefined;
-    if (!row || !row.uuid || !row.trackId) {
-      return err("unknown_track", `No track with id ${id} in this library.`);
+    // == null, not a falsy check: originTrackId = 0 or originDatabaseUuid =
+    // "" are real values a track can legitimately carry, not "not found".
+    if (!row || row.uuid == null || row.trackId == null) {
+      return err("unknown_track", `No track with id ${id} in this library.`, { detail: NOT_COMMITTED });
     }
     refs.push({ uuid: row.uuid, trackId: row.trackId });
   }
@@ -58,6 +77,15 @@ function resolveOrigins(db: DatabaseSync, trackIds: number[]): OriginRef[] | Eng
  * inserted it first. Re-deriving the head as "the row nothing points at"
  * would be the same assumption the write just made, so it could not catch a
  * write that made it wrongly.
+ *
+ * This, together with `sameOrder`, confirms that the *links* survived the
+ * round trip in the order given -- it does not independently confirm the
+ * *values* are correct. The comparison target is `refs`, the same array
+ * `resolveOrigins` produced and the write consumed, so a `resolveOrigins`
+ * that resolved every id wrongly (e.g. to the local row id instead of the
+ * origin pair) would write wrong values, read the same wrong values back,
+ * and pass this check. Catching that class of bug is what the
+ * re-originated-track test is for, not this readback.
  */
 function walkFrom(db: DatabaseSync, listId: number, headId: number): OriginRef[] {
   const rows = db
@@ -86,7 +114,34 @@ export async function createPlaylist(
   opts: { backupDir: string },
 ): Promise<CreatePlaylistResult | EngineError> {
   const title = input.title.trim();
-  if (!title) return err("invalid_argument", "A playlist needs a non-empty title.");
+  if (!title) return err("invalid_argument", "A playlist needs a non-empty title.", { detail: NOT_COMMITTED });
+
+  // Validate against a short-lived read-only connection before touching the
+  // snapshot rotation or opening the library for writing at all.
+  // snapshotLibrary keeps only the last KEEP copies (src/store/backup.ts);
+  // snapshotting before checking the title means a user who mistypes it
+  // repeatedly evicts every genuine pre-write backup from that window for
+  // nothing. This pass only rules out the common case cheaply -- another
+  // writer can still create the same title (or, in principle, the same
+  // entry) between this check and the INSERT below, so the UNIQUE-constraint
+  // catch further down stays in place as the backstop for that race and
+  // must still report it correctly, not as a generic failure.
+  let refs: OriginRef[] | EngineError;
+  {
+    const precheck = new DatabaseSync(mdbPath, { readOnly: true });
+    try {
+      const exists = precheck.prepare("SELECT 1 FROM Playlist WHERE title = ? AND parentListId = 0").get(title);
+      if (exists) {
+        return err("playlist_exists", `A playlist called "${title}" already exists in this library.`, {
+          detail: NOT_COMMITTED,
+        });
+      }
+      refs = resolveOrigins(precheck, input.trackIds);
+    } finally {
+      precheck.close();
+    }
+  }
+  if (!Array.isArray(refs)) return refs;
 
   const backupPath = await snapshotLibrary(mdbPath, uuid, opts.backupDir);
   if (typeof backupPath !== "string") return backupPath;
@@ -98,12 +153,6 @@ export async function createPlaylist(
     open = true;
     db.exec("PRAGMA foreign_keys = ON");
     db.exec("BEGIN IMMEDIATE");
-
-    const refs = resolveOrigins(db, input.trackIds);
-    if (!Array.isArray(refs)) {
-      db.exec("ROLLBACK");
-      return refs;
-    }
 
     // nextListId = 0 appends: Engine's own insert triggers move the tail
     // marker off the previous last row and point it at this one.
@@ -131,30 +180,46 @@ export async function createPlaylist(
     }
     for (let i = 0; i + 1 < ids.length; i++) link.run(ids[i + 1], ids[i]);
 
-    const fk = db.prepare("PRAGMA foreign_key_check").all();
+    // Scoped to the one table this write touches. Unscoped, foreign_key_check
+    // walks every foreign key in the schema, and these libraries accumulate
+    // cross-library debris that is already orphaned before we ever open the
+    // file (src/playlists.ts:52-58) -- an unscoped check would roll back a
+    // perfectly good write and blame it for damage that predates it.
+    const fk = db.prepare("PRAGMA foreign_key_check(PlaylistEntity)").all();
     if (fk.length > 0) {
       db.exec("ROLLBACK");
-      return err("library_unreadable", `Writing "${title}" would have broken a foreign key; nothing was changed.`);
+      return err("library_unreadable", `Writing "${title}" would have broken a foreign key; nothing was changed.`, {
+        detail: NOT_COMMITTED,
+      });
     }
     if (ids.length > 0 && !sameOrder(walkFrom(db, listId, ids[0]!), refs)) {
       db.exec("ROLLBACK");
-      return err("library_unreadable", `The entry chain for "${title}" did not read back as written; nothing was changed.`);
+      return err(
+        "library_unreadable",
+        `The entry chain for "${title}" did not read back as written; nothing was changed.`,
+        { detail: NOT_COMMITTED },
+      );
     }
-    const tails = db
-      .prepare("SELECT COUNT(*) AS c FROM Playlist WHERE parentListId = 0 AND nextListId = 0")
-      .get() as { c: number };
-    if (tails.c !== 1) {
-      db.exec("ROLLBACK");
-      return err("library_unreadable", `The playlist chain has ${tails.c} tails after writing "${title}"; nothing was changed.`);
-    }
+    // No check that exactly one Playlist row has nextListId = 0: the schema's
+    // own C_NEXT_LIST_ID_UNIQUE_FOR_PARENT constraint already permits at most
+    // one per parent, and this insert always uses nextListId = 0, so more
+    // than one tail is not a state this transaction can produce. Restating
+    // that as a runtime check would be a tautology, not a safety net.
 
     db.exec("COMMIT");
 
-    const integrity = db.prepare("PRAGMA integrity_check").get() as { integrity_check: string };
-    if (integrity.integrity_check !== "ok") {
+    // quick_check, not integrity_check: after a successful COMMIT, SQLite's
+    // own durability guarantee already covers what a full integrity_check
+    // would re-derive, at the cost of walking every page of what can be a
+    // multi-gigabyte USB library on every single playlist creation.
+    // quick_check skips the cross-index verification integrity_check does
+    // and is still enough to catch structural damage from this write.
+    const check = db.prepare("PRAGMA quick_check").get() as { quick_check: string };
+    if (check.quick_check !== "ok") {
       return err(
         "library_unreadable",
-        `The database reports "${integrity.integrity_check}" after writing "${title}". A snapshot from before the write is at ${backupPath}.`,
+        `The database reports "${check.quick_check}" after writing "${title}". A snapshot from before the write is at ${backupPath}.`,
+        { detail: COMMITTED_UNVERIFIED, backup_path: backupPath },
       );
     }
 
@@ -168,16 +233,32 @@ export async function createPlaylist(
       }
     }
     const msg = (e as Error).message ?? String(e);
-    if (/UNIQUE constraint failed: Playlist\.title/i.test(msg) || /C_NAME_UNIQUE_FOR_PARENT/i.test(msg)) {
-      return err("playlist_exists", `A playlist called "${title}" already exists in this library.`);
+    const isUniqueViolation = /UNIQUE constraint failed/i.test(msg);
+    // The constraint's *name* never appears in the message SQLite raises --
+    // only the column list does, e.g. "Playlist.title, Playlist.parentListId"
+    // -- so the two conditions are checked independently rather than as one
+    // pattern that happens to work only because title leads that index today.
+    if (isUniqueViolation && /\bPlaylist\.title\b/.test(msg)) {
+      return err("playlist_exists", `A playlist called "${title}" already exists in this library.`, {
+        detail: NOT_COMMITTED,
+      });
+    }
+    if (isUniqueViolation && /\bPlaylistEntity\./.test(msg)) {
+      return err(
+        "duplicate_track",
+        `A track in "${title}" collided with an existing playlist entry; Engine allows a track in a playlist only once.`,
+        { detail: NOT_COMMITTED },
+      );
     }
     if (/SQLITE_BUSY|database is locked/i.test(msg)) {
-      return err("library_busy", "The library is locked by Engine DJ or a player. Close it and try again.");
+      return err("library_busy", "The library is locked by Engine DJ or a player. Close it and try again.", {
+        detail: NOT_COMMITTED,
+      });
     }
     if (/readonly|attempt to write a readonly database/i.test(msg)) {
-      return err("library_unreadable", `The library at ${mdbPath} cannot be written to.`);
+      return err("library_unreadable", `The library at ${mdbPath} cannot be written to.`, { detail: NOT_COMMITTED });
     }
-    return err("library_unreadable", `Writing "${title}" failed: ${msg}`);
+    return err("library_unreadable", `Writing "${title}" failed: ${msg}`, { detail: NOT_COMMITTED });
   } finally {
     try {
       db?.close();

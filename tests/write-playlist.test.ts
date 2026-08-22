@@ -114,6 +114,34 @@ describe("createPlaylist", () => {
     expect(isEngineError(r)).toBe(false);
     expect((r as any).tracks_added).toBe(0);
     expect(chain(dbPath, (r as any).playlist_id)).toEqual([]);
+    // chain() returns [] whether or not the Playlist row exists at all, so an
+    // implementation that skipped the insert and invented an id would pass
+    // the assertion above. Confirm the row is actually there.
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const row = db.prepare("SELECT title FROM Playlist WHERE id = ?").get((r as any).playlist_id) as any;
+    db.close();
+    expect(row?.title).toBe("Empty");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("writes the mandated column values, not just whatever happens to work", async () => {
+    // These are specified by exact value, not "truthy" or "falsy" -- a
+    // writer that flipped isPersisted or left isExplicitlyExported unset
+    // would still produce a playlist Engine renders, so nothing but a direct
+    // readback catches a wrong constant here.
+    const { dir, dbPath, backupDir } = setup();
+    const r = await createPlaylist(dbPath, "lib-uuid", { title: "Constants", trackIds: [1, 2] }, { backupDir });
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const list = db
+      .prepare("SELECT parentListId, isPersisted, isExplicitlyExported FROM Playlist WHERE id = ?")
+      .get((r as any).playlist_id) as any;
+    const entries = db
+      .prepare("SELECT membershipReference FROM PlaylistEntity WHERE listId = ?")
+      .all((r as any).playlist_id) as any[];
+    db.close();
+    expect(list).toEqual({ parentListId: 0, isPersisted: 1, isExplicitlyExported: 0 });
+    expect(entries.length).toBe(2);
+    expect(entries.every((e) => e.membershipReference === 0)).toBe(true);
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -122,6 +150,7 @@ describe("createPlaylist", () => {
     const r = await createPlaylist(dbPath, "lib-uuid", { title: "Existing", trackIds: [1] }, { backupDir });
     expect(isEngineError(r)).toBe(true);
     expect((r as any).error).toBe("playlist_exists");
+    expect((r as any).detail).toBe("not_committed");
     const db = new DatabaseSync(dbPath, { readOnly: true });
     expect((db.prepare("SELECT COUNT(*) c FROM Playlist").get() as any).c).toBe(1);
     db.close();
@@ -133,6 +162,7 @@ describe("createPlaylist", () => {
     const r = await createPlaylist(dbPath, "lib-uuid", { title: "Ghost", trackIds: [1, 9999] }, { backupDir });
     expect(isEngineError(r)).toBe(true);
     expect((r as any).error).toBe("unknown_track");
+    expect((r as any).detail).toBe("not_committed");
     const db = new DatabaseSync(dbPath, { readOnly: true });
     expect((db.prepare("SELECT COUNT(*) c FROM Playlist WHERE title='Ghost'").get() as any).c).toBe(0);
     expect((db.prepare("SELECT COUNT(*) c FROM PlaylistEntity").get() as any).c).toBe(2);
@@ -145,6 +175,47 @@ describe("createPlaylist", () => {
     const r = await createPlaylist(dbPath, "lib-uuid", { title: "Dup", trackIds: [2, 3, 2] }, { backupDir });
     expect(isEngineError(r)).toBe(true);
     expect((r as any).error).toBe("duplicate_track");
+    expect((r as any).detail).toBe("not_committed");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("rolls back every row when a later entity insert hits the real UNIQUE constraint", async () => {
+    // resolveOrigins only catches a *repeated* id within one request, so it
+    // runs before any row exists and its rollback path is untested by the
+    // two error cases above: delete every ROLLBACK call and those still
+    // pass. This forces a genuine PlaylistEntity UNIQUE(listId, databaseUuid,
+    // trackId) violation from a row already sitting in the table, which is
+    // only caught after the Playlist row and one PlaylistEntity row have
+    // actually been inserted -- so it is the one test that can tell "wrote
+    // nothing" apart from "wrote it, then failed to say so".
+    const { dir, dbPath, backupDir } = setup();
+    // FK enforcement is on by default for a plain DatabaseSync connection
+    // (node:sqlite's own default, separate from createPlaylist's explicit
+    // PRAGMA). Off here because this seed row deliberately targets a listId
+    // that does not exist yet -- the id the next Playlist insert will get.
+    const seed = new DatabaseSync(dbPath, { enableForeignKeyConstraints: false });
+    const nextListId = (seed.prepare("SELECT MAX(id) + 1 AS n FROM Playlist").get() as any).n;
+    // Track 1 was never re-originated, so its origin pair is exactly
+    // (lib-uuid, 1) -- what createPlaylist will try to insert as the second
+    // entity row below, once the fresh Playlist row lands on `nextListId`.
+    seed
+      .prepare(
+        "INSERT INTO PlaylistEntity (listId, trackId, databaseUuid, nextEntityId, membershipReference) VALUES (?, 1, 'lib-uuid', 0, 0)",
+      )
+      .run(nextListId);
+    const playlistCountBefore = (seed.prepare("SELECT COUNT(*) c FROM Playlist").get() as any).c;
+    const entityCountBefore = (seed.prepare("SELECT COUNT(*) c FROM PlaylistEntity").get() as any).c;
+    seed.close();
+
+    const r = await createPlaylist(dbPath, "lib-uuid", { title: "Collide", trackIds: [2, 1] }, { backupDir });
+    expect(isEngineError(r)).toBe(true);
+    expect((r as any).error).toBe("duplicate_track");
+    expect((r as any).detail).toBe("not_committed");
+
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    expect((db.prepare("SELECT COUNT(*) c FROM Playlist").get() as any).c).toBe(playlistCountBefore);
+    expect((db.prepare("SELECT COUNT(*) c FROM PlaylistEntity").get() as any).c).toBe(entityCountBefore);
+    db.close();
     rmSync(dir, { recursive: true, force: true });
   });
 
