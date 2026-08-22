@@ -441,10 +441,13 @@ describe("createServer", () => {
     const perf = tools.find((t) => t.name === "get_track_performance")!;
     expect(perf.description).toMatch(/verified/);
     expect(perf.description).toMatch(/unverified/);
-    // Which is which, not merely that both words appear.
-    expect(perf.description).toMatch(/layout: "verified" \(cues, beatgrid, waveform_summary\)/);
-    expect(perf.description).toMatch(/layout: "unverified" \(loops\)/);
-    expect(perf.description).toMatch(/must not be reported to a user as fact/i);
+    // Which is which, not merely that both words appear. Every field is
+    // verified now that a saved loop exists to check the loops layout
+    // against, so the description has to say that rather than still warning
+    // a model off loop bounds.
+    expect(perf.description).toMatch(/layout: "verified" \(every field\)/);
+    expect(perf.description).toMatch(/no field returns it\s+today/);
+    expect(perf.description).not.toMatch(/must not be reported to a user as fact/i);
     await client.close();
   });
 

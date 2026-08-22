@@ -6,13 +6,15 @@
 // The layouts below were derived from, and checked against, a real Engine DJ
 // library: 257 analysed tracks on a USB export plus 24 in the local history
 // database, 281 blobs of each kind. What each check proved is recorded next
-// to the decoder it justifies. `loops` is the one field whose *contents*
-// could not be checked — see decodeLoops.
+// to the decoder it justifies. `loops` was the last field to be checked: its
+// contents needed a library with a loop actually saved in one, which arrived
+// later than the rest — see decodeLoops.
 //
 // Framing: `quickCues`, `beatData` and `overviewWaveFormData` are Qt
 // qCompress frames (4-byte big-endian uncompressed length, then a raw zlib
 // stream); the declared length matched the inflated length for all 281 of
-// each. `loops` is NOT compressed and NOT framed — it is 192 raw bytes, and
+// each. `loops` is NOT compressed and NOT framed — 192 raw bytes plus any
+// label text its slots carry, and
 // running it through the qCompress path reads its little-endian int64 count
 // of 8 as a big-endian length of 134217728 and hands zlib bytes it rejects.
 //
@@ -36,10 +38,12 @@ import { qUncompress, Reader, DecodeError } from "./qcompress.js";
  * sample count. `status: "ok"` on a verified field is a claim about the
  * values, not merely about the parse.
  *
- * `"unverified"` still means what it always did: the bytes parsed without
- * contradicting the layout, and nothing more. It survives on `loops` because
- * no track in the 281 examined has a loop set, so while the slot structure is
- * pinned down, the meaning of a *populated* slot is untested.
+ * `"unverified"` means the bytes parsed without contradicting the layout, and
+ * nothing more. No field carries it today: `loops` was the last one, and it
+ * held the marker only for as long as no library available had a loop saved in
+ * it. One saved loop supplied the missing prediction — see `decodeLoops` — and
+ * the marker is kept here because it is what a future field decoded from an
+ * unpopulated example would deserve.
  *
  * The marker is about the *bytes*: which offset holds which field, and what
  * the numbers there mean. It is not a claim about every English word this
@@ -386,23 +390,27 @@ export function hasCueSet(buf: Buffer | null): boolean {
  *                                                (23 bytes with an empty label)
  *
  * Evidence for the framing and the slot grid: 8 + 8×23 = 192, the size of
- * all 281 real blobs, every one of which parsed to exactly its last byte;
+ * every unpopulated real blob, each of which parsed to exactly its last byte;
  * the little-endian count reads as 8, and the little-endian -1.0 sentinel
  * (`000000000000f0bf`) appears at the offsets this layout predicts in all
  * 2248 slots. Reading the count big-endian gives 134217728, which is what
  * made every real track decode as `unsupported` before.
  *
- * This layout keeps `layout: "unverified"`. Not one of the 2248 slots is
- * populated — this library has no saved loops — so while the slot grid is
- * pinned down by 2248 sentinels, the six bytes after each slot's two doubles
- * are zero everywhere, and nothing here distinguishes start/end from
- * end/start, or fixes the order of the flag and colour bytes. A populated
- * loop is the one thing the available data cannot exercise, so it is not
- * claimed as verified.
+ * The sentinels pin the slot grid, but an empty slot cannot say which double
+ * is the start, what unit the doubles are in, or what the six trailing bytes
+ * mean — so this layout carried `unverified` for as long as no library had a
+ * saved loop in it. The `saved-loop` golden fixture is that loop, and it
+ * settles all three at once. Its slot reads label "Loop 1", start 2129416.08
+ * and end 2203430.06, which at the 44100 Hz `beatData` declares for the track
+ * is 1.678321678 s — exactly four beats at the 143 BPM Engine analysed, to
+ * 3.6e-15 s. Nothing but the right field order, the right unit and the right
+ * endianness lands on a whole number of beats, so the layout is verified.
+ * The trailing bytes read `01 01` (start set, end set) and four colour bytes,
+ * which is the same tail `quickCues` slots carry.
  */
 export function decodeLoops(buf: Buffer | null, sampleRate?: number | null): LoopsResult {
   const rate = usableRate(sampleRate);
-  return guard<Loop, { slots: number }>(buf, LAYOUT_UNVERIFIED, "raw", (r) => {
+  return guard<Loop, { slots: number }>(buf, LAYOUT_VERIFIED, "raw", (r) => {
     const slots = boundedCount(r, true, MAX_ITEMS, `loop slot count`);
     const items: Loop[] = [];
     for (let i = 0; i < slots; i++) {

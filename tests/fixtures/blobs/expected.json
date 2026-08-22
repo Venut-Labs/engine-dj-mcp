@@ -37,7 +37,7 @@
           }
         },
         "loops": {
-          "layout": "unverified",
+          "layout": "verified",
           "status": "ok",
           "items": [],
           "total": 0,
@@ -148,7 +148,7 @@
           }
         },
         "loops": {
-          "layout": "unverified",
+          "layout": "verified",
           "status": "ok",
           "items": [],
           "total": 0,
@@ -251,7 +251,7 @@
           }
         },
         "loops": {
-          "layout": "unverified",
+          "layout": "verified",
           "status": "ok",
           "items": [],
           "total": 0,
@@ -354,7 +354,7 @@
           }
         },
         "loops": {
-          "layout": "unverified",
+          "layout": "verified",
           "status": "ok",
           "items": [],
           "total": 0,
@@ -457,7 +457,7 @@
           }
         },
         "loops": {
-          "layout": "unverified",
+          "layout": "verified",
           "status": "ok",
           "items": [],
           "total": 0,
@@ -560,7 +560,7 @@
           }
         },
         "loops": {
-          "layout": "unverified",
+          "layout": "verified",
           "status": "ok",
           "items": [],
           "total": 0,
@@ -663,7 +663,7 @@
           }
         },
         "loops": {
-          "layout": "unverified",
+          "layout": "verified",
           "status": "ok",
           "items": [],
           "total": 0,
@@ -766,7 +766,7 @@
           }
         },
         "loops": {
-          "layout": "unverified",
+          "layout": "verified",
           "status": "ok",
           "items": [],
           "total": 0,
@@ -837,6 +837,126 @@
             0.67,
             0.67,
             0.67
+          ]
+        }
+      }
+    },
+    {
+      "name": "saved-loop",
+      "why": "the only track with a loop actually saved: slot 0 spans four beats at 143 BPM",
+      "track_length_seconds": 263,
+      "bpm_analyzed": 143,
+      "blob_bytes": {
+        "quickCues": 59,
+        "loops": 198,
+        "beatData": 68,
+        "overviewWaveFormData": 2782
+      },
+      "expect": {
+        "sample_rate": 44100,
+        "cues": {
+          "layout": "verified",
+          "status": "ok",
+          "items": [
+            {
+              "index": 0,
+              "label": "Cue 1",
+              "position_samples": 2351458.0360030592,
+              "position_seconds": 53.321,
+              "colour": 4294234936
+            }
+          ],
+          "total": 1,
+          "truncated": false,
+          "slots": 8,
+          "main_cue": {
+            "position_samples": 2129416.077961101,
+            "position_seconds": 48.286,
+            "default_samples": 20017.4765625,
+            "is_adjusted": true
+          }
+        },
+        "loops": {
+          "layout": "verified",
+          "status": "ok",
+          "items": [
+            {
+              "index": 0,
+              "label": "Loop 1",
+              "start_samples": 2129416.077961101,
+              "end_samples": 2203430.0639750874,
+              "start_seconds": 48.286,
+              "end_seconds": 49.964
+            }
+          ],
+          "total": 1,
+          "truncated": false,
+          "slots": 8
+        },
+        "beatgrid": {
+          "layout": "verified",
+          "status": "ok",
+          "items": [
+            {
+              "sample": -53996.50945148601,
+              "beat": -4,
+              "seconds": -1.224
+            },
+            {
+              "sample": 11584702.791247815,
+              "beat": 625,
+              "seconds": 262.692
+            }
+          ],
+          "total": 2,
+          "truncated": false,
+          "sample_rate": 44100,
+          "sample_count": 11576448,
+          "duration_seconds": 262.504,
+          "bpm": 143,
+          "grid": "adjusted"
+        },
+        "waveform_summary": {
+          "layout": "verified",
+          "status": "ok",
+          "peaks": 32,
+          "entries": 1024,
+          "samples_per_entry": 11305.125,
+          "bytes": 3099,
+          "duration_seconds": 263,
+          "profile": [
+            0.88,
+            0.87,
+            0.9,
+            0.88,
+            0.88,
+            0.81,
+            0.88,
+            0.85,
+            0.85,
+            0.84,
+            0.83,
+            0.82,
+            0.82,
+            0.75,
+            0.83,
+            0.84,
+            0.83,
+            0.83,
+            0.81,
+            0.82,
+            0.45,
+            0.87,
+            0.82,
+            0.84,
+            0.82,
+            0.82,
+            0.82,
+            0.81,
+            0.85,
+            0.85,
+            0.86,
+            0.91
           ]
         }
       }

@@ -609,11 +609,13 @@ describe("bounded responses", () => {
 });
 
 describe("layout honesty", () => {
-  // The marker now says which way it points. Cues, the beatgrid and the
-  // waveform were confirmed against 281 real blobs, so a "verified" field's
-  // "ok" is a claim about the values. loops keeps "unverified" because not
-  // one of the 2248 loop slots in that library is populated: the slot grid
-  // is pinned down, a populated slot is not.
+  // The marker says which way it points: a "verified" field's "ok" is a claim
+  // about the values, not merely about the parse. Cues, the beatgrid and the
+  // waveform were confirmed against 281 real blobs. loops held "unverified"
+  // for as long as not one of the 2248 loop slots in the libraries available
+  // was populated — the slot grid was pinned down, a populated slot was not —
+  // and earned "verified" from the one saved loop that finally exercised it
+  // (tests/fixtures/blobs/saved-loop.loops.bin, four beats at 143 BPM).
   it("marks cue and beatgrid results verified, whatever their status", () => {
     const results = [
       decodeCues(cueFrame([{ label: "Intro", position: 1, colour: 0 }])), // ok
@@ -628,14 +630,14 @@ describe("layout honesty", () => {
     );
   });
 
-  it("keeps loops marked unverified, whatever its status", () => {
+  it("marks loops verified too, whatever its status", () => {
     const results = [
       decodeLoops(loopBlob([{ label: "L", start: 1, end: 2 }])), // ok
       decodeLoops(null), // empty
       decodeLoops(Buffer.from([0, 0, 0, 1])), // corrupt (too short for a count)
       decodeLoops(i64le(99999)), // unsupported slot count
     ];
-    for (const r of results) expect(r.layout, JSON.stringify(r)).toBe("unverified");
+    for (const r of results) expect(r.layout, JSON.stringify(r)).toBe("verified");
     expect(new Set(results.map((r) => r.status))).toEqual(
       new Set(["ok", "empty", "corrupt", "unsupported"]),
     );
@@ -650,6 +652,6 @@ describe("layout honesty", () => {
     });
     expect(r.cues.layout).toBe("verified");
     expect(r.beatgrid.layout).toBe("verified");
-    expect(r.loops.layout).toBe("unverified");
+    expect(r.loops.layout).toBe("verified");
   });
 });

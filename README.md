@@ -125,8 +125,7 @@ main cue, saved loops, the beatgrid, and a coarse waveform profile.
 Every field carries its own decode status **and** its own `layout` marker.
 `layout: "verified"` means the byte layout was confirmed against a real
 library, so `status: "ok"` is a claim about the values. `layout: "unverified"`
-means only that the bytes parsed. Read [Limitations](#limitations) before
-trusting loop bounds.
+would mean only that the bytes parsed; no field returns it today.
 
 Positions are sample offsets; cue and loop items also carry seconds.
 `items: []` with `slots: 8` means an analysed track with no cues set.
@@ -230,16 +229,19 @@ asks you to launch Engine DJ once so it can recover its own library.
 
 Read this before deciding what to trust.
 
-**Loop bounds are not validated.** The layouts inside `PerformanceData` are
-reverse-engineered, so every decoded field says which kind it is. Cues, the
-beatgrid and the waveform are marked `layout: "verified"` — derived from and
-checked against a real Engine DJ 3.0.x library of 281 analysed tracks, where
-cue offsets land inside the track, the beatgrid's implied tempo matches
-`bpmAnalyzed` on all 281, and the waveform's declared point spacing
-multiplies back out to the track's sample count on all 281. Loops are marked
-`layout: "unverified"`: the slot structure is known and an empty slot decodes
-correctly, but no available library had a loop saved, so a *populated* slot is
-untested. **Do not report loop bounds to a user as fact.**
+**The `PerformanceData` layouts are reverse-engineered**, so every decoded
+field says which kind it is. All four are marked `layout: "verified"` —
+derived from and checked against a real Engine DJ 3.0.x library of 281
+analysed tracks, where cue offsets land inside the track, the beatgrid's
+implied tempo matches `bpmAnalyzed` on all 281, and the waveform's declared
+point spacing multiplies back out to the track's sample count on all 281.
+
+Loops were the last to earn it. The slot grid was pinned down by 2248
+sentinels, but no library available had a loop saved in it, so a *populated*
+slot stayed untested and loops carried `layout: "unverified"` through several
+releases. One deliberately saved loop settled it: its slot spans 1.678321678 s
+on a track Engine analysed at 143 BPM, which is four beats to within 4e-15 s.
+Only the right field order, unit and endianness land on a whole beat count.
 
 A `layout` marker is a claim about the bytes, not about every name put on
 them. Four labels are inferred rather than measured, and the code says so

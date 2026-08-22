@@ -60,6 +60,22 @@ function decode(f: Fixture) {
 const BARE_CUE_BLOB_BYTES = 129;
 
 /**
+ * The size of a loops blob whose eight slots are all unused and unlabelled:
+ * 8 (slot count) + 8×23 (empty label byte + two float64 + two flag bytes +
+ * four colour bytes). As with quickCues, every label byte a slot carries is
+ * one byte over this — which is the whole difference between the eight
+ * loop-less fixtures at 192 and `saved-loop` at 198, for "Loop 1".
+ */
+const BARE_LOOP_BLOB_BYTES = 192;
+
+/** Bytes of label text the fixture's populated loop slots carry, if any. */
+function labelBytes(f: Fixture): number {
+  const loops = f.expect.loops;
+  if (loops.status !== "ok") return 0;
+  return loops.items.reduce((n, l) => n + Buffer.byteLength(l.label ?? "", "utf8"), 0);
+}
+
+/**
  * The fixtures split by whether a hot cue is set, so each group can be
  * asserted on what is actually true of it. Before this split, one shared
  * "places every cue inside the track" case ran over both, and for a
@@ -68,6 +84,14 @@ const BARE_CUE_BLOB_BYTES = 129;
  */
 const WITH_CUES = manifest.fixtures.filter((f) => f.expect.cues.status === "ok" && f.expect.cues.items.length > 0);
 const WITHOUT_CUES = manifest.fixtures.filter((f) => f.expect.cues.status === "ok" && f.expect.cues.items.length === 0);
+
+/**
+ * The same split for loops. Every fixture sat in the second group until a
+ * loop was saved in a real library on purpose to populate the first, which is
+ * what let the loops layout stop being marked unverified.
+ */
+const WITH_LOOPS = manifest.fixtures.filter((f) => f.expect.loops.status === "ok" && f.expect.loops.items.length > 0);
+const WITHOUT_LOOPS = manifest.fixtures.filter((f) => f.expect.loops.status === "ok" && f.expect.loops.items.length === 0);
 
 describe("golden fixtures from a real Engine library", () => {
   it("covers tracks that differ in the ways the layouts turn on", () => {
@@ -84,6 +108,12 @@ describe("golden fixtures from a real Engine library", () => {
     // Both halves of the split below have to be populated, or a whole group
     // of per-fixture assertions would run over nothing and still pass.
     expect(WITH_CUES.length).toBeGreaterThan(0);
+    // Same for loops, and this one guards something that was false for the
+    // whole life of the project until a loop was saved on purpose: with no
+    // populated fixture, every loops assertion below runs over nothing.
+    expect(WITH_LOOPS.length).toBeGreaterThan(0);
+    expect(WITHOUT_LOOPS.length).toBeGreaterThan(0);
+    expect(WITH_LOOPS.length + WITHOUT_LOOPS.length).toBe(manifest.fixtures.length);
     expect(WITHOUT_CUES.length).toBeGreaterThan(0);
     expect(WITH_CUES.length + WITHOUT_CUES.length).toBe(manifest.fixtures.length);
     // main_cue.is_adjusted is set on ten of the 281 real blobs, and was
@@ -103,7 +133,7 @@ describe("golden fixtures from a real Engine library", () => {
     // future change routes loops through qUncompress again, this fails.
     for (const f of manifest.fixtures) {
       const raw = blobs(f.name).loops;
-      expect(raw.length, f.name).toBe(192);
+      expect(raw.length, f.name).toBe(BARE_LOOP_BLOB_BYTES + labelBytes(f));
       expect(() => qUncompress(raw), f.name).toThrow();
     }
   });
@@ -157,19 +187,14 @@ describe("golden fixtures from a real Engine library", () => {
         expect(Math.max(...w.profile)).toBeGreaterThan(0.2);
       });
 
-      it("finds eight loop slots, none of them populated", () => {
-        // Recorded as a fact about this library rather than as an
-        // aspiration: it is precisely why the loops layout keeps its
-        // unverified marker.
+      it("finds eight loop slots", () => {
         const d = decode(f);
         expect(d.loops.status).toBe("ok");
         if (d.loops.status !== "ok") return;
-        expect(d.loops.layout).toBe("unverified");
-        expect(d.loops.slots).toBe(8);
-        expect(d.loops.items).toEqual([]);
+        expect(d.loops.slots).toBe(8); // eight loop slots, as for hot cues
       });
 
-      it("says the cue, beatgrid and waveform layouts are verified", () => {
+      it("says every layout is verified", () => {
         const d = decode(f);
         expect(d.cues.layout).toBe("verified");
         expect(d.beatgrid.layout).toBe("verified");
@@ -178,6 +203,10 @@ describe("golden fixtures from a real Engine library", () => {
         // asserted below), and was the one field whose result carried no
         // marker at all while the README promised one.
         expect(d.waveform_summary.layout).toBe("verified");
+        // loops was the last field to earn this, and could only earn it once
+        // a library existed with a loop saved in it — see WITH_LOOPS below
+        // for the prediction that settled it.
+        expect(d.loops.layout).toBe("verified");
       });
     });
   }
@@ -195,6 +224,49 @@ describe("golden fixtures from a real Engine library", () => {
         expect(cue.index).toBeGreaterThanOrEqual(0);
         expect(cue.index).toBeLessThan(8);
       }
+    });
+  }
+
+  for (const f of WITH_LOOPS) {
+    it(`${f.name}: spans a whole number of beats at the analysed tempo`, () => {
+      // The prediction that took loops from unverified to verified, and the
+      // only one an unpopulated slot could never make. A loop is set on the
+      // grid, so its length has to be a whole number of beats at the BPM
+      // Engine analysed — and that is true of the right field order, unit and
+      // endianness alone. Swap start and end and the length goes negative;
+      // read the doubles big-endian and it is astronomical; treat them as
+      // seconds rather than samples and it is out by the sample rate. None of
+      // those land on an integer beat count.
+      const d = decode(f);
+      expect(d.loops.status).toBe("ok");
+      if (d.loops.status !== "ok") return;
+      expect(d.loops.items.length).toBeGreaterThan(0); // the point of this group
+      expect(d.sample_rate).not.toBeNull();
+      const beat = 60 / f.bpm_analyzed;
+      for (const loop of d.loops.items) {
+        expect(loop.end_samples, loop.label).toBeGreaterThan(loop.start_samples);
+        expect(loop.start_seconds, loop.label).not.toBeNull();
+        expect(loop.end_seconds!, loop.label).toBeLessThanOrEqual(f.track_length_seconds);
+        const beats = (loop.end_seconds! - loop.start_seconds!) / beat;
+        expect(Math.abs(beats - Math.round(beats)), `${loop.label}: ${beats} beats`).toBeLessThan(0.01);
+        expect(Math.round(beats), loop.label).toBeGreaterThanOrEqual(1);
+        expect(loop.index).toBeGreaterThanOrEqual(0);
+        expect(loop.index).toBeLessThan(8);
+      }
+    });
+  }
+
+  for (const f of WITHOUT_LOOPS) {
+    it(`${f.name}: reports no loops from a blob that is all sentinels`, () => {
+      // The complement: eight slots present, none of them claiming a loop.
+      // A decoder that mistook the -1.0 sentinel for a position would invent
+      // eight loops per track here rather than none.
+      const d = decode(f);
+      expect(d.loops.status).toBe("ok");
+      if (d.loops.status !== "ok") return;
+      expect(d.loops.items).toEqual([]);
+      expect(d.loops.slots).toBe(8);
+      expect(blobs(f.name).loops.length).toBe(BARE_LOOP_BLOB_BYTES);
     });
   }
 
@@ -301,7 +373,10 @@ describe("golden fixtures from a real Engine library", () => {
     // level bytes, which throw off printable-ASCII runs by chance (measured:
     // 46 of them in one waveform), so scanning those would be noise, not a
     // guard.
-    const ENGINE_DEFAULT_LABEL = /^Cue [1-8]/;
+    // Engine's own default pad labels, and nothing else. A DJ who renames a
+    // pad after the track can put anything here, which is the leak this
+    // guards; "Loop 1" is what Engine writes unprompted when a loop is saved.
+    const ENGINE_DEFAULT_LABEL = /^(Cue|Loop) [1-8]/;
     for (const f of manifest.fixtures) {
       const b = blobs(f.name);
       const cueBytes = qUncompress(b.quickCues);
@@ -316,13 +391,18 @@ describe("golden fixtures from a real Engine library", () => {
       // so there is no room in it for a string nobody accounted for.
       const d = decode(f);
       const labelled = d.cues.status === "ok" ? d.cues.items : [];
-      const labelBytes = labelled.reduce((n, c) => n + Buffer.byteLength(c.label, "utf8"), 0);
-      expect(cueBytes.length, f.name).toBe(BARE_CUE_BLOB_BYTES + labelBytes);
+      const cueLabelBytes = labelled.reduce((n, c) => n + Buffer.byteLength(c.label, "utf8"), 0);
+      expect(cueBytes.length, f.name).toBe(BARE_CUE_BLOB_BYTES + cueLabelBytes);
       for (const cue of labelled) {
         if (cue.label !== "") expect(cue.label, f.name).toMatch(/^Cue [1-8]$/);
       }
-      // loops: 8 + 8×23, every label empty. Any label byte would grow it.
-      expect(b.loops.length, f.name).toBe(192);
+      // The same accounting for loops: the blob is the bare size plus exactly
+      // the label bytes the decoder reports, so no unaccounted string fits.
+      expect(b.loops.length, f.name).toBe(BARE_LOOP_BLOB_BYTES + labelBytes(f));
+      const savedLoops = d.loops.status === "ok" ? d.loops.items : [];
+      for (const loop of savedLoops) {
+        if (loop.label !== "") expect(loop.label, f.name).toMatch(/^Loop [1-8]$/);
+      }
     }
   });
 });

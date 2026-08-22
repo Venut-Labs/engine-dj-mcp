@@ -409,14 +409,14 @@ export async function createServer(
         "Decode PerformanceData for one track: hot cues, the main cue, saved loops, the " +
         "beatgrid and a coarse waveform profile. Each field carries its own decode status " +
         "and its own layout marker. " +
-        "layout: \"verified\" (cues, beatgrid, waveform_summary) means the binary layout was " +
+        "layout: \"verified\" (every field) means the binary layout was " +
         "confirmed against a real Engine DJ library -- cue positions land inside the track, " +
-        "the beatgrid's implied tempo matches the analysed BPM, and the waveform's declared " +
-        "point spacing multiplies back out to the track's sample count -- so status: \"ok\" " +
-        "there is a claim about the values, not just about the parse. " +
-        "layout: \"unverified\" (loops) still means only that the bytes parsed: the loop slot " +
-        "structure is known, but no library was available with a loop actually saved, so " +
-        "loop bounds must not be reported to a user as fact. " +
+        "the beatgrid's implied tempo matches the analysed BPM, the waveform's declared " +
+        "point spacing multiplies back out to the track's sample count, and a saved loop " +
+        "spans a whole number of beats at that same analysed BPM -- so status: \"ok\" " +
+        "is a claim about the values, not just about the parse. " +
+        "layout: \"unverified\" would mean only that the bytes parsed; no field returns it " +
+        "today. " +
         "Positions are sample offsets; sample_rate at the top level converts them to " +
         "seconds, and cue/loop items carry the seconds already. Only hot-cue and loop slots " +
         "that hold something are listed -- slots is how many the track has in total, so " +

@@ -93,7 +93,7 @@ describe("get_track_performance", () => {
     if (isEngineError(r)) return;
     expect((r as any).cues.layout).toBe("verified");
     expect((r as any).beatgrid.layout).toBe("verified");
-    expect((r as any).loops.layout).toBe("unverified");
+    expect((r as any).loops.layout).toBe("verified");
   });
 
   it("reports an unknown track as a structured error", async () => {
