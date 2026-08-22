@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, openSync, writeSync, closeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -226,6 +226,83 @@ describe("createPlaylist", () => {
     // The snapshot predates the write, so the new playlist must not be in it.
     expect((copy.prepare("SELECT COUNT(*) c FROM Playlist WHERE title='Backed'").get() as any).c).toBe(0);
     copy.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("returns an EngineError, not a rejection, when the library disappears before the write", async () => {
+    // Everything up to and including the title/track pre-check ran through a
+    // try with no catch until this round -- a missing file, an unmounted
+    // volume, or Engine holding the lock would all throw straight out of
+    // createPlaylist instead of resolving to an EngineError.
+    const { dir, backupDir } = setup();
+    const r = await createPlaylist(join(dir, "nope", "m.db"), "lib-uuid", { title: "X", trackIds: [] }, { backupDir });
+    expect(isEngineError(r)).toBe(true);
+    expect((r as any).error).toBe("library_not_found");
+    expect((r as any).detail).toBe("not_committed");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("labels a pre-write snapshot failure as not_committed too", async () => {
+    // snapshotLibrary itself sets no detail (src/store/backup.ts); this
+    // confirms createPlaylist adds one on the way through rather than
+    // leaving this the one pre-commit error the discriminator misses.
+    const { dir, dbPath } = setup();
+    // A file where the backup directory needs to be gives mkdirSync ENOTDIR.
+    const backupDir = join(dbPath, "not-a-directory");
+    const r = await createPlaylist(dbPath, "lib-uuid", { title: "X", trackIds: [] }, { backupDir });
+    expect(isEngineError(r)).toBe(true);
+    expect((r as any).detail).toBe("not_committed");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("reports a committed write that then fails its own check, with a usable backup_path", async () => {
+    // The corruption does not need to land between COMMIT and the check: a
+    // pre-existing bad page in a table this write never touches is enough.
+    // BEGIN IMMEDIATE / INSERT / COMMIT all succeed and persist -- only the
+    // post-commit PRAGMA quick_check, which walks every page rather than
+    // just the ones this transaction wrote, ever notices.
+    const { dir, dbPath, backupDir } = setup();
+
+    // A throwaway table, so corrupting its one page cannot touch anything
+    // createPlaylist itself reads or writes.
+    const seed = new DatabaseSync(dbPath);
+    seed.exec("CREATE TABLE Junk (id INTEGER PRIMARY KEY, data TEXT)");
+    seed.prepare("INSERT INTO Junk (data) VALUES (?)").run("x".repeat(100));
+    const pageSize = (seed.prepare("PRAGMA page_size").get() as any).page_size as number;
+    const rootpage = (
+      seed.prepare("SELECT rootpage FROM sqlite_master WHERE name = 'Junk'").get() as any
+    ).rootpage as number;
+    seed.close();
+
+    // Smash the b-tree page header (page type, freeblock pointer, cell
+    // count, content-area start) so SQLite can no longer parse this page as
+    // a b-tree at all. Confirmed against a throwaway probe that this is what
+    // makes quick_check fail with "btreeInitPage() returns error code 11" --
+    // scrambling row payload bytes further into the page instead left
+    // quick_check reporting "ok", because it validates b-tree structure, not
+    // row content.
+    const fd = openSync(dbPath, "r+");
+    writeSync(fd, Buffer.alloc(8, 0xff), 0, 8, (rootpage - 1) * pageSize);
+    closeSync(fd);
+
+    const r = await createPlaylist(dbPath, "lib-uuid", { title: "AfterCorruption", trackIds: [1] }, { backupDir });
+    expect(isEngineError(r)).toBe(true);
+    expect((r as any).detail).toBe("committed_unverified");
+    expect(typeof (r as any).backup_path).toBe("string");
+
+    // The write itself went through: quick_check runs after COMMIT, so this
+    // error reports a fait accompli, not something that was undone.
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const created = db.prepare("SELECT id FROM Playlist WHERE title = ?").get("AfterCorruption");
+    db.close();
+    expect(created).toBeTruthy();
+
+    // backup_path is only useful to a DJ if it actually opens and reads.
+    const copy = new DatabaseSync((r as any).backup_path, { readOnly: true });
+    const existing = copy.prepare("SELECT COUNT(*) c FROM Playlist WHERE title = 'Existing'").get() as any;
+    copy.close();
+    expect(existing.c).toBe(1);
+
     rmSync(dir, { recursive: true, force: true });
   });
 });

@@ -107,6 +107,53 @@ function sameOrder(a: OriginRef[], b: OriginRef[]): boolean {
   return a.length === b.length && a.every((x, i) => x.uuid === b[i]!.uuid && x.trackId === b[i]!.trackId);
 }
 
+/**
+ * Turns whatever node:sqlite throws into an EngineError. Shared between the
+ * read-only pre-check and the write transaction below it: both open a
+ * connection to the same file and can hit the same failure modes (the
+ * library gone missing mid-session, Engine holding the lock, a foreign or
+ * corrupt schema), and a caller whose promise is typed
+ * `Promise<CreatePlaylistResult | EngineError>` must never see one of them
+ * escape as a rejection instead.
+ */
+function mapWriteError(e: unknown, title: string, mdbPath: string): EngineError {
+  const msg = (e as Error).message ?? String(e);
+  const isUniqueViolation = /UNIQUE constraint failed/i.test(msg);
+  // The constraint's *name* never appears in the message SQLite raises --
+  // only the column list does, e.g. "Playlist.title, Playlist.parentListId"
+  // -- so the two conditions are checked independently rather than as one
+  // pattern that happens to work only because title leads that index today.
+  if (isUniqueViolation && /\bPlaylist\.title\b/.test(msg)) {
+    return err("playlist_exists", `A playlist called "${title}" already exists in this library.`, {
+      detail: NOT_COMMITTED,
+    });
+  }
+  if (isUniqueViolation && /\bPlaylistEntity\./.test(msg)) {
+    return err(
+      "duplicate_track",
+      `A track in "${title}" collided with an existing playlist entry; Engine allows a track in a playlist only once.`,
+      { detail: NOT_COMMITTED },
+    );
+  }
+  if (/SQLITE_BUSY|database is locked/i.test(msg)) {
+    return err("library_busy", "The library is locked by Engine DJ or a player. Close it and try again.", {
+      detail: NOT_COMMITTED,
+    });
+  }
+  if (/readonly|attempt to write a readonly database/i.test(msg)) {
+    return err("library_unreadable", `The library at ${mdbPath} cannot be written to.`, { detail: NOT_COMMITTED });
+  }
+  // The volume can go away between discovery and this call -- a USB drive
+  // pulled mid-set is the live-performance version of this. node:sqlite's
+  // message for that is generic ("unable to open database file"), so this
+  // is matched by wording rather than an errno, the same tradeoff every
+  // other branch here makes.
+  if (/unable to open database file/i.test(msg)) {
+    return err("library_not_found", `No Engine library database at ${mdbPath}.`, { detail: NOT_COMMITTED });
+  }
+  return err("library_unreadable", `Writing "${title}" failed: ${msg}`, { detail: NOT_COMMITTED });
+}
+
 export async function createPlaylist(
   mdbPath: string,
   uuid: string,
@@ -128,8 +175,14 @@ export async function createPlaylist(
   // must still report it correctly, not as a generic failure.
   let refs: OriginRef[] | EngineError;
   {
-    const precheck = new DatabaseSync(mdbPath, { readOnly: true });
+    // The constructor is inside the try, not just the statements after it:
+    // a missing file, an unmounted volume, or Engine holding the lock all
+    // fail right here, and this connection must report those exactly like
+    // the write connection below does rather than let them throw past
+    // createPlaylist's Promise<CreatePlaylistResult | EngineError> contract.
+    let precheck: DatabaseSync | undefined;
     try {
+      precheck = new DatabaseSync(mdbPath, { readOnly: true });
       const exists = precheck.prepare("SELECT 1 FROM Playlist WHERE title = ? AND parentListId = 0").get(title);
       if (exists) {
         return err("playlist_exists", `A playlist called "${title}" already exists in this library.`, {
@@ -137,14 +190,22 @@ export async function createPlaylist(
         });
       }
       refs = resolveOrigins(precheck, input.trackIds);
+    } catch (e) {
+      return mapWriteError(e, title, mdbPath);
     } finally {
-      precheck.close();
+      try {
+        precheck?.close();
+      } catch {
+        /* never opened, or already closed */
+      }
     }
   }
   if (!Array.isArray(refs)) return refs;
 
   const backupPath = await snapshotLibrary(mdbPath, uuid, opts.backupDir);
-  if (typeof backupPath !== "string") return backupPath;
+  // snapshotLibrary sets no detail of its own (src/store/backup.ts); this is
+  // still a pre-commit failure, so the discriminator applies here too.
+  if (typeof backupPath !== "string") return { ...backupPath, detail: NOT_COMMITTED };
 
   let db: DatabaseSync | undefined;
   let open = false;
@@ -208,12 +269,13 @@ export async function createPlaylist(
 
     db.exec("COMMIT");
 
-    // quick_check, not integrity_check: after a successful COMMIT, SQLite's
-    // own durability guarantee already covers what a full integrity_check
-    // would re-derive, at the cost of walking every page of what can be a
-    // multi-gigabyte USB library on every single playlist creation.
-    // quick_check skips the cross-index verification integrity_check does
-    // and is still enough to catch structural damage from this write.
+    // quick_check, not integrity_check: both walk every page -- the
+    // difference is that integrity_check additionally cross-checks every
+    // index against its table's actual content, and that cross-check is
+    // what dominates the cost on a library with hundreds of thousands of
+    // tracks. quick_check skips only that verification and still catches
+    // the on-disk structural damage (a malformed b-tree page, say) that a
+    // check running right after a write exists to catch.
     const check = db.prepare("PRAGMA quick_check").get() as { quick_check: string };
     if (check.quick_check !== "ok") {
       return err(
@@ -232,33 +294,7 @@ export async function createPlaylist(
         /* no transaction in progress */
       }
     }
-    const msg = (e as Error).message ?? String(e);
-    const isUniqueViolation = /UNIQUE constraint failed/i.test(msg);
-    // The constraint's *name* never appears in the message SQLite raises --
-    // only the column list does, e.g. "Playlist.title, Playlist.parentListId"
-    // -- so the two conditions are checked independently rather than as one
-    // pattern that happens to work only because title leads that index today.
-    if (isUniqueViolation && /\bPlaylist\.title\b/.test(msg)) {
-      return err("playlist_exists", `A playlist called "${title}" already exists in this library.`, {
-        detail: NOT_COMMITTED,
-      });
-    }
-    if (isUniqueViolation && /\bPlaylistEntity\./.test(msg)) {
-      return err(
-        "duplicate_track",
-        `A track in "${title}" collided with an existing playlist entry; Engine allows a track in a playlist only once.`,
-        { detail: NOT_COMMITTED },
-      );
-    }
-    if (/SQLITE_BUSY|database is locked/i.test(msg)) {
-      return err("library_busy", "The library is locked by Engine DJ or a player. Close it and try again.", {
-        detail: NOT_COMMITTED,
-      });
-    }
-    if (/readonly|attempt to write a readonly database/i.test(msg)) {
-      return err("library_unreadable", `The library at ${mdbPath} cannot be written to.`, { detail: NOT_COMMITTED });
-    }
-    return err("library_unreadable", `Writing "${title}" failed: ${msg}`, { detail: NOT_COMMITTED });
+    return mapWriteError(e, title, mdbPath);
   } finally {
     try {
       db?.close();
