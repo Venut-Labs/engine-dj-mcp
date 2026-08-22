@@ -17,14 +17,23 @@ import { err, type EngineError } from "../errors.js";
 const KEEP = 10;
 
 /**
+ * Monotonic counter to ensure unique, sortable filenames even in tight loops.
+ * The ISO string alone provides only millisecond precision, so rapid-fire calls
+ * in the same millisecond would collide. The counter serves as an infallible
+ * tiebreaker: calls within the same millisecond are ordered by counter value,
+ * and calls across milliseconds are already separated by the ISO string. This
+ * ordering is essential: rotation immediately deletes the text-sorted oldest,
+ * so an inverted sort would delete the snapshot we just handed back.
+ */
+let counter = 0;
+
+/**
  * A filename-safe, sortable stamp. Sorting the directory listing as text
  * therefore orders snapshots by age, which is what rotation relies on.
- * Nanosecond precision ensures uniqueness even in tight loops.
  */
 function stamp(): string {
   const iso = new Date().toISOString().replace(/[:.]/g, "-");
-  const nano = String(process.hrtime.bigint() % 1000000000n).padStart(9, "0");
-  return `${iso}-${nano}`;
+  return `${iso}-${String(++counter).padStart(10, "0")}`;
 }
 
 export async function snapshotLibrary(
@@ -51,7 +60,7 @@ export async function snapshotLibrary(
   } catch (e) {
     return err(
       "library_unreadable",
-      `Could not snapshot ${mdbPath} before writing: ${(e as Error).message}`,
+      `Could not snapshot ${mdbPath} before writing: ${String(e)}`,
     );
   } finally {
     try {

@@ -25,9 +25,18 @@ describe("snapshotLibrary", () => {
     const dir = mkdtempSync(join(tmpdir(), "bk-rot-"));
     const dbPath = makeLibrary(dir, { tracks: 2, uuid: "uuid-b" });
     const backups = join(dir, "backups");
-    for (let i = 0; i < 12; i++) await snapshotLibrary(dbPath, "uuid-b", backups);
-    const kept = readdirSync(backups).filter((f) => f.startsWith("uuid-b-"));
-    expect(kept.length).toBe(10);
+    const returned: string[] = [];
+    for (let i = 0; i < 12; i++) {
+      const path = await snapshotLibrary(dbPath, "uuid-b", backups);
+      returned.push(path as string);
+    }
+    // The kept snapshots must be exactly the last 10 returned, in sorted order
+    const expectedPaths = returned.slice(-10).sort();
+    const keptPaths = readdirSync(backups)
+      .filter((f) => f.startsWith("uuid-b-") && f.endsWith(".db"))
+      .map((f) => join(backups, f))
+      .sort();
+    expect(keptPaths).toEqual(expectedPaths);
     rmSync(dir, { recursive: true, force: true });
   });
 
