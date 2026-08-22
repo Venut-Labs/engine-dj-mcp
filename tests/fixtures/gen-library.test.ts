@@ -58,6 +58,19 @@ describe("synthetic library", () => {
     const relinked = db.prepare("SELECT nextListId FROM Playlist WHERE id = ?").get(oldTail.id) as any;
     expect(relinked.nextListId).toBe(newTail.id);
 
+    // The arithmetic -(1 + N) must be general for N > 0, not hardcoded as -1.
+    // Insert a third list pointing to the second: the trigger must compute
+    // -(1 + newTail.id), not just -1, to avoid collision. The old tail (second)
+    // should be relinked from first via the new third.
+    const secondId = newTail.id;
+    db.prepare(
+      `INSERT INTO Playlist (title, parentListId, isPersisted, nextListId, lastEditTime, isExplicitlyExported)
+       VALUES ('Third', 0, 1, ?, datetime('now'), 0)`,
+    ).run(secondId);
+    const third = db.prepare("SELECT id FROM Playlist WHERE title = 'Third'").get() as any;
+    const oldTailRelinked = db.prepare("SELECT nextListId FROM Playlist WHERE id = ?").get(oldTail.id) as any;
+    expect(oldTailRelinked.nextListId).toBe(third.id);
+
     db.close();
     rmSync(dir, { recursive: true, force: true });
   });

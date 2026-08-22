@@ -87,11 +87,10 @@ export function makeLibrary(
   // below: C_NEXT_LIST_ID_UNIQUE_FOR_PARENT is what makes "two sibling
   // chains both ending at 0" impossible in a real library, so a broken-chain
   // fixture that ignored it would be testing a shape Engine can never
-  // produce. The triggers Engine also defines are deliberately *not* copied
-  // — they rewrite nextListId on insert to splice new lists into the chain,
-  // which is exactly the behaviour a fixture needs to override to place a
-  // chain by hand. This server never writes to a library, so no code under
-  // test depends on them.
+  // produce. The triggers Engine also defines are also copied, because the
+  // write path depends on Engine's own chain maintenance: without them, a
+  // fixture would let an implementation that hand-maintains the chain pass
+  // while the real library rejects it.
   db.exec(`CREATE TABLE Playlist (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT,
     parentListId INTEGER, isPersisted BOOLEAN, nextListId INTEGER, lastEditTime DATETIME,
     isExplicitlyExported BOOLEAN,
