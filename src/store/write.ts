@@ -8,6 +8,7 @@
 // product's core promise -- teaching it to write would dissolve it for reads
 // as well. Writes therefore get their own short-lived connection here:
 // validate read-only, snapshot, open, one transaction, verify, commit, close.
+import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { err, libraryNeedsRecovery, type EngineError } from "../errors.js";
 import { snapshotLibrary } from "./backup.js";
@@ -30,13 +31,59 @@ export interface OriginRef {
  * Stable across releases so a caller can decide "is the library still what
  * it was" without parsing message prose. Everything before COMMIT --
  * including validation that never reaches the database at all -- collapses
- * to the same NOT_COMMITTED answer; only the post-commit check below can
- * produce COMMITTED_UNVERIFIED, and that is the one case where backup_path
- * is also set, because it is the only case where restoring from it is ever
- * the right next step.
+ * to the same NOT_COMMITTED answer. COMMITTED_UNVERIFIED is produced by
+ * exactly two things, and both mean "the playlist may be on disk": the
+ * post-commit check reporting anything but "ok", and anything thrown from
+ * the COMMIT itself onwards. It is also the only case that carries
+ * backup_path, because it is the only case where restoring from a snapshot
+ * is ever the right next step.
+ *
+ * These two strings are part of the tool's contract; see src/errors.ts.
  */
 const NOT_COMMITTED = "not_committed";
 const COMMITTED_UNVERIFIED = "committed_unverified";
+
+/**
+ * One snapshot per library per process, which is what "before the first write
+ * of a session" means in the spec (§6.1) and in the README.
+ *
+ * Keyed by backup directory *and* library path so a test (or a second
+ * configured backup root) cannot silently reuse a snapshot that lives
+ * somewhere else. The value is only ever a snapshot that actually landed on
+ * disk; a failed snapshot is not cached, so the next write tries again.
+ */
+const sessionSnapshots = new Map<string, string>();
+
+/** Test seam only: forget this process's snapshots so a test can start clean. */
+export function resetSessionSnapshots(): void {
+  sessionSnapshots.clear();
+}
+
+/**
+ * The snapshot for this library, taken once per process.
+ *
+ * Called with the write transaction already open (see createPlaylist): by
+ * that point BEGIN IMMEDIATE has succeeded, so a locked library, a read-only
+ * one and a missing one are all already ruled out and none of them can spend
+ * a snapshot slot. Reading the file through a second, read-only connection
+ * while this process holds RESERVED is safe and yields the *pre-write* state
+ * -- verified: a snapshot taken between INSERT and COMMIT contains the rows
+ * as they were before BEGIN IMMEDIATE.
+ */
+async function sessionSnapshot(
+  mdbPath: string,
+  uuid: string,
+  backupDir: string,
+): Promise<string | EngineError> {
+  const key = `${backupDir}\u0000${mdbPath}`;
+  // existsSync, not a bare Map hit: a user who cleared ~/.engine-dj-mcp/backups
+  // mid-session must get a real snapshot back, not a path to a deleted file.
+  const cached = sessionSnapshots.get(key);
+  if (cached && existsSync(cached)) return cached;
+  const fresh = await snapshotLibrary(mdbPath, uuid, backupDir);
+  if (typeof fresh === "string") sessionSnapshots.set(key, fresh);
+  return fresh;
+}
 
 /**
  * Engine stores a playlist entry's track as the pair the track was *born*
@@ -119,10 +166,11 @@ export function sameOrder(a: OriginRef[], b: OriginRef[]): boolean {
  *
  * Every path that reaches this function is one where the library is
  * unchanged: the transaction either never opened or is rolled back by the
- * caller. That is what lets the fallback below say "nothing was changed"
- * without qualification -- it used to say `Writing "X" failed`, which reads
- * as a half-write even when the failure was "file is not a database" and not
- * one byte was ever attempted.
+ * caller, and a failure at or after COMMIT is answered before this is ever
+ * called (see createPlaylist's catch). That is what lets the fallback below
+ * say "nothing was changed" without qualification -- it used to say
+ * `Writing "X" failed`, which reads as a half-write even when the failure was
+ * "file is not a database" and not one byte was attempted.
  */
 function mapWriteError(e: unknown, title: string, mdbPath: string): EngineError {
   const msg = (e as Error).message ?? String(e);
@@ -186,16 +234,13 @@ export async function createPlaylist(
   // function untouched.
   if (hasHotJournal(mdbPath)) return { ...libraryNeedsRecovery(), detail: NOT_COMMITTED };
 
-  // Validate against a short-lived read-only connection before touching the
-  // snapshot rotation or opening the library for writing at all.
-  // snapshotLibrary keeps only the last KEEP copies (src/store/backup.ts);
-  // snapshotting before checking the title means a user who mistypes it
-  // repeatedly evicts every genuine pre-write backup from that window for
-  // nothing. This pass only rules out the common case cheaply -- another
-  // writer can still create the same title (or, in principle, the same
-  // entry) between this check and the INSERT below, so the UNIQUE-constraint
-  // catch further down stays in place as the backstop for that race and
-  // must still report it correctly, not as a generic failure.
+  // Validate against a short-lived read-only connection before opening the
+  // library for writing at all. This pass only rules out the common case
+  // cheaply -- another writer can still create the same title (or, in
+  // principle, the same entry) between this check and the INSERT below, so
+  // the UNIQUE-constraint catch further down stays in place as the backstop
+  // for that race and must still report it correctly, not as a generic
+  // failure.
   let refs: OriginRef[] | EngineError;
   {
     // The constructor is inside the try, not just the statements after it:
@@ -225,18 +270,42 @@ export async function createPlaylist(
   }
   if (!Array.isArray(refs)) return refs;
 
-  const backupPath = await snapshotLibrary(mdbPath, uuid, opts.backupDir);
-  // snapshotLibrary sets no detail of its own (src/store/backup.ts); this is
-  // still a pre-commit failure, so the discriminator applies here too.
-  if (typeof backupPath !== "string") return { ...backupPath, detail: NOT_COMMITTED };
-
   let db: DatabaseSync | undefined;
   let open = false;
+  /**
+   * "not yet" until COMMIT is reached; "maybe" for the moment COMMIT is in
+   * flight; "yes" once it returned. Anything thrown while this is not "not
+   * yet" may have left the playlist on disk -- COMMIT can fail at fsync with
+   * SQLITE_IOERR or SQLITE_FULL after the pages are already there, and the
+   * post-commit check below runs against a database that has definitely
+   * changed. Reporting those as not_committed (which is what a single catch
+   * calling mapWriteError did) inverts the one discriminator a client uses to
+   * decide whether their library still is what it was, and drops the snapshot
+   * path in exactly the case where it is the only way back.
+   */
+  let commit: "not yet" | "maybe" | "yes" = "not yet";
+  let backupPath: string | undefined;
   try {
     db = new DatabaseSync(mdbPath);
     open = true;
     db.exec("PRAGMA foreign_keys = ON");
     db.exec("BEGIN IMMEDIATE");
+
+    // Snapshot here, not before opening: with BEGIN IMMEDIATE held, a locked
+    // library (library_busy -- the expected answer while Engine DJ is
+    // writing), a read-only one and a missing one have all already been
+    // ruled out. Snapshotting first meant ten busy retries took ten full
+    // copies of m.db and evicted every genuine pre-write snapshot from
+    // backup.ts's KEEP window -- the same eviction problem the title
+    // pre-check above exists to prevent, on the more common trigger.
+    const snapshot = await sessionSnapshot(mdbPath, uuid, opts.backupDir);
+    // snapshotLibrary sets no detail of its own (src/store/backup.ts); this is
+    // still a pre-commit failure, so the discriminator applies here too.
+    if (typeof snapshot !== "string") {
+      db.exec("ROLLBACK");
+      return { ...snapshot, detail: NOT_COMMITTED };
+    }
+    backupPath = snapshot;
 
     // nextListId = 0 appends: Engine's own insert triggers move the tail
     // marker off the previous last row and point it at this one.
@@ -302,7 +371,9 @@ export async function createPlaylist(
     // than one tail is not a state this transaction can produce. Restating
     // that as a runtime check would be a tautology, not a safety net.
 
+    commit = "maybe";
     db.exec("COMMIT");
+    commit = "yes";
 
     // quick_check, not integrity_check: both walk every page -- the
     // difference is that integrity_check additionally cross-checks every
@@ -311,25 +382,52 @@ export async function createPlaylist(
     // tracks. quick_check skips only that verification and still catches
     // the on-disk structural damage (a malformed b-tree page, say) that a
     // check running right after a write exists to catch.
-    const check = db.prepare("PRAGMA quick_check").get() as { quick_check: string };
-    if (check.quick_check !== "ok") {
+    //
+    // check?.quick_check, not check.quick_check: the pragma is documented to
+    // return at least one row, but a `.get()` that came back undefined here
+    // would raise a TypeError *after* a successful commit, and that lands in
+    // the catch below as an error about a library that has in fact already
+    // changed. Reading it as "not ok" says the same true thing without
+    // depending on the throw being classified correctly.
+    const check = db.prepare("PRAGMA quick_check").get() as { quick_check?: string } | undefined;
+    if (check?.quick_check !== "ok") {
       return err(
         "library_unreadable",
-        `The database reports "${check.quick_check}" after writing "${title}". A snapshot from before the write is at ${backupPath}.`,
+        `The database reports "${check?.quick_check ?? "no result"}" after writing "${title}". A snapshot from before the write is at ${backupPath}.`,
         { detail: COMMITTED_UNVERIFIED, backup_path: backupPath },
       );
     }
 
     return { playlist_id: listId, title, tracks_added: refs.length, backup_path: backupPath };
   } catch (e) {
-    if (open && db) {
-      try {
-        db.exec("ROLLBACK");
-      } catch {
-        /* no transaction in progress */
+    // A COMMIT that returned SQLITE_BUSY is the one in-flight failure SQLite
+    // defines precisely: the transaction stays open and nothing was written,
+    // so it is a plain retry, not an unverified write.
+    const busyOnCommit = commit === "maybe" && /SQLITE_BUSY|database is locked/i.test((e as Error)?.message ?? "");
+    if (commit === "not yet" || busyOnCommit) {
+      if (open && db) {
+        try {
+          db.exec("ROLLBACK");
+        } catch {
+          /* no transaction in progress */
+        }
       }
+      return mapWriteError(e, title, mdbPath);
     }
-    return mapWriteError(e, title, mdbPath);
+    // Past the point of no return. No ROLLBACK: after a successful COMMIT
+    // there is no transaction to roll back, and after a COMMIT that failed
+    // mid-flight there is no state we can reason about well enough to undo
+    // by hand -- db.close() in the finally block ends anything still open.
+    // The honest answer is that the write may have gone through, plus the
+    // path of the snapshot from before it, which is the only case where
+    // restoring one is ever the right next step.
+    const msg = (e as Error)?.message ?? String(e);
+    return err(
+      "library_unreadable",
+      `Writing "${title}" may have gone through: the library could not be verified afterwards (${msg}). ` +
+        `Check the library in Engine DJ. A snapshot from before the write is at ${backupPath}.`,
+      { detail: COMMITTED_UNVERIFIED, ...(backupPath ? { backup_path: backupPath } : {}) },
+    );
   } finally {
     try {
       db?.close();

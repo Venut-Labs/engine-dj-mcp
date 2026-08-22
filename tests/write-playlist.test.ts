@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { makeLibrary, addPlaylists, reoriginTracks } from "./fixtures/gen-library.js";
-import { createPlaylist, sameOrder, walkFrom } from "../src/store/write.js";
+import { createPlaylist, resetSessionSnapshots, sameOrder, walkFrom } from "../src/store/write.js";
 import { isEngineError } from "../src/errors.js";
 
 const hotWriterScript = fileURLToPath(new URL("./fixtures/hot-journal-writer.js", import.meta.url));
@@ -17,6 +17,9 @@ const hotWriterScript = fileURLToPath(new URL("./fixtures/hot-journal-writer.js"
 const tempDirs: string[] = [];
 afterEach(() => {
   for (const d of tempDirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  // The snapshot is taken once per library per process (store/write.ts), so
+  // one test's memo must not survive into the next.
+  resetSessionSnapshots();
 });
 
 /** Walk the entry chain the way Engine does, from the head we are told. */
@@ -304,6 +307,79 @@ describe("createPlaylist", () => {
     expect(existing.c).toBe(1);
   });
 
+  it("reports a throw at or after COMMIT as committed_unverified, naming the snapshot", async () => {
+    // The post-commit check does not only fail by returning something other
+    // than "ok" -- it can throw, and so can the COMMIT itself. A USB stick
+    // pulled a moment after commit gives SQLITE_IOERR; an unreadable
+    // sqlite_master gives SQLITE_CORRUPT; a commit that fails at fsync gives
+    // SQLITE_IOERR or SQLITE_FULL. In every one of them the playlist may
+    // already be on disk, so answering the way a pre-write failure is
+    // answered -- detail "not_committed", no backup_path, and a ROLLBACK that
+    // is meaningless after a successful commit -- inverts the one field a
+    // client uses to decide whether their library changed.
+    //
+    // The throw is produced by patching DatabaseSync.prototype.prepare rather
+    // than by yanking a real drive: node:sqlite exposes it as an ordinary
+    // writable prototype method, so a single statement can be made to fail
+    // exactly where the fault would land.
+    const { dbPath, backupDir } = setup();
+    const realPrepare = DatabaseSync.prototype.prepare;
+    DatabaseSync.prototype.prepare = function (this: DatabaseSync, sql: string) {
+      if (/quick_check/i.test(sql)) throw new Error("SQLITE_IOERR: disk I/O error");
+      return realPrepare.call(this, sql);
+    } as typeof realPrepare;
+    let r: any;
+    try {
+      r = await createPlaylist(dbPath, "lib-uuid", { title: "Yanked", trackIds: [1, 2] }, { backupDir });
+    } finally {
+      DatabaseSync.prototype.prepare = realPrepare;
+    }
+
+    expect(isEngineError(r)).toBe(true);
+    expect(r.detail).toBe("committed_unverified");
+    expect(r.message).toMatch(/may have gone through/i);
+    // The snapshot has to be named *and* still be there: this is the only
+    // error where restoring one is the right next step.
+    expect(typeof r.backup_path).toBe("string");
+    expect(existsSync(r.backup_path)).toBe(true);
+    expect(r.message).toContain(r.backup_path);
+
+    // And the write did go through -- the commit ran before the throw, so
+    // "not_committed" would have been a false reassurance.
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    expect((db.prepare("SELECT COUNT(*) c FROM Playlist WHERE title='Yanked'").get() as any).c).toBe(1);
+    expect((db.prepare("SELECT COUNT(*) c FROM PlaylistEntity WHERE listId=(SELECT id FROM Playlist WHERE title='Yanked')").get() as any).c).toBe(2);
+    db.close();
+  });
+
+  it("treats a post-commit check that yields no row as unverified, not as a crash", async () => {
+    // `.get()` on PRAGMA quick_check is documented to return a row and has
+    // always returned one, but reading `.quick_check` off an undefined would
+    // raise a TypeError after a successful commit -- a failure mode invented
+    // by the checking code itself. Reading it through `?.` says the same true
+    // thing ("this write could not be verified") without depending on a throw
+    // being classified correctly on the way out.
+    const { dbPath, backupDir } = setup();
+    const realPrepare = DatabaseSync.prototype.prepare;
+    DatabaseSync.prototype.prepare = function (this: DatabaseSync, sql: string) {
+      if (/quick_check/i.test(sql)) return { get: () => undefined } as any;
+      return realPrepare.call(this, sql);
+    } as typeof realPrepare;
+    let r: any;
+    try {
+      r = await createPlaylist(dbPath, "lib-uuid", { title: "NoRow", trackIds: [1] }, { backupDir });
+    } finally {
+      DatabaseSync.prototype.prepare = realPrepare;
+    }
+
+    expect(isEngineError(r)).toBe(true);
+    expect(r.detail).toBe("committed_unverified");
+    // The guarded read, not the catch: this is the pragma answering "nothing",
+    // not the pragma throwing.
+    expect(r.message).toMatch(/no result/);
+    expect(typeof r.backup_path).toBe("string");
+  });
+
   it("succeeds on a library that already holds an orphaned playlist entry", async () => {
     // Entries left behind by a deleted playlist are pre-existing damage, and
     // `PRAGMA foreign_key_check(PlaylistEntity)` reports them from inside any
@@ -398,6 +474,49 @@ describe("createPlaylist", () => {
     expect(existsSync(backupDir)).toBe(false);
   });
 
+  it("does not spend a snapshot on a library that turns out to be locked", async () => {
+    // library_busy is the expected answer while Engine DJ holds the write
+    // lock, and it is only knowable once BEGIN IMMEDIATE has been tried: a
+    // read-only connection opens fine under someone else's RESERVED lock, so
+    // snapshotting before that point meant ten busy retries took ten full
+    // copies of m.db and evicted every genuine pre-write snapshot from
+    // backup.ts's ten-slot window.
+    const { dbPath, backupDir } = setup();
+    const blocker = new DatabaseSync(dbPath);
+    blocker.exec("BEGIN IMMEDIATE");
+    let r: any;
+    try {
+      r = await createPlaylist(dbPath, "lib-uuid", { title: "Locked", trackIds: [1] }, { backupDir });
+    } finally {
+      blocker.exec("ROLLBACK");
+      blocker.close();
+    }
+    expect(isEngineError(r)).toBe(true);
+    expect(r.error).toBe("library_busy");
+    expect(r.detail).toBe("not_committed");
+    const snapshots = existsSync(backupDir) ? readdirSync(backupDir).filter((f) => f.endsWith(".db")) : [];
+    expect(snapshots).toEqual([]);
+  });
+
+  it("snapshots once per library per session, not once per call", async () => {
+    // What spec §6.1 and the README both say: "before the first write of a
+    // session". Snapshotting per call copied the whole library every time and
+    // pushed the earliest -- the one taken before the session's first change,
+    // the only one that restores the library as the user last saw it -- out
+    // of the ten-slot window.
+    const { dbPath, backupDir } = setup();
+    const first: any = await createPlaylist(dbPath, "lib-uuid", { title: "One", trackIds: [1] }, { backupDir });
+    const second: any = await createPlaylist(dbPath, "lib-uuid", { title: "Two", trackIds: [2] }, { backupDir });
+    expect(isEngineError(first)).toBe(false);
+    expect(isEngineError(second)).toBe(false);
+    expect(second.backup_path).toBe(first.backup_path);
+    expect(readdirSync(backupDir).filter((f) => f.endsWith(".db")).length).toBe(1);
+
+    // And it really is from before the first write: neither playlist is in it.
+    const copy = new DatabaseSync(first.backup_path, { readOnly: true });
+    expect((copy.prepare("SELECT COUNT(*) c FROM Playlist WHERE title IN ('One','Two')").get() as any).c).toBe(0);
+    copy.close();
+  });
 });
 
 describe("walkFrom / sameOrder", () => {
