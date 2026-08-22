@@ -1,6 +1,7 @@
 // src/server.ts
 import { existsSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { discoverLibraries, defaultRoots, probeLibraries, type LibraryInfo } from "./discovery.js";
@@ -27,9 +28,11 @@ import { auditLibrary, AuditInput, AUDIT_CHECKS } from "./tools/audit.js";
 import { runSql, RunSqlInput } from "./tools/sql.js";
 import { listLibraries, type LibraryEntry } from "./tools/libraries.js";
 import { refreshIndex } from "./tools/refresh.js";
+import { CreatePlaylistInput, runCreatePlaylist } from "./tools/write-playlist.js";
 import { err, isEngineError, libraryNeedsRecovery, type EngineError } from "./errors.js";
 
 const RO = { readOnlyHint: true, destructiveHint: false, idempotentHint: true } as const;
+const RW = { readOnlyHint: false, destructiveHint: false, idempotentHint: false } as const;
 
 /**
  * name/version reported to every client on initialize. Read from
@@ -119,7 +122,7 @@ interface LibraryState {
 }
 
 export async function createServer(
-  opts: { roots?: string[]; sidecarBaseDir?: string } = {},
+  opts: { roots?: string[]; sidecarBaseDir?: string; allowWrites?: boolean } = {},
 ): Promise<EngineDjMcpServer> {
   const server = new McpServer({ name: PACKAGE_INFO.name, version: PACKAGE_INFO.version }) as EngineDjMcpServer;
 
@@ -512,6 +515,46 @@ export async function createServer(
       return reply(await refreshIndex(stateFor(lib).mgr));
     },
   );
+
+  // Registered only under --allow-writes. A client that never enables it sees
+  // exactly the read-only server it saw before this feature existed, which is
+  // what keeps the README's promise true by default.
+  if (opts.allowWrites) {
+    server.registerTool(
+      "create_playlist",
+      {
+        title: "Create a playlist",
+        description:
+          "Create a new playlist in this Engine DJ library from track ids returned by " +
+          "search_tracks or get_tracks -- track_ids sets both membership and order. " +
+          "Unlike every other tool here, this WRITES to the library, so do not call it " +
+          "speculatively: only call it once you actually intend to add the playlist. " +
+          "Before writing, a full snapshot of the library file is taken and its path is " +
+          "returned as backup_path -- keep it, since it is how the write can be undone. " +
+          "No existing playlist or entry is ever modified; this only adds a new one. " +
+          "Fails with playlist_exists if a top-level playlist already has that title, and " +
+          "with library_busy if Engine DJ or a player currently has the library open -- " +
+          "nothing is written in that case, so close the library and retry rather than " +
+          "treating it as permanent. track_ids may be empty (an empty playlist); a track " +
+          "id may appear at most once. " +
+          LIBRARY_SELECTION_NOTE,
+        inputSchema: { ...CreatePlaylistInput.shape, library: LibraryArg },
+        annotations: RW,
+      },
+      async (args) => {
+        const state = await acquire(args.library);
+        if (isEngineError(state)) return reply(state);
+        return reply(
+          await runCreatePlaylist(
+            state.lib.path,
+            state.lib.uuid,
+            args as any,
+            join(homedir(), ".engine-dj-mcp", "backups"),
+          ),
+        );
+      },
+    );
+  }
 
   /**
    * There was previously no way to shut this down at all: createServer
