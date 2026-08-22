@@ -1,11 +1,10 @@
 // src/server.ts
 import { existsSync, readFileSync } from "node:fs";
-import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { discoverLibraries, defaultRoots, probeLibraries, type LibraryInfo } from "./discovery.js";
-import { libraryCandidates, sidecarDir } from "./paths.js";
+import { libraryCandidates, libraryTag, sidecarDir } from "./paths.js";
 import {
   LibraryArg,
   findLibrary,
@@ -203,8 +202,7 @@ export async function createServer(
   const sidecarBaseFor = (lib: LibraryInfo): string | undefined => {
     const first = knownList().find((l) => l.uuid === lib.uuid);
     if (!first || first.path === lib.path) return opts.sidecarBaseDir;
-    const tag = createHash("sha256").update(lib.path).digest("hex").slice(0, 12);
-    return join(opts.sidecarBaseDir ?? sidecarDir(""), "duplicate-uuid", tag);
+    return join(opts.sidecarBaseDir ?? sidecarDir(""), "duplicate-uuid", libraryTag(lib.path));
   };
 
   /** Lazily creates -- and thereafter reuses -- one query child per library. */

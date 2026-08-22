@@ -12,6 +12,7 @@ import { DatabaseSync, backup } from "node:sqlite";
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { err, type EngineError } from "../errors.js";
+import { libraryTag } from "../paths.js";
 
 /** How many snapshots to keep per library before deleting the oldest. */
 const KEEP = 10;
@@ -45,13 +46,21 @@ export async function snapshotLibrary(
   try {
     mkdirSync(baseDir, { recursive: true });
     src = new DatabaseSync(mdbPath, { readOnly: true });
-    const dest = join(baseDir, `${uuid}-${stamp()}.db`);
+    // uuid *and* a hash of the file's own path. Keyed on uuid alone, a
+    // library and its clone on a second drive -- same uuid, different drive,
+    // an ordinary thing for a DJ to have -- shared one namespace and one
+    // KEEP-slot window: writes to either evicted the other's snapshots, and
+    // a returned backup_path did not say which drive it came from. This is
+    // the same tag server.ts's sidecarBaseFor uses to keep two such
+    // libraries' indexes apart (see paths.ts).
+    const prefix = `${uuid}-${libraryTag(mdbPath)}-`;
+    const dest = join(baseDir, `${prefix}${stamp()}.db`);
     await backup(src, dest);
     src.close();
     src = undefined;
 
     const mine = readdirSync(baseDir)
-      .filter((f) => f.startsWith(`${uuid}-`) && f.endsWith(".db"))
+      .filter((f) => f.startsWith(prefix) && f.endsWith(".db"))
       .sort();
     for (const old of mine.slice(0, Math.max(0, mine.length - KEEP))) {
       rmSync(join(baseDir, old), { force: true });
