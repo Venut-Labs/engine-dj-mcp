@@ -9,8 +9,9 @@
 // as well. Writes therefore get their own short-lived connection here:
 // validate read-only, snapshot, open, one transaction, verify, commit, close.
 import { DatabaseSync } from "node:sqlite";
-import { err, type EngineError } from "../errors.js";
+import { err, libraryNeedsRecovery, type EngineError } from "../errors.js";
 import { snapshotLibrary } from "./backup.js";
+import { hasHotJournal } from "./connections.js";
 
 export interface CreatePlaylistResult {
   playlist_id: number;
@@ -19,7 +20,7 @@ export interface CreatePlaylistResult {
   backup_path: string;
 }
 
-interface OriginRef {
+export interface OriginRef {
   uuid: string;
   trackId: number;
 }
@@ -87,7 +88,7 @@ function resolveOrigins(db: DatabaseSync, trackIds: number[]): OriginRef[] | Eng
  * and pass this check. Catching that class of bug is what the
  * re-originated-track test is for, not this readback.
  */
-function walkFrom(db: DatabaseSync, listId: number, headId: number): OriginRef[] {
+export function walkFrom(db: DatabaseSync, listId: number, headId: number): OriginRef[] {
   const rows = db
     .prepare("SELECT id, trackId, databaseUuid, nextEntityId FROM PlaylistEntity WHERE listId = ?")
     .all(listId) as { id: number; trackId: number; databaseUuid: string; nextEntityId: number }[];
@@ -103,7 +104,7 @@ function walkFrom(db: DatabaseSync, listId: number, headId: number): OriginRef[]
   return out;
 }
 
-function sameOrder(a: OriginRef[], b: OriginRef[]): boolean {
+export function sameOrder(a: OriginRef[], b: OriginRef[]): boolean {
   return a.length === b.length && a.every((x, i) => x.uuid === b[i]!.uuid && x.trackId === b[i]!.trackId);
 }
 
@@ -115,6 +116,13 @@ function sameOrder(a: OriginRef[], b: OriginRef[]): boolean {
  * corrupt schema), and a caller whose promise is typed
  * `Promise<CreatePlaylistResult | EngineError>` must never see one of them
  * escape as a rejection instead.
+ *
+ * Every path that reaches this function is one where the library is
+ * unchanged: the transaction either never opened or is rolled back by the
+ * caller. That is what lets the fallback below say "nothing was changed"
+ * without qualification -- it used to say `Writing "X" failed`, which reads
+ * as a half-write even when the failure was "file is not a database" and not
+ * one byte was ever attempted.
  */
 function mapWriteError(e: unknown, title: string, mdbPath: string): EngineError {
   const msg = (e as Error).message ?? String(e);
@@ -151,7 +159,9 @@ function mapWriteError(e: unknown, title: string, mdbPath: string): EngineError 
   if (/unable to open database file/i.test(msg)) {
     return err("library_not_found", `No Engine library database at ${mdbPath}.`, { detail: NOT_COMMITTED });
   }
-  return err("library_unreadable", `Writing "${title}" failed: ${msg}`, { detail: NOT_COMMITTED });
+  return err("library_unreadable", `Could not write "${title}": ${msg}. Nothing was changed.`, {
+    detail: NOT_COMMITTED,
+  });
 }
 
 export async function createPlaylist(
@@ -162,6 +172,19 @@ export async function createPlaylist(
 ): Promise<CreatePlaylistResult | EngineError> {
   const title = input.title.trim();
   if (!title) return err("invalid_argument", "A playlist needs a non-empty title.", { detail: NOT_COMMITTED });
+
+  // A hot journal is a mandatory refusal reason (spec §6.2), and it has to be
+  // checked here rather than left to whatever opens the file first: SQLite
+  // refuses to open such a database *read-only* (rolling the journal forward
+  // is a write) with the raw "attempt to write a readonly database", which
+  // this module would otherwise map to library_unreadable -- the wrong code,
+  // and actively false, since the library can be written to perfectly well
+  // once Engine DJ has recovered it. Nor does the caller's acquire() cover
+  // it: IndexManager.ensureFresh reads the header change counter as raw
+  // bytes and returns "fresh" without opening the database at all, so a
+  // journal left behind after an earlier successful read reaches this
+  // function untouched.
+  if (hasHotJournal(mdbPath)) return { ...libraryNeedsRecovery(), detail: NOT_COMMITTED };
 
   // Validate against a short-lived read-only connection before touching the
   // snapshot rotation or opening the library for writing at all.
@@ -241,13 +264,25 @@ export async function createPlaylist(
     }
     for (let i = 0; i + 1 < ids.length; i++) link.run(ids[i + 1], ids[i]);
 
-    // Scoped to the one table this write touches. Unscoped, foreign_key_check
-    // walks every foreign key in the schema, and these libraries accumulate
-    // cross-library debris that is already orphaned before we ever open the
-    // file (src/playlists.ts:52-58) -- an unscoped check would roll back a
-    // perfectly good write and blame it for damage that predates it.
-    const fk = db.prepare("PRAGMA foreign_key_check(PlaylistEntity)").all();
-    if (fk.length > 0) {
+    // Spec §6.3's foreign-key gate, asserted about the rows *this transaction
+    // wrote* rather than about the table they went into.
+    //
+    // PlaylistEntity carries exactly one foreign key -- listId -> Playlist(id)
+    // -- so this query is that key, checked on our own rows. `PRAGMA
+    // foreign_key_check(PlaylistEntity)` looked equivalent and is not: it
+    // reports every orphan in the table, and one PlaylistEntity row left
+    // behind by a deleted playlist (measured: a pre-existing orphan comes back
+    // from the scoped pragma inside an unrelated transaction) would fail every
+    // create_playlist call on that library forever, accusing this write of
+    // damage that predates it in words the user cannot tell apart from a real
+    // violation. The cross-library debris these libraries do accumulate --
+    // entries naming a third library's (databaseUuid, trackId), see
+    // src/playlists.ts:52-58 -- is not a foreign key at all and no pragma
+    // scoping ever protected against it.
+    const orphan = db
+      .prepare("SELECT 1 FROM PlaylistEntity WHERE listId = ? AND listId NOT IN (SELECT id FROM Playlist)")
+      .get(listId);
+    if (orphan) {
       db.exec("ROLLBACK");
       return err("library_unreadable", `Writing "${title}" would have broken a foreign key; nothing was changed.`, {
         detail: NOT_COMMITTED,
