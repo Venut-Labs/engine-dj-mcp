@@ -44,14 +44,28 @@ Claude Desktop — add to your configuration:
 }
 ```
 
+To let the assistant create playlists as well, add `--allow-writes` — a flag
+in `args` rather than an environment variable precisely so it is visible in
+the configuration you are reading:
+
+```json
+{
+  "mcpServers": {
+    "engine-dj": { "command": "npx", "args": ["-y", "engine-dj-mcp", "--allow-writes"] }
+  }
+}
+```
+
 **Requirements:** Node.js 22.13 or newer (for the unflagged `node:sqlite`;
 there are no native dependencies), and an Engine DJ library at schema 3.0.0
 through 3.0.2 — Engine DJ 4.5 and 5.x.
 
 ## Tools
 
-Nine tools, all read-only. Every tool that reads library data also accepts
-an optional `library` argument — see [Choosing a library](#choosing-a-library).
+Nine read-only tools, and a tenth — `create_playlist` — that appears only
+when you start the server with `--allow-writes`. Every tool that reads
+library data also accepts an optional `library` argument — see
+[Choosing a library](#choosing-a-library).
 
 ### `search_tracks`
 
@@ -183,6 +197,41 @@ No arguments.
 Rebuilds the search index if the library changed. Normally unnecessary; the
 server checks staleness itself before answering.
 
+### `create_playlist`
+
+The only tool that writes, and the only one that is not registered at all
+unless the server was started with `--allow-writes`.
+
+Creates one new top-level playlist from track ids — `track_ids` sets both
+what is in it and the order it is in, so a list built by `search_tracks`
+arrives in Engine DJ in the order the assistant chose. Nothing else changes:
+no playlist is renamed, reordered, emptied or deleted, and no track, cue or
+beatgrid is touched. The one existing row that moves is the previous last
+playlist's link, and Engine's own insert trigger is what moves it.
+
+| Argument | What it does |
+| --- | --- |
+| `title` | Name of the new playlist. Must not already be taken at the top level — Engine allows one name per folder. |
+| `track_ids` | Ids from `search_tracks` or `get_tracks`, in playlist order. May be empty, for an empty playlist. A track may appear at most once, which is Engine's own rule. |
+
+Each entry stores the track's origin identity — `(originDatabaseUuid,
+originTrackId)`, the pair Engine matches on — not the local row id, so a
+playlist built here reads the same way Engine's own does.
+
+The result carries `playlist_id`, `tracks_added` and `backup_path`. **To undo
+it, delete the playlist in Engine DJ**; `backup_path` is a whole-library
+snapshot for the case where something went wrong at a lower level, not an
+undo — see [Restoring a snapshot](#restoring-a-snapshot).
+
+Refusals name themselves: `playlist_exists` for a taken title,
+`unknown_track` for an id this library does not have, `duplicate_track` for
+the same id twice, `library_busy` if something else holds a conflicting lock
+right then, `library_needs_recovery` if Engine DJ left an unrecovered
+journal behind. Every error also carries `detail`: `not_committed` means the
+library is exactly what it was, and `committed_unverified` — the rare one —
+means the write may have landed but could not be verified afterwards, and is
+the only case that hands back a `backup_path`.
+
 ## Resources
 
 - **`engine://schema`** — the field semantics an assistant needs before
@@ -215,8 +264,9 @@ does.
 
 Your library is opened **read-only at the operating-system level**, not by
 convention and not by a `PRAGMA` a query could turn back off. Writes are
-refused by SQLite itself, and no file is ever created inside your `Engine
-Library` folder. The search index lives in `~/.engine-dj-mcp/`.
+refused by SQLite itself, and without `--allow-writes` no file is ever
+created inside your `Engine Library` folder. The search index lives in
+`~/.engine-dj-mcp/`.
 
 ### Writing
 
@@ -230,20 +280,50 @@ existing row is the previous last playlist's link, made by Engine's own
 trigger.
 
 Before the first write of a session the database is snapshotted to
-`~/.engine-dj-mcp/backups/`, and the tool returns the path. Ten snapshots
-are kept per library. Nothing is ever written inside your `Engine Library`
-folder.
+`~/.engine-dj-mcp/backups/`, and every write of that session returns its
+path. Ten snapshots are kept per library — per library *file*, so a library
+and its clone on another drive do not share the ten.
 
-If Engine DJ has the library open, the write is refused with `library_busy`
-rather than waited out or forced.
+One file *is* created inside your `Engine Library` folder while a write is in
+progress: SQLite's rollback journal, `m.db-journal`, next to `m.db`. It is
+removed when the transaction commits, and it is what makes the write
+all-or-nothing. If the process is killed mid-transaction the journal is left
+behind, and both this server and Engine DJ then treat the library as needing
+recovery — this server reports `library_needs_recovery` and refuses to touch
+the library, including for reads, until you have launched Engine DJ once so
+it can roll the journal back. Nothing else is ever written in that folder,
+and without `--allow-writes` not even this.
+
+The write takes SQLite's own write lock for the length of one transaction and
+does not wait for it: if something else — Engine DJ mid-save, a player — is
+holding a conflicting lock at that moment, the write is refused with
+`library_busy` and nothing is changed. Merely having Engine DJ *open* is not
+usually a conflict, and the write normally succeeds with Engine running;
+Engine will show the new playlist after it next re-reads the library.
+
+### Restoring a snapshot
+
+`backup_path` is not an undo. It is a copy of the **whole** `m.db` from
+before the session's first write, so putting it back reverts the entire
+library to that moment: every play count, import, cue, beatgrid and rating
+Engine DJ has written since is discarded along with the playlist you wanted
+gone. Reach for it only if the library itself is damaged — the case where
+`create_playlist` comes back with `detail: "committed_unverified"`.
+
+**To undo a playlist, delete it in Engine DJ.** Engine's own delete trigger
+repairs the playlist chain and cascades the entries away, which is exactly
+what removing it should do and is not something restoring a snapshot does
+better.
 
 `run_sql` accepts arbitrary SQL, but only the first statement is ever
 executed, and `VACUUM`, `ATTACH` and `DETACH` are rejected outright, so a
 chained or exfiltrating statement cannot slip past the read-only connection.
 
 If Engine DJ was closed uncleanly and left an unrecovered journal, this
-server will not open the library writably to "fix" it — that would break the
-one guarantee this project makes. It reports `library_needs_recovery` and
+server will not open the library to "fix" it, with or without
+`--allow-writes` — rolling a journal forward is a repair on someone else's
+file, and `create_playlist` refuses such a library outright rather than
+letting SQLite do it on the way in. It reports `library_needs_recovery` and
 asks you to launch Engine DJ once so it can recover its own library.
 
 ## Limitations
@@ -287,8 +367,11 @@ changes. The track's **main cue** does not count towards it — Engine sets
 that as a playback marker rather than the DJ placing it. `has_beatgrid` does
 still test for the blob: `beatData` has no "written but empty" state.
 
-**It never writes to your library.** Not to add a cue, not to fix a tag, not
-even to recover a journal Engine DJ left behind.
+**It writes nothing but playlists, and only when you ask for it.** Without
+`--allow-writes` the library is opened read-only at the OS level and there is
+no tool that could write. With the flag, `create_playlist` adds playlists —
+and that is the whole list. Not a cue, not a tag, not a rating, and not even
+the recovery of a journal Engine DJ left behind.
 
 **It does not read play history.** `Track.timeLastPlayed` answers "what have I
 not played in six months?", but the separate Engine history database —
@@ -304,9 +387,11 @@ flag — a folder is simply a playlist that other playlists sit under — so
 `is_folder` means "has child lists". A folder you have emptied is
 indistinguishable from a playlist with no tracks.
 
-**It reads playlists; it does not write them.** No creating, reordering,
-renaming or adding to a playlist, and no set lists or suggested transitions.
-It answers questions about the collection; the mixing is yours.
+**Playlists can be created, not edited.** With `--allow-writes` a new
+playlist can be added; there is no reordering, renaming, deleting, or adding
+a track to a playlist that already exists, and no set lists or suggested
+transitions. It answers questions about the collection and writes down the
+answer if you ask; the mixing is yours.
 
 **Schema 3.0.0 through 3.0.2 only.** Older and newer libraries are listed with
 their version and reported as unsupported rather than read on a guess.
