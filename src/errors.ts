@@ -19,6 +19,13 @@ export const ERROR_CODES = [
   "decode_failed",
   "invalid_argument",
   "library_needs_recovery",
+  // Write-path codes. The tool is not registered at all without
+  // --allow-writes, so writes_not_enabled only fires for a client that
+  // cached an older tool list.
+  "writes_not_enabled",
+  "playlist_exists",
+  "unknown_track",
+  "duplicate_track",
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];
