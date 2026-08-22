@@ -12,7 +12,8 @@ libraries — the one on your computer and the ones on your USB drives.
 > inMusic or Denon DJ are used in this project.
 
 Your library is opened **read-only at the operating-system level**. It is
-never written to — see [Safety](#safety).
+never written to unless you start the server with `--allow-writes` — see
+[Safety](#safety).
 
 ## What you can ask
 
@@ -25,6 +26,7 @@ Once connected, these are ordinary questions in chat:
 - *"Anything around 128 in ACID Beach?"*
 - *"What's broken in my collection — missing files, duplicates, bad tempos?"*
 - *"Where are the cue points on this track, and what tempo did Engine analyse?"*
+- *"Build me a playlist of everything in 5A from 140 BPM up."* (needs `--allow-writes`)
 
 ## Install
 
@@ -215,6 +217,25 @@ Your library is opened **read-only at the operating-system level**, not by
 convention and not by a `PRAGMA` a query could turn back off. Writes are
 refused by SQLite itself, and no file is ever created inside your `Engine
 Library` folder. The search index lives in `~/.engine-dj-mcp/`.
+
+### Writing
+
+Without `--allow-writes` the server has no tool that can write, and the
+paragraph above holds exactly as written: SQLite itself refuses.
+
+With the flag, one tool appears — `create_playlist`. It adds a new playlist
+and nothing else: no existing playlist is renamed, reordered, emptied or
+deleted, and no track, cue or beatgrid is touched. The single change to an
+existing row is the previous last playlist's link, made by Engine's own
+trigger.
+
+Before the first write of a session the database is snapshotted to
+`~/.engine-dj-mcp/backups/`, and the tool returns the path. Ten snapshots
+are kept per library. Nothing is ever written inside your `Engine Library`
+folder.
+
+If Engine DJ has the library open, the write is refused with `library_busy`
+rather than waited out or forced.
 
 `run_sql` accepts arbitrary SQL, but only the first statement is ever
 executed, and `VACUUM`, `ATTACH` and `DETACH` are rejected outright, so a
