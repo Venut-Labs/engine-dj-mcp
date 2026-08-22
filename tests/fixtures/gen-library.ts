@@ -101,6 +101,32 @@ export function makeLibrary(
     trackId INTEGER, databaseUuid TEXT, nextEntityId INTEGER, membershipReference INTEGER,
     CONSTRAINT C_NAME_UNIQUE_FOR_LIST UNIQUE (listId, databaseUuid, trackId),
     FOREIGN KEY (listId) REFERENCES Playlist (id) ON DELETE CASCADE)`);
+  // Engine's own chain triggers, copied verbatim from a real 3.0.2 library.
+  // The insert pair is what makes `nextListId = 0` mean "append": the BEFORE
+  // trigger parks the current tail at -(1 + 0) to dodge
+  // C_NEXT_LIST_ID_UNIQUE_FOR_PARENT, and the AFTER trigger resolves it to the
+  // new row's id. Without these, a fixture would let an implementation that
+  // hand-maintains the chain pass while the real library rejects it.
+  db.exec(`CREATE TRIGGER trigger_before_insert_List
+    BEFORE INSERT ON Playlist FOR EACH ROW BEGIN
+      UPDATE Playlist SET nextListId = -(1 + nextListId)
+      WHERE nextListId = NEW.nextListId AND parentListId = NEW.parentListId;
+    END`);
+  db.exec(`CREATE TRIGGER trigger_after_insert_List
+    AFTER INSERT ON Playlist FOR EACH ROW BEGIN
+      UPDATE Playlist SET nextListId = NEW.id
+      WHERE nextListId = -(1 + NEW.nextListId) AND parentListId = NEW.parentListId;
+    END`);
+  db.exec(`CREATE TRIGGER trigger_after_delete_List
+    AFTER DELETE ON Playlist FOR EACH ROW BEGIN
+      UPDATE Playlist SET nextListId = OLD.nextListId WHERE nextListId = OLD.id;
+      DELETE FROM Playlist WHERE parentListId = OLD.id;
+    END`);
+  db.exec(`CREATE TRIGGER trigger_before_delete_PlaylistEntity
+    BEFORE DELETE ON PlaylistEntity WHEN OLD.trackId > 0 BEGIN
+      UPDATE PlaylistEntity SET nextEntityId = OLD.nextEntityId
+      WHERE nextEntityId = OLD.id AND listId = OLD.listId;
+    END`);
   // Engine's own PlaylistPath view, copied verbatim from a real 3.0.2
   // library. Nothing in src/ reads it — it is here precisely so a test can
   // demonstrate *why* nothing reads it: its `position` column is the obvious

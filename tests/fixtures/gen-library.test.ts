@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { makeLibrary } from "./gen-library.js";
+import { makeLibrary, addPlaylists } from "./gen-library.js";
 
 let dir: string;
 beforeAll(() => { dir = mkdtempSync(join(tmpdir(), "edj-")); });
@@ -26,5 +26,39 @@ describe("synthetic library", () => {
     expect((db.prepare("SELECT COUNT(*) c FROM Track").get() as any).c).toBe(500);
     expect((db.prepare("SELECT COUNT(*) c FROM PerformanceData").get() as any).c).toBe(500);
     db.close();
+  });
+
+  it("carries Engine's own playlist chain triggers, so writes behave as they do in Engine", () => {
+    // The insert triggers are the entire mechanism behind appending a playlist:
+    // inserting with nextListId = 0 must relink the previous tail. A fixture
+    // without them would let a wrong implementation pass.
+    const dir = mkdtempSync(join(tmpdir(), "gen-trig-"));
+    const dbPath = makeLibrary(dir, { tracks: 3 });
+    addPlaylists(dbPath, [{ id: 1, title: "First", nextListId: 0 }]);
+
+    const db = new DatabaseSync(dbPath);
+    const names = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name")
+      .all()
+      .map((r: any) => r.name);
+    expect(names).toContain("trigger_before_insert_List");
+    expect(names).toContain("trigger_after_insert_List");
+    expect(names).toContain("trigger_after_delete_List");
+    expect(names).toContain("trigger_before_delete_PlaylistEntity");
+
+    // And they work: inserting a second list with nextListId = 0 must move the
+    // tail marker onto it and point the old tail at it.
+    const oldTail = db.prepare("SELECT id FROM Playlist WHERE nextListId = 0").get() as any;
+    db.prepare(
+      `INSERT INTO Playlist (title, parentListId, isPersisted, nextListId, lastEditTime, isExplicitlyExported)
+       VALUES ('Second', 0, 1, 0, datetime('now'), 0)`,
+    ).run();
+    const newTail = db.prepare("SELECT id, title FROM Playlist WHERE nextListId = 0").get() as any;
+    expect(newTail.title).toBe("Second");
+    const relinked = db.prepare("SELECT nextListId FROM Playlist WHERE id = ?").get(oldTail.id) as any;
+    expect(relinked.nextListId).toBe(newTail.id);
+
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
   });
 });
