@@ -474,13 +474,19 @@ describe("createPlaylist", () => {
     expect(existsSync(backupDir)).toBe(false);
   });
 
-  it("does not spend a snapshot on a library that turns out to be locked", async () => {
+  it("spends exactly one snapshot on a library that turns out to be locked", async () => {
     // library_busy is the expected answer while Engine DJ holds the write
-    // lock, and it is only knowable once BEGIN IMMEDIATE has been tried: a
-    // read-only connection opens fine under someone else's RESERVED lock, so
-    // snapshotting before that point meant ten busy retries took ten full
-    // copies of m.db and evicted every genuine pre-write snapshot from
-    // backup.ts's ten-slot window.
+    // lock, and it is only knowable once BEGIN IMMEDIATE has been tried --
+    // but the snapshot is now taken *before* that point, before the write
+    // connection even opens, so this call spends one. One, not ten: the
+    // reason a call that turns out to be busy used to skip the snapshot
+    // entirely was that snapshotting before the busy check meant every busy
+    // retry copied the whole library and evicted a genuine pre-write
+    // snapshot from backup.ts's ten-slot window. What makes "one" the right
+    // number now instead of "ten" is the per-session memo (sessionSnapshot,
+    // src/store/write.ts): every retry in this process reuses the same
+    // cached snapshot, so a session that only ever gets library_busy still
+    // leaves exactly one file behind, not one per retry.
     const { dbPath, backupDir } = setup();
     const blocker = new DatabaseSync(dbPath);
     blocker.exec("BEGIN IMMEDIATE");
@@ -495,7 +501,7 @@ describe("createPlaylist", () => {
     expect(r.error).toBe("library_busy");
     expect(r.detail).toBe("not_committed");
     const snapshots = existsSync(backupDir) ? readdirSync(backupDir).filter((f) => f.endsWith(".db")) : [];
-    expect(snapshots).toEqual([]);
+    expect(snapshots.length).toBe(1);
   });
 
   it("snapshots once per library per session, not once per call", async () => {

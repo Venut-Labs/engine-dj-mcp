@@ -7,7 +7,7 @@
 // whose connection is opened readOnly: true, and that guarantee is the
 // product's core promise -- teaching it to write would dissolve it for reads
 // as well. Writes therefore get their own short-lived connection here:
-// validate read-only, open, take the write lock, snapshot, one transaction,
+// validate read-only, snapshot, open, take the write lock, one transaction,
 // verify, commit, check, close.
 import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
@@ -67,13 +67,15 @@ export function resetSessionSnapshots(): void {
 /**
  * The snapshot for this library, taken once per process.
  *
- * Called with the write transaction already open (see createPlaylist): by
- * that point BEGIN IMMEDIATE has succeeded, so a locked library, a read-only
- * one and a missing one are all already ruled out and none of them can spend
- * a snapshot slot. Reading the file through a second, read-only connection
- * while this process holds RESERVED is safe and yields the *pre-write* state
- * -- verified: a snapshot taken between INSERT and COMMIT contains the rows
- * as they were before BEGIN IMMEDIATE.
+ * Called before the write connection is even opened (see createPlaylist),
+ * so it never holds SQLite's RESERVED lock and never blocks a write Engine
+ * DJ or a second concurrent call in this process is trying to make at the
+ * same moment. The hot-journal check and the read-only pre-check have
+ * already run by the time this is called, so a library needing recovery or
+ * failing the title/track validation never spends a snapshot slot; a
+ * library that turns out to be busy still does, once, and the memo above is
+ * what keeps a session that only ever hits library_busy at exactly one
+ * snapshot rather than one per retry.
  */
 async function sessionSnapshot(
   mdbPath: string,
@@ -275,6 +277,27 @@ export async function createPlaylist(
   }
   if (!Array.isArray(refs)) return refs;
 
+  // Snapshot here, before the write connection is even opened, not after
+  // BEGIN IMMEDIATE. Taking it with RESERVED held meant a full-database copy
+  // -- tens of seconds on a multi-gigabyte USB library -- ran while every
+  // write Engine DJ attempted failed with SQLITE_BUSY, and a second
+  // concurrent create_playlist call in this process (the MCP SDK dispatches
+  // concurrently) was told the library was locked by Engine DJ when it was
+  // this server holding the lock. Snapshotting before BEGIN IMMEDIATE used
+  // to mean a call that turned out to be busy spent a slot on every retry --
+  // ten busy retries, ten full copies, evicting every genuine pre-write
+  // snapshot from backup.ts's KEEP window. The per-session memo
+  // (sessionSnapshot, above) is what makes moving it here safe: a session
+  // that only ever gets library_busy now leaves exactly one snapshot, not
+  // one per retry, so nothing is evicted. The hot-journal check and the
+  // read-only pre-check above still run first, so a call doomed by either of
+  // those still never copies anything.
+  const snapshot = await sessionSnapshot(mdbPath, uuid, opts.backupDir);
+  // snapshotLibrary sets no detail of its own (src/store/backup.ts); this is
+  // still a pre-commit failure, so the discriminator applies here too.
+  if (typeof snapshot !== "string") return { ...snapshot, detail: NOT_COMMITTED };
+  const backupPath = snapshot;
+
   let db: DatabaseSync | undefined;
   let open = false;
   /**
@@ -289,28 +312,11 @@ export async function createPlaylist(
    * path in exactly the case where it is the only way back.
    */
   let commit: "not yet" | "maybe" | "yes" = "not yet";
-  let backupPath: string | undefined;
   try {
     db = new DatabaseSync(mdbPath);
     open = true;
     db.exec("PRAGMA foreign_keys = ON");
     db.exec("BEGIN IMMEDIATE");
-
-    // Snapshot here, not before opening: with BEGIN IMMEDIATE held, a locked
-    // library (library_busy -- the expected answer while Engine DJ is
-    // writing), a read-only one and a missing one have all already been
-    // ruled out. Snapshotting first meant ten busy retries took ten full
-    // copies of m.db and evicted every genuine pre-write snapshot from
-    // backup.ts's KEEP window -- the same eviction problem the title
-    // pre-check above exists to prevent, on the more common trigger.
-    const snapshot = await sessionSnapshot(mdbPath, uuid, opts.backupDir);
-    // snapshotLibrary sets no detail of its own (src/store/backup.ts); this is
-    // still a pre-commit failure, so the discriminator applies here too.
-    if (typeof snapshot !== "string") {
-      db.exec("ROLLBACK");
-      return { ...snapshot, detail: NOT_COMMITTED };
-    }
-    backupPath = snapshot;
 
     // nextListId = 0 appends: Engine's own insert triggers move the tail
     // marker off the previous last row and point it at this one.
@@ -398,7 +404,7 @@ export async function createPlaylist(
     if (check?.quick_check !== "ok") {
       return err(
         "library_unreadable",
-        `The database reports "${check?.quick_check ?? "no result"}" after writing "${title}". A snapshot from before the write is at ${backupPath}.`,
+        `The database reports "${check?.quick_check ?? "no result"}" after writing "${title}". A snapshot from before this session's first write is at ${backupPath}.`,
         { detail: COMMITTED_UNVERIFIED, backup_path: backupPath },
       );
     }
@@ -424,14 +430,14 @@ export async function createPlaylist(
     // mid-flight there is no state we can reason about well enough to undo
     // by hand -- db.close() in the finally block ends anything still open.
     // The honest answer is that the write may have gone through, plus the
-    // path of the snapshot from before it, which is the only case where
-    // restoring one is ever the right next step.
+    // path of the snapshot from before this session's first write, which is
+    // the only case where restoring one is ever the right next step.
     const msg = (e as Error)?.message ?? String(e);
     return err(
       "library_unreadable",
       `Writing "${title}" may have gone through: the library could not be verified afterwards (${msg}). ` +
-        `Check the library in Engine DJ. A snapshot from before the write is at ${backupPath}.`,
-      { detail: COMMITTED_UNVERIFIED, ...(backupPath ? { backup_path: backupPath } : {}) },
+        `Check the library in Engine DJ. A snapshot from before this session's first write is at ${backupPath}.`,
+      { detail: COMMITTED_UNVERIFIED, backup_path: backupPath },
     );
   } finally {
     try {
