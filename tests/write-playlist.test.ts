@@ -352,6 +352,66 @@ describe("createPlaylist", () => {
     db.close();
   });
 
+  it("calls a COMMIT that fails for any reason but a lock an unverified write", async () => {
+    // The "maybe" half of the commit flag, and the only half no other test
+    // reaches: every existing case throws either before COMMIT or after it
+    // returned. A COMMIT that fails mid-flight -- SQLITE_IOERR when the drive
+    // goes away at fsync, SQLITE_FULL when it fills -- leaves a state this
+    // code cannot inspect: the pages may or may not have landed. Answering
+    // "not_committed" there would be a guess dressed as a fact, so the flag
+    // has to survive into the catch and route this to the unverified answer
+    // with the snapshot path attached.
+    const { dbPath, backupDir } = setup();
+    const realExec = DatabaseSync.prototype.exec;
+    DatabaseSync.prototype.exec = function (this: DatabaseSync, sql: string) {
+      if (/^\s*COMMIT/i.test(sql)) throw new Error("SQLITE_IOERR: disk I/O error");
+      return realExec.call(this, sql);
+    } as typeof realExec;
+    let r: any;
+    try {
+      r = await createPlaylist(dbPath, "lib-uuid", { title: "Fsync", trackIds: [1, 2] }, { backupDir });
+    } finally {
+      DatabaseSync.prototype.exec = realExec;
+    }
+
+    expect(isEngineError(r)).toBe(true);
+    expect(r.detail).toBe("committed_unverified");
+    expect(r.message).toMatch(/may have gone through/i);
+    expect(typeof r.backup_path).toBe("string");
+    expect(existsSync(r.backup_path)).toBe(true);
+  });
+
+  it("calls a COMMIT rejected by a lock a plain retry, because SQLite defines that one", async () => {
+    // The exception carved out of the rule above. SQLITE_BUSY on COMMIT is the
+    // single in-flight failure SQLite specifies exactly: the transaction stays
+    // open and nothing was written. Reporting it as "may have gone through"
+    // would send a user to restore a snapshot over a library that never
+    // changed -- the most destructive possible answer to a retryable error.
+    const { dbPath, backupDir } = setup();
+    const realExec = DatabaseSync.prototype.exec;
+    DatabaseSync.prototype.exec = function (this: DatabaseSync, sql: string) {
+      if (/^\s*COMMIT/i.test(sql)) throw new Error("database is locked");
+      return realExec.call(this, sql);
+    } as typeof realExec;
+    let r: any;
+    try {
+      r = await createPlaylist(dbPath, "lib-uuid", { title: "Busy", trackIds: [1] }, { backupDir });
+    } finally {
+      DatabaseSync.prototype.exec = realExec;
+    }
+
+    expect(isEngineError(r)).toBe(true);
+    expect(r.error).toBe("library_busy");
+    expect(r.detail).toBe("not_committed");
+    // No snapshot path: this is not a case where restoring one is ever right.
+    expect(r.backup_path).toBeUndefined();
+
+    // And nothing reached the file, which is what makes "not_committed" true.
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    expect((db.prepare("SELECT COUNT(*) c FROM Playlist WHERE title='Busy'").get() as any).c).toBe(0);
+    db.close();
+  });
+
   it("treats a post-commit check that yields no row as unverified, not as a crash", async () => {
     // `.get()` on PRAGMA quick_check is documented to return a row and has
     // always returned one, but reading `.quick_check` off an undefined would
