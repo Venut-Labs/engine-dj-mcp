@@ -48,10 +48,14 @@ const COMMITTED_UNVERIFIED = "committed_unverified";
  * One snapshot per library per process, which is what "before the first write
  * of a session" means in the spec (§6.1) and in the README.
  *
- * Keyed by backup directory *and* library path so a test (or a second
+ * Keyed by backup directory, library path *and* uuid so a test (or a second
  * configured backup root) cannot silently reuse a snapshot that lives
- * somewhere else. The value is only ever a snapshot that actually landed on
- * disk; a failed snapshot is not cached, so the next write tries again.
+ * somewhere else -- and so a different library that lands at the same path
+ * (a second USB stick sharing a volume label, an m.db replaced in place)
+ * cannot hit another library's cached entry and hand back its snapshot as
+ * this session's way back. The value is only ever a snapshot that actually
+ * landed on disk; a failed snapshot is not cached, so the next write tries
+ * again.
  */
 const sessionSnapshots = new Map<string, string>();
 
@@ -76,7 +80,7 @@ async function sessionSnapshot(
   uuid: string,
   backupDir: string,
 ): Promise<string | EngineError> {
-  const key = `${backupDir}\u0000${mdbPath}`;
+  const key = `${backupDir}\u0000${mdbPath}\u0000${uuid}`;
   // existsSync, not a bare Map hit: a user who cleared ~/.engine-dj-mcp/backups
   // mid-session must get a real snapshot back, not a path to a deleted file.
   const cached = sessionSnapshots.get(key);

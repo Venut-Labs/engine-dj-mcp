@@ -517,6 +517,24 @@ describe("createPlaylist", () => {
     expect((copy.prepare("SELECT COUNT(*) c FROM Playlist WHERE title IN ('One','Two')").get() as any).c).toBe(0);
     copy.close();
   });
+
+  it("keys the per-session snapshot memo by uuid, not just path", async () => {
+    // Two USB sticks with the same volume label, or an m.db replaced in
+    // place, land at the same path but are different libraries -- and
+    // backupDir is a single constant in production (server.ts), so path
+    // alone is not enough to tell them apart. Keyed on path alone, the
+    // second uuid's call would hit the first uuid's cached entry and hand
+    // back *its* snapshot as this session's way back: it opens fine, so
+    // nothing signals the mismatch, and in the one case backup_path is meant
+    // for -- committed_unverified, where the user may actually restore it --
+    // that would overwrite their library with an unrelated one.
+    const { dbPath, backupDir } = setup();
+    const first: any = await createPlaylist(dbPath, "uuid-A", { title: "First", trackIds: [1] }, { backupDir });
+    const second: any = await createPlaylist(dbPath, "uuid-B", { title: "Second", trackIds: [2] }, { backupDir });
+    expect(isEngineError(first)).toBe(false);
+    expect(isEngineError(second)).toBe(false);
+    expect(second.backup_path).not.toBe(first.backup_path);
+  });
 });
 
 describe("walkFrom / sameOrder", () => {
