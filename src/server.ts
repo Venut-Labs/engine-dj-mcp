@@ -123,7 +123,21 @@ interface LibraryState {
 }
 
 export async function createServer(
-  opts: { roots?: string[]; sidecarBaseDir?: string; allowWrites?: boolean } = {},
+  opts: {
+    roots?: string[];
+    sidecarBaseDir?: string;
+    allowWrites?: boolean;
+    /**
+     * Where pre-write snapshots go. Defaults to ~/.engine-dj-mcp/backups.
+     *
+     * An option rather than a constant because a test that writes through
+     * this server would otherwise deposit a full copy of its throwaway
+     * fixture in the real home directory -- and under a fresh tag each run,
+     * since every fixture gets a new temp path, so rotation could never
+     * reclaim them and they accumulated without bound.
+     */
+    backupBaseDir?: string;
+  } = {},
 ): Promise<EngineDjMcpServer> {
   const server = new McpServer({ name: PACKAGE_INFO.name, version: PACKAGE_INFO.version }) as EngineDjMcpServer;
 
@@ -555,7 +569,7 @@ export async function createServer(
             state.lib.path,
             state.lib.uuid,
             args as any,
-            join(homedir(), ".engine-dj-mcp", "backups"),
+            opts.backupBaseDir ?? join(homedir(), ".engine-dj-mcp", "backups"),
           ),
         );
       },

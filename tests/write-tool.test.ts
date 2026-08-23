@@ -1,6 +1,6 @@
 // tests/write-tool.test.ts
 import { describe, it, expect, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -17,7 +17,7 @@ const openServers: { dispose(): void }[] = [];
 async function connectedClient(
   roots: string[],
   sidecarBaseDir: string,
-  extra: { allowWrites?: boolean } = {},
+  extra: { allowWrites?: boolean; backupBaseDir?: string } = {},
 ) {
   const server = await createServer({ roots, sidecarBaseDir, ...extra });
   openServers.push(server);
@@ -54,7 +54,8 @@ describe("create_playlist tool", () => {
 
   it("appears and writes when writes are enabled", async () => {
     const { dir, dbPath } = lib();
-    const { client } = await connectedClient([dir], join(dir, "sc"), { allowWrites: true });
+    const backupBaseDir = join(dir, "backups");
+    const { client } = await connectedClient([dir], join(dir, "sc"), { allowWrites: true, backupBaseDir });
     const { tools } = await client.listTools();
     const tool = tools.find((t) => t.name === "create_playlist")!;
     expect(tool).toBeDefined();
@@ -70,6 +71,14 @@ describe("create_playlist tool", () => {
     // not just the store function it comes from.
     expect(typeof res.structuredContent.backup_path).toBe("string");
     expect(res.structuredContent.backup_path.length).toBeGreaterThan(0);
+
+    // The snapshot must land where the caller asked, not in the real
+    // ~/.engine-dj-mcp/backups: before backupBaseDir existed, every run of
+    // this suite deposited a full copy of a throwaway fixture in the user's
+    // home directory, under a fresh temp-path tag that rotation could never
+    // reclaim. They accumulated forever.
+    expect(res.structuredContent.backup_path.startsWith(backupBaseDir)).toBe(true);
+    expect(readdirSync(backupBaseDir).filter((f) => f.endsWith(".db")).length).toBe(1);
 
     const db = new DatabaseSync(dbPath, { readOnly: true });
     expect((db.prepare("SELECT COUNT(*) c FROM Playlist WHERE title='From MCP'").get() as any).c).toBe(1);

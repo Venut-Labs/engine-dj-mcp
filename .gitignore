@@ -6,3 +6,6 @@ dist/
 # superpowers artefacts stay local
 docs/superpowers/
 .superpowers/
+
+# local dev MCP wiring — points at ./dist and enables writes; not for anyone else
+.mcp.json
