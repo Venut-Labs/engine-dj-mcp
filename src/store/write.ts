@@ -158,6 +158,24 @@ export function walkFrom(db: DatabaseSync, listId: number, headId: number): Orig
   return out;
 }
 
+/**
+ * Roll back, swallowing a failure of the rollback itself.
+ *
+ * Every caller is already returning a specific error -- the chain did not read
+ * back, the library is busy -- and a ROLLBACK that throws on the way out would
+ * replace that reason with its own, telling the user about a failed rollback
+ * instead of what actually went wrong. Nothing is lost by ignoring it:
+ * db.close() in the finally block ends any transaction still open, and SQLite
+ * discards an uncommitted one on close.
+ */
+function rollback(db: DatabaseSync): void {
+  try {
+    db.exec("ROLLBACK");
+  } catch {
+    /* no transaction in progress, or the connection is already gone */
+  }
+}
+
 export function sameOrder(a: OriginRef[], b: OriginRef[]): boolean {
   return a.length === b.length && a.every((x, i) => x.uuid === b[i]!.uuid && x.trackId === b[i]!.trackId);
 }
@@ -344,32 +362,20 @@ export async function createPlaylist(
     }
     for (let i = 0; i + 1 < ids.length; i++) link.run(ids[i + 1], ids[i]);
 
-    // Spec §6.3's foreign-key gate, asserted about the rows *this transaction
-    // wrote* rather than about the table they went into.
-    //
-    // PlaylistEntity carries exactly one foreign key -- listId -> Playlist(id)
-    // -- so this query is that key, checked on our own rows. `PRAGMA
-    // foreign_key_check(PlaylistEntity)` looked equivalent and is not: it
-    // reports every orphan in the table, and one PlaylistEntity row left
-    // behind by a deleted playlist (measured: a pre-existing orphan comes back
-    // from the scoped pragma inside an unrelated transaction) would fail every
-    // create_playlist call on that library forever, accusing this write of
-    // damage that predates it in words the user cannot tell apart from a real
-    // violation. The cross-library debris these libraries do accumulate --
-    // entries naming a third library's (databaseUuid, trackId), see
-    // src/playlists.ts:52-58 -- is not a foreign key at all and no pragma
-    // scoping ever protected against it.
-    const orphan = db
-      .prepare("SELECT 1 FROM PlaylistEntity WHERE listId = ? AND listId NOT IN (SELECT id FROM Playlist)")
-      .get(listId);
-    if (orphan) {
-      db.exec("ROLLBACK");
-      return err("library_unreadable", `Writing "${title}" would have broken a foreign key; nothing was changed.`, {
-        detail: NOT_COMMITTED,
-      });
-    }
+    // No foreign-key gate here, though spec §6.3 asks for one. PlaylistEntity
+    // carries exactly one foreign key -- listId -> Playlist(id) -- it is not
+    // DEFERRABLE, and this connection sets PRAGMA foreign_keys = ON, so a bad
+    // listId is refused by SQLite at the INSERT above and never reaches a
+    // check. The listId asked about would in any case be the one this
+    // transaction just inserted, which exists by construction. A gate whose
+    // condition cannot become true is not a safety net; it reads as one,
+    // which is worse than its absence. (`PRAGMA foreign_key_check(...)` is
+    // not the alternative: it reports every orphan in the table, so a
+    // PlaylistEntity row left behind by some earlier deleted playlist would
+    // fail every create_playlist call on that library forever, blaming this
+    // write for damage that predates it.)
     if (ids.length > 0 && !sameOrder(walkFrom(db, listId, ids[0]!), refs)) {
-      db.exec("ROLLBACK");
+      rollback(db);
       return err(
         "library_unreadable",
         `The entry chain for "${title}" did not read back as written; nothing was changed.`,
@@ -416,13 +422,7 @@ export async function createPlaylist(
     // so it is a plain retry, not an unverified write.
     const busyOnCommit = commit === "maybe" && /SQLITE_BUSY|database is locked/i.test((e as Error)?.message ?? "");
     if (commit === "not yet" || busyOnCommit) {
-      if (open && db) {
-        try {
-          db.exec("ROLLBACK");
-        } catch {
-          /* no transaction in progress */
-        }
-      }
+      if (open && db) rollback(db);
       return mapWriteError(e, title, mdbPath);
     }
     // Past the point of no return. No ROLLBACK: after a successful COMMIT

@@ -59,8 +59,18 @@ export async function snapshotLibrary(
     src.close();
     src = undefined;
 
+    // Snapshots this library owns: the tagged shape above, plus the untagged
+    // `${uuid}-${stamp}.db` an earlier version wrote. Without the second,
+    // those sat outside every namespace and were never reclaimed -- up to
+    // KEEP full copies of a library, kept forever, on any upgrading user.
+    // They predate the tag and therefore predate everything written since,
+    // which is why folding them into one window evicts them first. Two
+    // libraries sharing a uuid is precisely why the tag exists, and an
+    // untagged file cannot say which of them it came from -- ageing them out
+    // under whichever library writes next is the only thing left to do.
+    const legacy = new RegExp(`^${uuid}-\\d{4}-`);
     const mine = readdirSync(baseDir)
-      .filter((f) => f.startsWith(prefix) && f.endsWith(".db"))
+      .filter((f) => f.endsWith(".db") && (f.startsWith(prefix) || legacy.test(f)))
       .sort();
     for (const old of mine.slice(0, Math.max(0, mine.length - KEEP))) {
       rmSync(join(baseDir, old), { force: true });

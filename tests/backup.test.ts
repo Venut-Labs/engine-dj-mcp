@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, rmSync, readdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -71,6 +71,30 @@ describe("snapshotLibrary", () => {
     expect(kept.length).toBe(11);
     expect(usbSnaps.slice(-10).every((p) => existsSync(p))).toBe(true);
     expect(usbSnaps.slice(0, 2).some((p) => existsSync(p))).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("rotates snapshots left by a version that did not tag them", async () => {
+    // Names gained the path tag after the first release that wrote them, so an
+    // upgrading user has files shaped `${uuid}-${stamp}.db` sitting outside
+    // every tagged namespace. The rotation filter matched only the new shape,
+    // so those were never reclaimed -- up to KEEP full copies of a library per
+    // uuid, kept forever. They are older than anything written since, so
+    // folding them into the same window evicts them first, which is the point.
+    const dir = mkdtempSync(join(tmpdir(), "bk-legacy-"));
+    const dbPath = makeLibrary(dir, { tracks: 2, uuid: "uuid-legacy" });
+    const backups = join(dir, "backups");
+    mkdirSync(backups, { recursive: true });
+    for (let i = 0; i < 12; i++) {
+      writeFileSync(join(backups, `uuid-legacy-2026-08-2${i % 10}T00-00-0${i % 10}-000Z-0000000001.db`), "old");
+    }
+    const out = await snapshotLibrary(dbPath, "uuid-legacy", backups);
+    expect(isEngineError(out)).toBe(false);
+
+    const kept = readdirSync(backups).filter((f) => f.endsWith(".db"));
+    expect(kept.length).toBe(10);
+    // The one just written is never the one evicted.
+    expect(kept).toContain((out as string).split("/").pop());
     rmSync(dir, { recursive: true, force: true });
   });
 

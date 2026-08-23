@@ -24,10 +24,12 @@ import type { QueryProcess } from "./proc/query-client.js";
  * never read by this project.
  *
  * Everything here therefore walks the chain — defensively. These are linked
- * lists inside a file this server does not own and never writes: a
- * half-completed Engine write, a sync conflict or a partially restored
- * backup can leave a cycle, a link to a row that is gone, or two
- * disconnected runs. None of those may hang the walk, and none may come
+ * lists inside a file this server does not own, and which nothing in this
+ * module writes: a half-completed Engine write, a sync conflict or a
+ * partially restored backup can leave a cycle, a link to a row that is gone,
+ * or two disconnected runs. (Since 0.11.0 the server can append a playlist
+ * under --allow-writes — see src/store/write.ts — but only ever through
+ * Engine's own chain triggers, and never from here.) None of those may hang the walk, and none may come
  * back as a silently short list that reads like a complete one.
  */
 
