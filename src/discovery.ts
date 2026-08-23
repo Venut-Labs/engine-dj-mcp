@@ -22,8 +22,9 @@ export function readLibraryInfo(mdbPath: string): LibraryInfo | EngineError {
   }
   if (hasHotJournal(mdbPath)) {
     // Same check openQueryConnection makes before opening (store/connections.ts):
-    // recovering a hot journal needs a write, which this project never
-    // performs, even to probe a library. Caught here first so the specific,
+    // recovering a hot journal needs a write, and discovery never opens a
+    // library writably -- not to probe one, and not to heal one. Caught here
+    // first so the specific,
     // actionable library_needs_recovery reaches the caller instead of the
     // SELECT below failing with the raw "attempt to write a readonly
     // database" and landing in the generic library_unreadable catch --

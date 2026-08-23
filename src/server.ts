@@ -1,10 +1,10 @@
 // src/server.ts
 import { existsSync, readFileSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { discoverLibraries, defaultRoots, probeLibraries, type LibraryInfo } from "./discovery.js";
-import { libraryCandidates, sidecarDir } from "./paths.js";
+import { libraryCandidates, libraryTag, sidecarDir } from "./paths.js";
 import {
   LibraryArg,
   findLibrary,
@@ -27,9 +27,11 @@ import { auditLibrary, AuditInput, AUDIT_CHECKS } from "./tools/audit.js";
 import { runSql, RunSqlInput } from "./tools/sql.js";
 import { listLibraries, type LibraryEntry } from "./tools/libraries.js";
 import { refreshIndex } from "./tools/refresh.js";
+import { CreatePlaylistInput, runCreatePlaylist } from "./tools/write-playlist.js";
 import { err, isEngineError, libraryNeedsRecovery, type EngineError } from "./errors.js";
 
 const RO = { readOnlyHint: true, destructiveHint: false, idempotentHint: true } as const;
+const RW = { readOnlyHint: false, destructiveHint: false, idempotentHint: false } as const;
 
 /**
  * name/version reported to every client on initialize. Read from
@@ -82,8 +84,10 @@ function reply(value: unknown) {
  * This walks the same candidate paths independently, purely to tell those
  * two cases apart, so `ready()` below can report library_needs_recovery
  * instead of the misleading library_not_found -- never to open the file:
- * recovering a hot journal requires a write, and this project never writes
- * to the user's library, even to heal it.
+ * recovering a hot journal requires a write, and nothing here opens a
+ * library writably to heal one. Not even create_playlist, which refuses a
+ * library in this state outright (store/write.ts) rather than letting
+ * SQLite roll the journal forward on its way in.
  */
 export function findHotJournalCandidate(roots: string[]): string | null {
   for (const root of roots) {
@@ -119,7 +123,7 @@ interface LibraryState {
 }
 
 export async function createServer(
-  opts: { roots?: string[]; sidecarBaseDir?: string } = {},
+  opts: { roots?: string[]; sidecarBaseDir?: string; allowWrites?: boolean } = {},
 ): Promise<EngineDjMcpServer> {
   const server = new McpServer({ name: PACKAGE_INFO.name, version: PACKAGE_INFO.version }) as EngineDjMcpServer;
 
@@ -200,8 +204,7 @@ export async function createServer(
   const sidecarBaseFor = (lib: LibraryInfo): string | undefined => {
     const first = knownList().find((l) => l.uuid === lib.uuid);
     if (!first || first.path === lib.path) return opts.sidecarBaseDir;
-    const tag = createHash("sha256").update(lib.path).digest("hex").slice(0, 12);
-    return join(opts.sidecarBaseDir ?? sidecarDir(""), "duplicate-uuid", tag);
+    return join(opts.sidecarBaseDir ?? sidecarDir(""), "duplicate-uuid", libraryTag(lib.path));
   };
 
   /** Lazily creates -- and thereafter reuses -- one query child per library. */
@@ -513,6 +516,52 @@ export async function createServer(
     },
   );
 
+  // Registered only under --allow-writes. A client that never enables it sees
+  // exactly the read-only server it saw before this feature existed, which is
+  // what keeps the README's promise true by default.
+  if (opts.allowWrites) {
+    server.registerTool(
+      "create_playlist",
+      {
+        title: "Create a playlist",
+        description:
+          "Create a new playlist in this Engine DJ library from track ids returned by " +
+          "search_tracks or get_tracks -- track_ids sets both membership and order. " +
+          "Unlike every other tool here, this WRITES to the library, so do not call it " +
+          "speculatively: only call it once you actually intend to add the playlist. " +
+          "To undo it, delete the playlist in Engine DJ -- Engine's own delete trigger and " +
+          "cascade remove the playlist and its entries cleanly. " +
+          "backup_path in the result names a whole-database snapshot taken before the first " +
+          "write of this session; it is a recovery route for a damaged library, NOT an undo. " +
+          "Restoring it reverts the entire library to that moment, discarding everything " +
+          "Engine DJ has written since (play counts, imports, cue and beatgrid edits). " +
+          "No existing playlist or entry is ever modified; this only adds a new one. " +
+          "Fails with playlist_exists if a top-level playlist already has that title, and " +
+          "with library_busy if Engine DJ or a player is holding a conflicting lock on the " +
+          "library right then -- nothing is written in that case, so retry rather than " +
+          "treating it as permanent. On any error, `detail` is \"not_committed\" when the " +
+          "library is unchanged and \"committed_unverified\" when the write may have gone " +
+          "through but could not be verified. track_ids may be empty (an empty playlist); a " +
+          "track id may appear at most once. " +
+          LIBRARY_SELECTION_NOTE,
+        inputSchema: { ...CreatePlaylistInput.shape, library: LibraryArg },
+        annotations: RW,
+      },
+      async (args) => {
+        const state = await acquire(args.library);
+        if (isEngineError(state)) return reply(state);
+        return reply(
+          await runCreatePlaylist(
+            state.lib.path,
+            state.lib.uuid,
+            args as any,
+            join(homedir(), ".engine-dj-mcp", "backups"),
+          ),
+        );
+      },
+    );
+  }
+
   /**
    * There was previously no way to shut this down at all: createServer
    * forked a query child and handed back an McpServer whose close() knows
@@ -554,7 +603,8 @@ More than one library can be connected at once — the local one under
 (\`search_tracks\`, \`get_tracks\`, \`get_playlists\`,
 \`get_playlist_tracks\`, \`get_track_performance\`, \`audit_library\`,
 \`run_sql\`, \`refresh_index\`) takes an optional
-\`library\` argument naming one of them: either the \`uuid\` or the
+\`library\` argument naming one of them — as does \`create_playlist\`, when
+the server was started with \`--allow-writes\` — either the \`uuid\` or the
 \`path\`, in the \`~/...\` form \`list_libraries\` prints or the absolute
 one. A value matching neither comes back as \`library_not_found\` listing
 the libraries that are selectable.

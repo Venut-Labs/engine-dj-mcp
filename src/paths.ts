@@ -1,8 +1,23 @@
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 
 export function sidecarDir(uuid: string): string {
   return join(homedir(), ".engine-dj-mcp", uuid);
+}
+
+/**
+ * A short, stable tag for one library *file*, for use wherever a uuid alone
+ * would collide. A library copied onto a second drive carries the original's
+ * uuid -- an ordinary thing for a DJ to do -- so uuid is not unique across
+ * mounted volumes while the path of `m.db` always is.
+ *
+ * Shared by the sidecar layout (server.ts's sidecarBaseFor) and the backup
+ * filenames (store/backup.ts) so the two cannot drift into different ideas
+ * of which library they are talking about.
+ */
+export function libraryTag(mdbPath: string): string {
+  return createHash("sha256").update(mdbPath).digest("hex").slice(0, 12);
 }
 
 /** Engine stores Track.path relative to the `Engine Library` folder, usually with `..`. */

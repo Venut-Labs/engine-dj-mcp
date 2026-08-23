@@ -19,6 +19,14 @@ export const ERROR_CODES = [
   "decode_failed",
   "invalid_argument",
   "library_needs_recovery",
+  // Write-path codes. There is no writes_not_enabled code: the tool is not
+  // registered at all without --allow-writes, and the MCP SDK's own
+  // dispatcher rejects a call to an unregistered tool name before any
+  // handler in this project runs, so this project never gets the chance to
+  // report that condition itself.
+  "playlist_exists",
+  "unknown_track",
+  "duplicate_track",
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];
@@ -26,8 +34,27 @@ export type ErrorCode = (typeof ERROR_CODES)[number];
 export interface EngineError {
   error: ErrorCode;
   message: string;
+  /**
+   * Free text almost everywhere (store/index-manager.ts passes a raw
+   * `e.message` through it), with one exception that is part of the tool
+   * contract: on an error from the write path (store/write.ts) this is
+   * always exactly `"not_committed"` -- the library is byte-for-byte what it
+   * was -- or `"committed_unverified"` -- the write may have landed and could
+   * not be confirmed, and `backup_path` below is then set. Those two strings
+   * are reserved on that path and must stay stable, because a client reads
+   * them to decide whether their library changed.
+   */
   detail?: string;
   retry_after_ms?: number;
+  /**
+   * Path to a pre-write snapshot the caller can restore from. Only ever set
+   * by the write path, and only on the errors a client cannot safely ignore:
+   * `detail === "committed_unverified"`. It is a whole-database snapshot, so
+   * restoring it is a recovery route for a damaged library and not an undo
+   * of one playlist -- it reverts everything Engine DJ wrote since it was
+   * taken.
+   */
+  backup_path?: string;
 }
 
 export function err(

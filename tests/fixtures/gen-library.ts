@@ -87,11 +87,10 @@ export function makeLibrary(
   // below: C_NEXT_LIST_ID_UNIQUE_FOR_PARENT is what makes "two sibling
   // chains both ending at 0" impossible in a real library, so a broken-chain
   // fixture that ignored it would be testing a shape Engine can never
-  // produce. The triggers Engine also defines are deliberately *not* copied
-  // — they rewrite nextListId on insert to splice new lists into the chain,
-  // which is exactly the behaviour a fixture needs to override to place a
-  // chain by hand. This server never writes to a library, so no code under
-  // test depends on them.
+  // produce. The triggers Engine also defines are also copied, because the
+  // write path depends on Engine's own chain maintenance: without them, a
+  // fixture would let an implementation that hand-maintains the chain pass
+  // while the real library rejects it.
   db.exec(`CREATE TABLE Playlist (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT,
     parentListId INTEGER, isPersisted BOOLEAN, nextListId INTEGER, lastEditTime DATETIME,
     isExplicitlyExported BOOLEAN,
@@ -101,6 +100,32 @@ export function makeLibrary(
     trackId INTEGER, databaseUuid TEXT, nextEntityId INTEGER, membershipReference INTEGER,
     CONSTRAINT C_NAME_UNIQUE_FOR_LIST UNIQUE (listId, databaseUuid, trackId),
     FOREIGN KEY (listId) REFERENCES Playlist (id) ON DELETE CASCADE)`);
+  // Engine's own chain triggers, copied verbatim from a real 3.0.2 library.
+  // The insert pair is what makes `nextListId = 0` mean "append": the BEFORE
+  // trigger parks the current tail at -(1 + 0) to dodge
+  // C_NEXT_LIST_ID_UNIQUE_FOR_PARENT, and the AFTER trigger resolves it to the
+  // new row's id. Without these, a fixture would let an implementation that
+  // hand-maintains the chain pass while the real library rejects it.
+  db.exec(`CREATE TRIGGER trigger_before_insert_List
+    BEFORE INSERT ON Playlist FOR EACH ROW BEGIN
+      UPDATE Playlist SET nextListId = -(1 + nextListId)
+      WHERE nextListId = NEW.nextListId AND parentListId = NEW.parentListId;
+    END`);
+  db.exec(`CREATE TRIGGER trigger_after_insert_List
+    AFTER INSERT ON Playlist FOR EACH ROW BEGIN
+      UPDATE Playlist SET nextListId = NEW.id
+      WHERE nextListId = -(1 + NEW.nextListId) AND parentListId = NEW.parentListId;
+    END`);
+  db.exec(`CREATE TRIGGER trigger_after_delete_List
+    AFTER DELETE ON Playlist FOR EACH ROW BEGIN
+      UPDATE Playlist SET nextListId = OLD.nextListId WHERE nextListId = OLD.id;
+      DELETE FROM Playlist WHERE parentListId = OLD.id;
+    END`);
+  db.exec(`CREATE TRIGGER trigger_before_delete_PlaylistEntity
+    BEFORE DELETE ON PlaylistEntity WHEN OLD.trackId > 0 BEGIN
+      UPDATE PlaylistEntity SET nextEntityId = OLD.nextEntityId
+      WHERE nextEntityId = OLD.id AND listId = OLD.listId;
+    END`);
   // Engine's own PlaylistPath view, copied verbatim from a real 3.0.2
   // library. Nothing in src/ reads it — it is here precisely so a test can
   // demonstrate *why* nothing reads it: its `position` column is the obvious
