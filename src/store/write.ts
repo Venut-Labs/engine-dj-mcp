@@ -88,7 +88,8 @@ export function resetSessionSnapshots(): void {
 /**
  * The snapshot for this library, taken once per process.
  *
- * Called before the write connection is even opened (see createPlaylist),
+ * Called before the write connection is even opened (see
+ * withWriteTransaction, which every write op in this module goes through),
  * so it never holds SQLite's RESERVED lock and never blocks a write Engine
  * DJ or a second concurrent call in this process is trying to make at the
  * same moment. The hot-journal check and the read-only pre-check have
@@ -885,6 +886,227 @@ export async function addTracksToPlaylist(
       tracks_added: trackRefs.length,
       positions,
       undo: [{ tool: "remove_tracks_from_playlist", arguments: { playlist_id: listId, positions } }],
+    };
+  });
+}
+
+/**
+ * Validates `positions` against a chain's current order -- in range, no
+ * repeats -- and, when `expectTrackIds` is given, that each named position
+ * still holds the track a caller who read the list earlier believed it did.
+ * Resolves each surviving position to the entry id to delete and the
+ * *local* track id it currently holds, translated from the stored origin
+ * pair the same way addTracksToPlaylist's duplicate-track check does (null
+ * if that pair no longer resolves to any local track).
+ *
+ * Called twice by removeTracksFromPlaylist, against two different reads of
+ * the same chain, for the same reason resolveInsertAt is: once in the
+ * pre-check, to fail fast, and again inside the transaction against the
+ * chain BEGIN IMMEDIATE just locked -- the pre-check's read can be stale by
+ * the time the lock is held.
+ */
+function resolveRemoval(
+  db: DatabaseSync,
+  listId: number,
+  order: number[],
+  positions: number[],
+  expectTrackIds: number[] | undefined,
+): { position: number; entryId: number; trackId: number | null }[] | EngineError {
+  const seen = new Set<number>();
+  for (const p of positions) {
+    if (!Number.isInteger(p) || p < 1 || p > order.length) {
+      return err(
+        "invalid_position",
+        `Playlist ${listId} has ${order.length} entries; each position must be between 1 and ${order.length}.`,
+        { detail: NOT_COMMITTED },
+      );
+    }
+    if (seen.has(p)) {
+      return err("invalid_position", `Position ${p} is named more than once.`, { detail: NOT_COMMITTED });
+    }
+    seen.add(p);
+  }
+  if (expectTrackIds && expectTrackIds.length !== positions.length) {
+    return err(
+      "invalid_position",
+      `expectTrackIds has ${expectTrackIds.length} entries but positions has ${positions.length}.`,
+      { detail: NOT_COMMITTED },
+    );
+  }
+
+  const entryAt = db.prepare("SELECT trackId, databaseUuid FROM PlaylistEntity WHERE id = ?");
+  const resolveLocal = db.prepare("SELECT id FROM Track WHERE originDatabaseUuid = ? AND originTrackId = ?");
+  const plan: { position: number; entryId: number; trackId: number | null }[] = [];
+  for (let i = 0; i < positions.length; i++) {
+    const position = positions[i]!;
+    const entryId = order[position - 1]!;
+    const row = entryAt.get(entryId) as { trackId: number; databaseUuid: string };
+    const local = resolveLocal.get(row.databaseUuid, row.trackId) as { id: number } | undefined;
+    const trackId = local ? local.id : null;
+    if (expectTrackIds && expectTrackIds[i] !== trackId) {
+      return err(
+        "invalid_position",
+        `Position ${position} in playlist ${listId} does not hold track ${expectTrackIds[i]}; refusing to remove the wrong track.`,
+        { detail: NOT_COMMITTED },
+      );
+    }
+    plan.push({ position, entryId, trackId });
+  }
+  return plan;
+}
+
+/**
+ * Removes one or more tracks from an existing playlist by their current
+ * position.
+ *
+ * `trigger_before_delete_PlaylistEntity` (see gen-library.ts's copy of it,
+ * taken verbatim from a real 3.0.2 library) relinks each deleted row's
+ * predecessor onto its successor as SQLite processes the delete -- verified
+ * for a row removed at the head, the middle and the tail, and, by
+ * construction of the trigger itself, for a batch that removes several
+ * rows, adjacent or not, in one statement. So this function does no chain
+ * maintenance of its own; writing any would just be fighting Engine's own
+ * trigger. What it does own is checking that the trigger's job actually
+ * landed: its `WHEN OLD.trackId > 0` means a row with trackId <= 0 is
+ * deleted *without* relinking, leaving its predecessor pointing at a row
+ * that is now gone. No real library measured has such a row, but the
+ * post-delete gate below is the only thing that would ever notice one.
+ *
+ * Shares createPlaylist/addTracksToPlaylist's skeleton: a read-only
+ * pre-check first, then withWriteTransaction.
+ */
+export async function removeTracksFromPlaylist(
+  mdbPath: string,
+  uuid: string,
+  input: { listId: number; positions: number[]; expectTrackIds?: number[] },
+  opts: { backupDir: string },
+): Promise<EditResult | EngineError> {
+  const { listId, positions, expectTrackIds } = input;
+  const subject = `playlist ${listId}`;
+
+  if (positions.length === 0) {
+    return err("invalid_argument", "Name at least one position to remove.", { detail: NOT_COMMITTED });
+  }
+
+  // See createPlaylist for why this has to be checked before anything else
+  // even tries to open the file.
+  if (hasHotJournal(mdbPath)) return { ...libraryNeedsRecovery(), detail: NOT_COMMITTED };
+
+  {
+    let precheck: DatabaseSync | undefined;
+    try {
+      precheck = new DatabaseSync(mdbPath, { readOnly: true });
+
+      const exists = precheck.prepare("SELECT 1 FROM Playlist WHERE id = ?").get(listId);
+      if (!exists) {
+        return err("playlist_not_found", `No playlist with id ${listId} in this library.`, {
+          detail: NOT_COMMITTED,
+        });
+      }
+
+      const gate = gateChain(precheck, listId);
+      if (!gate.ok) {
+        return err("playlist_chain_damaged", `Playlist ${listId}: ${gate.reason}. Nothing was changed.`, {
+          detail: NOT_COMMITTED,
+        });
+      }
+
+      const plan = resolveRemoval(precheck, listId, gate.order, positions, expectTrackIds);
+      if (isEngineError(plan)) return plan;
+    } catch (e) {
+      return mapWriteError(e, subject, mdbPath);
+    } finally {
+      try {
+        precheck?.close();
+      } catch {
+        /* never opened, or already closed */
+      }
+    }
+  }
+
+  return withWriteTransaction(mdbPath, uuid, subject, opts, (db) => {
+    // Re-read: BEGIN IMMEDIATE is the first moment nothing else can change
+    // the chain, and gating on the pre-check's read alone would be trusting
+    // one that could already be stale.
+    const gate = gateChain(db, listId);
+    if (!gate.ok) {
+      rollback(db);
+      return err("playlist_chain_damaged", `Playlist ${listId}: ${gate.reason}. Nothing was changed.`, {
+        detail: NOT_COMMITTED,
+      });
+    }
+
+    // Re-resolved against this read of the chain, not the pre-check's: see
+    // resolveRemoval's comment.
+    const plan = resolveRemoval(db, listId, gate.order, positions, expectTrackIds);
+    if (isEngineError(plan)) {
+      rollback(db);
+      return plan;
+    }
+
+    // One statement, no chain maintenance -- see this function's own
+    // comment for why the trigger is trusted to relink around every row
+    // this deletes, including a batch of several at once.
+    const placeholders = plan.map(() => "?").join(", ");
+    db.prepare(`DELETE FROM PlaylistEntity WHERE id IN (${placeholders})`).run(...plan.map((p) => p.entryId));
+
+    // The gate that catches what the trigger's WHEN clause does not cover:
+    // a deleted row with trackId <= 0 leaves its predecessor pointing at a
+    // row that no longer exists, and this is the only check in the whole
+    // operation that would notice.
+    const finalGate = gateChain(db, listId);
+    if (!finalGate.ok) {
+      rollback(db);
+      return err("playlist_chain_damaged", `Playlist ${listId}: ${finalGate.reason}. Nothing was changed.`, {
+        detail: NOT_COMMITTED,
+      });
+    }
+
+    // No trigger maintains this: measured, changing PlaylistEntity leaves the
+    // parent Playlist row untouched. datetime('now'), not strftime('%s') --
+    // that is the Track convention, and Playlist.lastEditTime is TEXT.
+    db.prepare("UPDATE Playlist SET lastEditTime = datetime('now') WHERE id = ?").run(listId);
+
+    // Reported, and undone, in ascending position order rather than the
+    // order the caller named them in -- the undo below depends on it.
+    const removed = plan
+      .slice()
+      .sort((a, b) => a.position - b.position)
+      .map((p) => ({ position: p.position, track_id: p.trackId }));
+
+    // Undo restores in that same ascending order, each step expressed
+    // against the list as it will be *after* the previous step has run --
+    // and that is just `position - 1` computed against the *original*
+    // (pre-removal) position, not recomputed per step. Restoring in
+    // ascending order means that immediately before the row originally at
+    // position p is restored, every row originally before p is present
+    // again -- either it was never removed, or, being an earlier and
+    // already-restored entry, it is back in its exact original spot -- and
+    // nothing originally at or after p has been restored yet. So exactly
+    // p - 1 rows precede that slot at that moment, regardless of how many
+    // other removed positions fall between the previous restore and this
+    // one. Removing positions 1 and 3 from a three-entry list makes this
+    // concrete: restoring 1 first (at "start") and then 3 (at
+    // after_position: 2) reproduces the original order. Restoring 3 first
+    // would compute that same after_position: 2 against a list from which 1
+    // is *also* still missing -- a single surviving entry -- which is
+    // already wrong (there is no position 2 to be after yet); ascending
+    // order is what keeps every step's target position valid, not just
+    // correct.
+    const undo: UndoStep[] = removed.map((r) => ({
+      tool: "add_tracks_to_playlist",
+      arguments: {
+        playlist_id: listId,
+        track_ids: [r.track_id],
+        at: r.position === 1 ? "start" : { after_position: r.position - 1 },
+      },
+    }));
+
+    return {
+      playlist_id: listId,
+      tracks_removed: removed.length,
+      removed,
+      undo,
     };
   });
 }

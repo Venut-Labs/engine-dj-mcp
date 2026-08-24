@@ -3,8 +3,8 @@ import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { makeLibrary, addPlaylists, damageChain } from "./fixtures/gen-library.js";
-import { addTracksToPlaylist, resetSessionSnapshots } from "../src/store/write.js";
+import { makeLibrary, addPlaylists, damageChain, reoriginTracks } from "./fixtures/gen-library.js";
+import { addTracksToPlaylist, removeTracksFromPlaylist, resetSessionSnapshots } from "../src/store/write.js";
 import { isEngineError } from "../src/errors.js";
 
 const dirs: string[] = [];
@@ -208,5 +208,86 @@ describe("addTracksToPlaylist", () => {
     );
     expect(isEngineError(r)).toBe(false);
     expect(order(dbPath)).toEqual([1, 2, 3, 6]);
+  });
+
+  it("stores a re-originated track's origin pair, not its local row id", async () => {
+    // order() reads PlaylistEntity.trackId directly and agrees with the
+    // local id only because the fixture's origin and local id coincide by
+    // default. Re-originating one track breaks that coincidence, so this is
+    // the only test in the suite that can tell a correct write apart from
+    // one that stored the local id -- the bug class this repository has
+    // shipped five times.
+    const { dbPath, backupDir } = setup();
+    reoriginTracks(dbPath, [{ id: 5, originUuid: "other-lib-uuid", originTrackId: 999 }]);
+    const r = await addTracksToPlaylist(dbPath, "lib-uuid", { listId: 1, trackIds: [5], at: "end" }, { backupDir });
+    expect(isEngineError(r)).toBe(false);
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const row = db
+      .prepare("SELECT trackId, databaseUuid FROM PlaylistEntity WHERE listId = 1 AND databaseUuid = ?")
+      .get("other-lib-uuid") as any;
+    db.close();
+    expect(row?.trackId).toBe(999);
+  });
+});
+
+describe("removeTracksFromPlaylist", () => {
+  it("removes by position and leaves the chain sound", async () => {
+    const { dbPath, backupDir } = setup();
+    const r = await removeTracksFromPlaylist(dbPath, "lib-uuid", { listId: 1, positions: [2] }, { backupDir });
+    expect(isEngineError(r)).toBe(false);
+    expect(order(dbPath)).toEqual([1, 3]);
+  });
+
+  it("removes the head and the tail correctly", async () => {
+    for (const [pos, left] of [[1, [2, 3]], [3, [1, 2]]] as const) {
+      const { dbPath, backupDir } = setup();
+      await removeTracksFromPlaylist(dbPath, "lib-uuid", { listId: 1, positions: [pos] }, { backupDir });
+      expect(order(dbPath), `position ${pos}`).toEqual([...left]);
+    }
+  });
+
+  it("catches a chain the delete trigger did not relink", async () => {
+    // trigger_before_delete_PlaylistEntity carries WHEN OLD.trackId > 0, so
+    // an entry with trackId <= 0 is deleted without relinking and leaves its
+    // predecessor pointing at nothing. No real library measured has such a
+    // row -- min trackId is 1 -- but "none today" is not "none ever", and the
+    // post-edit gate is the only thing that would notice.
+    const { dbPath, backupDir } = setup();
+    const db = new DatabaseSync(dbPath);
+    db.prepare("UPDATE PlaylistEntity SET trackId = 0 WHERE id = 2").run();
+    db.close();
+    const r = await removeTracksFromPlaylist(dbPath, "lib-uuid", { listId: 1, positions: [2] }, { backupDir });
+    expect(isEngineError(r)).toBe(true);
+    expect((r as any).error).toBe("playlist_chain_damaged");
+    expect((r as any).detail).toBe("not_committed");
+    expect(order(dbPath)).toEqual([1, 0, 3]);
+  });
+
+  it("returns an ordered undo, because positions shift as it runs", async () => {
+    const { dbPath, backupDir } = setup();
+    const r: any = await removeTracksFromPlaylist(dbPath, "lib-uuid", { listId: 1, positions: [1, 3] }, { backupDir });
+    // Restoring position 1 first puts the later one back at 3; restoring 3
+    // first would land the other at 2. The order is part of the answer.
+    expect(r.undo).toEqual([
+      { tool: "add_tracks_to_playlist", arguments: { playlist_id: 1, track_ids: [1], at: "start" } },
+      { tool: "add_tracks_to_playlist", arguments: { playlist_id: 1, track_ids: [3], at: { after_position: 2 } } },
+    ]);
+  });
+
+  it("checks expect_track_ids when given, and refuses a mismatch", async () => {
+    const { dbPath, backupDir } = setup();
+    const r = await removeTracksFromPlaylist(
+      dbPath, "lib-uuid", { listId: 1, positions: [2], expectTrackIds: [3] }, { backupDir },
+    );
+    expect((r as any).error).toBe("invalid_position");
+    expect(order(dbPath)).toEqual([1, 2, 3]);
+  });
+
+  it("refuses a repeated or out-of-range position", async () => {
+    const { dbPath, backupDir } = setup();
+    for (const positions of [[2, 2], [0], [4]]) {
+      const r = await removeTracksFromPlaylist(dbPath, "lib-uuid", { listId: 1, positions }, { backupDir });
+      expect((r as any).error, JSON.stringify(positions)).toBe("invalid_position");
+    }
   });
 });
