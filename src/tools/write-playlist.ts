@@ -84,12 +84,25 @@ export const AddTracksToPlaylistInput = z.object({
  * `get_playlist_tracks` does (see resolvePlaylist in ../playlists.ts), so
  * every edit tool refuses an ambiguous name identically rather than each
  * growing its own resolution logic.
+ *
+ * `notFound: "playlist_not_found"` is what makes that code reachable at all.
+ * The store functions return it for an id that gets as far as them, and the
+ * README documents it as a refusal of all three edit tools -- but resolution
+ * runs first and used to answer every miss with `invalid_argument`, so no
+ * caller could ever see the documented code. It is also the more accurate of
+ * the two: the argument is well-formed, the playlist simply is not there.
+ * Ambiguity still comes back as `invalid_argument`, because a name matching
+ * three playlists genuinely is a problem with the argument.
  */
 async function resolveListId(
   qp: QueryProcess,
   args: { playlist_id?: number; playlist_name?: string },
 ): Promise<number | EngineError> {
-  const resolved = await resolvePlaylist(qp, { id: args.playlist_id, name: args.playlist_name });
+  const resolved = await resolvePlaylist(
+    qp,
+    { id: args.playlist_id, name: args.playlist_name },
+    { id: "playlist_id", name: "playlist_name", notFound: "playlist_not_found" },
+  );
   if (isEngineError(resolved)) return resolved;
   return resolved.playlist.id;
 }

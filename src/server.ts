@@ -40,7 +40,21 @@ import {
 import { err, isEngineError, libraryNeedsRecovery, type EngineError } from "./errors.js";
 
 const RO = { readOnlyHint: true, destructiveHint: false, idempotentHint: true } as const;
+/**
+ * A write that only ever *adds*. `destructiveHint: false` is a claim with a
+ * defined meaning in MCP -- "this tool performs only additive updates" -- and
+ * clients use it to decide whether to confirm with the user first. True of
+ * create_playlist (a new playlist, nothing else touched) and of
+ * add_tracks_to_playlist (new entries, existing ones left where they are).
+ */
 const RW = { readOnlyHint: false, destructiveHint: false, idempotentHint: false } as const;
+/**
+ * A write that can destroy or reorganise what is already there:
+ * remove_tracks_from_playlist deletes entries, reorder_playlist rewrites the
+ * order of a list a DJ may be playing from live. Advertising either as
+ * additive told a client it need not ask before calling.
+ */
+const RW_DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: false } as const;
 
 /**
  * name/version reported to every client on initialize. Read from
@@ -604,7 +618,10 @@ export async function createServer(
           "already damaged, the write is refused outright rather than repaired -- nothing is " +
           "added, and the error names what is broken. " +
           "On success, the result's `undo` is the exact remove_tracks_from_playlist call that " +
-          "reverses this edit (naming the positions the new tracks landed at); call it to undo " +
+          "reverses this edit -- the positions the new tracks landed at, plus expect_track_ids " +
+          "naming the tracks that landed there, so a list someone changed in the meantime is " +
+          "refused rather than having the wrong rows removed -- and `undo_complete` is true. " +
+          "Call it to undo " +
           "rather than restoring backup_path, which reverts the WHOLE library to before this " +
           "session's first write, discarding every play count, import, cue and beatgrid change " +
           "Engine DJ has recorded since -- not just this one edit. backup_path is only a " +
@@ -634,22 +651,29 @@ export async function createServer(
           "not guessed at). positions are the 1-based positions get_playlist_tracks reports " +
           "for THIS playlist right now -- they include entries whose track is missing from the " +
           "library (get_playlist_tracks marks those missing: true), and removing one of those " +
-          "is a legitimate way to clean up a hole. expect_track_ids is optional and, when " +
+          "is a legitimate way to clean up a hole -- but it is the one removal that cannot be " +
+          "undone: such an entry names no track id, so no add_tracks_to_playlist call can put " +
+          "it back, and the result says so with undo_complete: false plus an undo_note naming " +
+          "those positions. expect_track_ids is optional and, when " +
           "given, must have one entry per position: it verifies each named position still " +
           "holds the track expected before anything is removed, refusing the whole call " +
           "otherwise; null there means \"this position should hold an entry whose track is " +
           "missing\", not \"no expectation\". If this playlist's entry chain is already " +
           "damaged, the write is refused outright rather than repaired. " +
           "On success, the result's `undo` is a SEQUENCE of add_tracks_to_playlist calls, one " +
-          "per removed track -- run them IN THE ORDER GIVEN, never in parallel and never " +
+          "per removed track THAT CAN BE RESTORED -- run them IN THE ORDER GIVEN, never in " +
+          "parallel and never " +
           "reversed: each step's target position is computed against the list as it stands " +
           "after the previous step has already run, so firing them out of order or " +
-          "concurrently puts tracks back in the wrong places. Preferred over restoring " +
+          "concurrently puts tracks back in the wrong places. Check `undo_complete`: false " +
+          "means one or more removed entries had no track to name and are gone for good -- " +
+          "`undo_note` says which positions, and the remaining steps still restore everything " +
+          "else. Preferred over restoring " +
           "backup_path, which reverts the WHOLE library to before this session's first write, " +
           "discarding everything Engine DJ has recorded since -- not just this edit. " +
           LIBRARY_SELECTION_NOTE,
         inputSchema: { ...RemoveTracksFromPlaylistInput.shape, library: LibraryArg },
-        annotations: RW,
+        annotations: RW_DESTRUCTIVE,
       },
       async (args) => {
         const state = await acquire(args.library);
@@ -676,12 +700,13 @@ export async function createServer(
           "that do not move. If this playlist's entry chain is already damaged, the write is " +
           "refused outright rather than repaired. " +
           "On success, the result's `undo` is the exact inverse permutation, as a single " +
-          "reorder_playlist call; prefer it over restoring backup_path, which reverts the " +
+          "reorder_playlist call, and `undo_complete` is true; prefer it over restoring " +
+          "backup_path, which reverts the " +
           "WHOLE library to before this session's first write, discarding everything Engine DJ " +
           "has recorded since -- not just this reorder. " +
           LIBRARY_SELECTION_NOTE,
         inputSchema: { ...ReorderPlaylistInput.shape, library: LibraryArg },
-        annotations: RW,
+        annotations: RW_DESTRUCTIVE,
       },
       async (args) => {
         const state = await acquire(args.library);

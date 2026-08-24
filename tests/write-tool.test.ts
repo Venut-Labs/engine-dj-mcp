@@ -167,6 +167,50 @@ describe("playlist edit tools", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it("advertises which writes are destructive, because clients confirm on that flag", async () => {
+    // destructiveHint: false has a defined meaning in MCP -- "additive
+    // updates only" -- and a client reads it to decide whether to ask the
+    // user first. Adding tracks is additive; deleting entries from a list
+    // someone plays live, or rewriting its order, is not.
+    const { dir } = lib();
+    const { client } = await connectedClient([dir], join(dir, "sc"), {
+      allowWrites: true,
+      backupBaseDir: join(dir, "b"),
+    });
+    const tools = (await client.listTools()).tools;
+    const hint = (n: string) => tools.find((t) => t.name === n)!.annotations?.destructiveHint;
+    expect(hint("create_playlist")).toBe(false);
+    expect(hint("add_tracks_to_playlist")).toBe(false);
+    expect(hint("remove_tracks_from_playlist")).toBe(true);
+    expect(hint("reorder_playlist")).toBe(true);
+    await client.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("reports a playlist that is not there as playlist_not_found, the code it documents", async () => {
+    // Resolution runs before the store function, so the store's own
+    // playlist_not_found was unreachable through MCP: every miss came back
+    // as invalid_argument, a code the README does not list for these tools.
+    // Ambiguity still is an argument problem and still reports as such.
+    const { dir } = lib();
+    const { client } = await connectedClient([dir], join(dir, "sc"), {
+      allowWrites: true,
+      backupBaseDir: join(dir, "b"),
+    });
+    for (const [name, args] of [
+      ["add_tracks_to_playlist", { playlist_id: 999, track_ids: [2] }],
+      ["remove_tracks_from_playlist", { playlist_id: 999, positions: [1] }],
+      ["reorder_playlist", { playlist_id: 999, order: [1] }],
+      ["add_tracks_to_playlist", { playlist_name: "Nope", track_ids: [2] }],
+    ] as const) {
+      const res: any = await client.callTool({ name, arguments: args as any });
+      expect(res.isError, name).toBe(true);
+      expect(res.structuredContent.error, `${name} ${JSON.stringify(args)}`).toBe("playlist_not_found");
+    }
+    await client.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it("edits a playlist named by name, and hands back a usable undo", async () => {
     const { dir, dbPath } = lib();
     const { client } = await connectedClient([dir], join(dir, "sc"), {
