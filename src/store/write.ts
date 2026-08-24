@@ -158,6 +158,72 @@ export function walkFrom(db: DatabaseSync, listId: number, headId: number): Orig
   return out;
 }
 
+export interface ChainCheck {
+  ok: boolean;
+  reason?: string;
+  /** Entry ids head to tail. Meaningful only when `ok`. */
+  order: number[];
+}
+
+/**
+ * Whether one playlist's entry chain is sound enough to edit.
+ *
+ * Deliberately not `orderByChain` from src/playlists.ts. That function's
+ * contract is that it returns every node it was given, degrading a damaged
+ * chain to a warning, because a reader that silently returned 30 of 43
+ * entries would be worse than one that guesses an order and says so. An edit
+ * needs the opposite: a yes or no.
+ *
+ * Three conditions, and all three are needed because different breakages trip
+ * different ones. Checking only that the walk covered every row is the trap:
+ * a list severed into two runs has two heads, and walking from both covers
+ * everything -- measured, on a chain broken on purpose, as "5 of 5" while the
+ * walk from the real head reached 2.
+ */
+export function checkChain(rows: { id: number; next: number }[]): ChainCheck {
+  if (rows.length === 0) return { ok: true, order: [] };
+  const byId = new Map(rows.map((r) => [r.id, r]));
+
+  for (const r of rows) {
+    if (r.next !== 0 && !byId.has(r.next)) {
+      return { ok: false, reason: `entry ${r.id} links to ${r.next}, which is not in this playlist`, order: [] };
+    }
+  }
+
+  // A self-link (next === id) still counts as something pointing at that row
+  // -- unlike orderByChain, which excludes it so the row remains visible as
+  // its own one-node run. Here that would instead make the row look like a
+  // *second* head next to the real one, turning a one-row cycle in the
+  // middle of an otherwise sound chain into a false "two heads" instead of
+  // the coverage miss it actually is.
+  const targets = new Set(rows.map((r) => r.next));
+  const heads = rows.filter((r) => !targets.has(r.id));
+  if (heads.length !== 1) {
+    return {
+      ok: false,
+      reason: `expected exactly one head (an entry nothing points at); found ${heads.length}`,
+      order: [],
+    };
+  }
+
+  const order: number[] = [];
+  const seen = new Set<number>();
+  let cur: { id: number; next: number } | undefined = heads[0];
+  while (cur && !seen.has(cur.id)) {
+    seen.add(cur.id);
+    order.push(cur.id);
+    cur = cur.next === 0 ? undefined : byId.get(cur.next);
+  }
+  if (order.length !== rows.length) {
+    return {
+      ok: false,
+      reason: `the chain reaches ${order.length} of ${rows.length} entries`,
+      order: [],
+    };
+  }
+  return { ok: true, order };
+}
+
 /**
  * Roll back, swallowing a failure of the rollback itself.
  *
