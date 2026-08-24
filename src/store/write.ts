@@ -799,15 +799,19 @@ export async function addTracksToPlaylist(
       //
       // The reverse direction -- resolving each entry back to a local track
       // and asking whether the request names it -- looks equivalent and is
-      // strictly weaker. It goes through Track, so it answers "is there a
-      // local track carrying this entry's pair, and is *that* track the one
-      // asked for", and when two Track rows share one origin pair (measured:
-      // a re-origination that moved some rows and not others) it resolves to
-      // whichever row the query returns first. Ask for the other one and the
-      // check misses, the snapshot is copied, the transaction opens, and
-      // only then does the constraint refuse. Comparing pairs cannot miss
-      // that, and it drops one unindexed Track scan per existing entry from
-      // a path that runs before every add.
+      // strictly weaker, on two counts. First, it is not what gets compared:
+      // UNIQUE (listId, databaseUuid, trackId) compares the pair itself, so
+      // the pair form is exactly that comparison run early, while the
+      // reverse form goes through Track and answers a related but different
+      // question. Second, where two Track rows share one origin pair the
+      // reverse form has to pick one and can miss the other -- but Engine's
+      // own C_originDatabaseUuid_originTrackId UNIQUE constraint (see the
+      // ENTRY_TRACK_MATCH comment in playlists.ts) forbids a real library
+      // from ever holding that state; it is reachable at all only in this
+      // project's own fixture, whose generated schema omits that constraint
+      // (see tests/playlist-edit.test.ts). The pair form also drops one
+      // unindexed Track scan per existing entry from a path that runs before
+      // every add.
       //
       // Neither form can catch more than the constraint itself: an entry
       // whose stored pair no longer names any local track -- what a library
