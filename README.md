@@ -3,13 +3,15 @@
 [![npm](https://img.shields.io/npm/v/engine-dj-mcp)](https://www.npmjs.com/package/engine-dj-mcp)
 [![licence](https://img.shields.io/npm/l/engine-dj-mcp)](./LICENSE)
 
-An MCP server that lets an AI assistant search and audit your **Engine DJ**
-libraries — the one on your computer and the ones on your USB drives.
+An MCP server that gives an AI assistant your **Engine DJ** libraries — the
+one on your computer and the ones on your USB drives. It searches and audits
+them, reads the cues and beatgrids Engine stored, and builds playlists when
+you ask it to.
 
 > **Not affiliated with, endorsed by, or sponsored by inMusic Brands, Denon
 > DJ, or the Engine DJ product.** "Engine DJ" is used here only to name the
-> software whose library this tool reads. No logos or brand artwork from
-> inMusic or Denon DJ are used in this project.
+> software whose library this tool reads and writes. No logos or brand
+> artwork from inMusic or Denon DJ are used in this project.
 
 Your library is opened **read-only at the operating-system level**. It is
 never written to unless you start the server with `--allow-writes` — see
