@@ -10,6 +10,7 @@ import {
   reorderPlaylist,
   resetSessionSnapshots,
 } from "../src/store/write.js";
+import { AddTracksToPlaylistInput } from "../src/tools/write-playlist.js";
 import { isEngineError } from "../src/errors.js";
 
 const dirs: string[] = [];
@@ -68,6 +69,66 @@ function setupUnresolvable() {
         { id: 3, trackId: 3, next: 0 },
       ],
     },
+  ]);
+  return { dir, dbPath, backupDir: join(dir, "backups") };
+}
+
+/**
+ * Same fixture, but two Track rows carry one origin pair, and the playlist
+ * already holds an entry naming it.
+ *
+ * The generated schema copies Engine's `C_path` UNIQUE and not the real
+ * library's `C_originDatabaseUuid_originTrackId`, so it can hold this state;
+ * a library that has been re-originated partway is where it comes from. It
+ * is the one shape that tells the two forms of the duplicate check apart --
+ * comparing origin pairs, which is what the INSERT and its UNIQUE constraint
+ * compare, versus resolving each entry back through `Track` to a local id,
+ * which has to pick one of the two rows and misses the other.
+ */
+function setupSharedOrigin() {
+  const dir = mkdtempSync(join(tmpdir(), "pe-"));
+  dirs.push(dir);
+  const dbPath = makeLibrary(dir, { tracks: 8, uuid: "lib-uuid" });
+  addPlaylists(dbPath, [
+    {
+      id: 1,
+      title: "Set",
+      nextListId: 0,
+      entries: [
+        { id: 1, trackId: 1, next: 2 },
+        { id: 2, trackId: 42, next: 3, databaseUuid: "shared-uuid" },
+        { id: 3, trackId: 3, next: 0 },
+      ],
+    },
+  ]);
+  reoriginTracks(dbPath, [
+    { id: 5, originUuid: "shared-uuid", originTrackId: 42 },
+    { id: 6, originUuid: "shared-uuid", originTrackId: 42 },
+  ]);
+  return { dir, dbPath, backupDir: join(dir, "backups") };
+}
+
+/**
+ * Playlist 1 is a *folder*: playlist 2 sits under it. Engine has no separate
+ * folder type -- `is_folder` is computed as "has child lists" -- so a folder
+ * can carry entries of its own, and the edit tools do not treat it specially.
+ */
+function setupFolder() {
+  const dir = mkdtempSync(join(tmpdir(), "pe-"));
+  dirs.push(dir);
+  const dbPath = makeLibrary(dir, { tracks: 8, uuid: "lib-uuid" });
+  addPlaylists(dbPath, [
+    {
+      id: 1,
+      title: "Crate",
+      nextListId: 0,
+      entries: [
+        { id: 1, trackId: 1, next: 2 },
+        { id: 2, trackId: 2, next: 3 },
+        { id: 3, trackId: 3, next: 0 },
+      ],
+    },
+    { id: 2, title: "Inside", parentId: 1, nextListId: 0, entries: [{ id: 4, trackId: 4, next: 0 }] },
   ]);
   return { dir, dbPath, backupDir: join(dir, "backups") };
 }
@@ -231,12 +292,79 @@ describe("addTracksToPlaylist", () => {
     expect(row.t).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
   });
 
-  it("returns an undo that names the positions it wrote", async () => {
+  it("returns an undo that names the positions it wrote, and the tracks it put there", async () => {
     const { dbPath, backupDir } = setup();
     const r: any = await addTracksToPlaylist(dbPath, "lib-uuid", { listId: 1, trackIds: [6, 5], at: "end" }, { backupDir });
     expect(r.undo).toEqual([
-      { tool: "remove_tracks_from_playlist", arguments: { playlist_id: 1, positions: [4, 5] } },
+      {
+        tool: "remove_tracks_from_playlist",
+        arguments: { playlist_id: 1, positions: [4, 5], expect_track_ids: [6, 5] },
+      },
     ]);
+    expect(r.undo_complete).toBe(true);
+  });
+
+  it("hands back an undo that refuses to run against a list that changed underneath it", async () => {
+    // The moment the undo is built is the only moment the server knows which
+    // tracks landed at those positions. Without expect_track_ids the undo is
+    // just "remove position 4", which a list someone has since prepended to
+    // answers with a different track entirely -- silently, and with the
+    // caller believing their edit was reversed.
+    const { dbPath, backupDir } = setup();
+    const r: any = await addTracksToPlaylist(dbPath, "lib-uuid", { listId: 1, trackIds: [6], at: "end" }, { backupDir });
+    expect(order(dbPath)).toEqual([1, 2, 3, 6]);
+
+    // Somebody else edits the playlist before the undo is replayed: position
+    // 4 now holds track 3, not the track this edit added.
+    await addTracksToPlaylist(dbPath, "lib-uuid", { listId: 1, trackIds: [7], at: "start" }, { backupDir });
+    expect(order(dbPath)).toEqual([7, 1, 2, 3, 6]);
+
+    const step = r.undo[0];
+    const back = await removeTracksFromPlaylist(
+      dbPath,
+      "lib-uuid",
+      { listId: 1, positions: step.arguments.positions, expectTrackIds: step.arguments.expect_track_ids },
+      { backupDir },
+    );
+    expect(isEngineError(back)).toBe(true);
+    expect((back as any).error).toBe("invalid_position");
+    expect(order(dbPath)).toEqual([7, 1, 2, 3, 6]);
+  });
+
+  it("refuses a track whose origin pair is already an entry, even when two tracks share that pair", async () => {
+    // The duplicate check compares origin pairs, which is the comparison
+    // UNIQUE (listId, databaseUuid, trackId) will make when the INSERT runs.
+    // Resolving each entry back to a local track instead asks a different
+    // question, through a table that does not promise the pair is unique:
+    // with tracks 5 and 6 both carrying ("shared-uuid", 42), it resolves to
+    // whichever row the query happens to return, so a request naming the
+    // other one slips past, copies a snapshot, opens a transaction and is
+    // refused only by the constraint. Both are checked here precisely so the
+    // test does not depend on which of the two SQLite returns first.
+    for (const trackId of [5, 6]) {
+      const { dbPath, backupDir } = setupSharedOrigin();
+      const r = await addTracksToPlaylist(dbPath, "lib-uuid", { listId: 1, trackIds: [trackId], at: "end" }, { backupDir });
+      expect(isEngineError(r), `track ${trackId}`).toBe(true);
+      expect((r as any).error, `track ${trackId}`).toBe("duplicate_track");
+      expect((r as any).detail, `track ${trackId}`).toBe("not_committed");
+      // The point of the pair form: refused before anything touched the
+      // filesystem. The constraint would refuse too, one snapshot later.
+      expect(existsSync(backupDir), `track ${trackId}`).toBe(false);
+      expect(order(dbPath), `track ${trackId}`).toEqual([1, 42, 3]);
+    }
+  });
+
+  it("adds to a playlist that is a folder, because Engine has no separate folder type", async () => {
+    // A folder is just a playlist other playlists sit under -- there is no
+    // flag distinguishing them (see get_playlists's is_folder, which is
+    // computed as "has children"). Engine itself shows such a list's own
+    // entries, and nothing here refuses one. Pinned rather than argued for:
+    // if this ever becomes a refusal it should be a decision, not a drift.
+    const { dbPath, backupDir } = setupFolder();
+    const r = await addTracksToPlaylist(dbPath, "lib-uuid", { listId: 1, trackIds: [6], at: "end" }, { backupDir });
+    expect(isEngineError(r)).toBe(false);
+    expect(order(dbPath, 1)).toEqual([1, 2, 3, 6]);
+    expect(order(dbPath, 2)).toEqual([4]);
   });
 
   it("refuses an empty trackIds list", async () => {
@@ -329,16 +457,66 @@ describe("removeTracksFromPlaylist", () => {
     // an entry with trackId <= 0 is deleted without relinking and leaves its
     // predecessor pointing at nothing. No real library measured has such a
     // row -- min trackId is 1 -- but "none today" is not "none ever", and the
-    // post-edit gate is the only thing that would notice.
+    // post-edit check is the only thing that would notice.
+    //
+    // library_unreadable, not playlist_chain_damaged, and the same code add
+    // and reorder return from their own post-edit check: the two codes
+    // answer different questions. playlist_chain_damaged means the chain was
+    // already broken before this edit and the edit refused to touch it;
+    // library_unreadable here means this edit's own verification disagreed
+    // with what it wrote and rolled back.
     const { dbPath, backupDir } = setup();
     const db = new DatabaseSync(dbPath);
     db.prepare("UPDATE PlaylistEntity SET trackId = 0 WHERE id = 2").run();
     db.close();
     const r = await removeTracksFromPlaylist(dbPath, "lib-uuid", { listId: 1, positions: [2] }, { backupDir });
     expect(isEngineError(r)).toBe(true);
-    expect((r as any).error).toBe("playlist_chain_damaged");
+    expect((r as any).error).toBe("library_unreadable");
     expect((r as any).detail).toBe("not_committed");
     expect(order(dbPath)).toEqual([1, 0, 3]);
+  });
+
+  it("checks the surviving order, not just that some sound chain is left", async () => {
+    // The gate answers "is this still one sound chain", which is not the
+    // question the caller asked. Engine's own trigger cannot produce a sound
+    // chain holding the wrong entries -- given a sound chain going in, its
+    // WHEN OLD.trackId > 0 either relinks correctly or leaves a dangling
+    // link, both of which the gate alone catches -- so the divergence is
+    // staged here with a trigger of this test's own, which is exactly the
+    // shape "a trigger this code does not know about" takes on a file the
+    // server does not own.
+    {
+      // Sound, complete, and in the wrong order: 1 -> 4 -> 3 rather than the
+      // 1 -> 3 -> 4 removing position 2 should leave.
+      const { dbPath, backupDir } = setupChain(4);
+      const db = new DatabaseSync(dbPath);
+      db.exec(`CREATE TRIGGER t_scramble AFTER DELETE ON PlaylistEntity FOR EACH ROW BEGIN
+        UPDATE PlaylistEntity SET nextEntityId = 4 WHERE id = 1;
+        UPDATE PlaylistEntity SET nextEntityId = 3 WHERE id = 4;
+        UPDATE PlaylistEntity SET nextEntityId = 0 WHERE id = 3;
+      END`);
+      db.close();
+      const r = await removeTracksFromPlaylist(dbPath, "lib-uuid", { listId: 1, positions: [2] }, { backupDir });
+      expect(isEngineError(r)).toBe(true);
+      expect((r as any).error).toBe("library_unreadable");
+      expect((r as any).detail).toBe("not_committed");
+      expect(order(dbPath)).toEqual([1, 2, 3, 4]);
+    }
+    {
+      // Sound, in order, and one entry short: the count is part of the
+      // answer too.
+      const { dbPath, backupDir } = setupChain(4);
+      const db = new DatabaseSync(dbPath);
+      db.exec(`CREATE TRIGGER t_extra AFTER DELETE ON PlaylistEntity FOR EACH ROW WHEN OLD.id = 2 BEGIN
+        DELETE FROM PlaylistEntity WHERE id = 4;
+        UPDATE PlaylistEntity SET nextEntityId = 0 WHERE id = 3;
+      END`);
+      db.close();
+      const r = await removeTracksFromPlaylist(dbPath, "lib-uuid", { listId: 1, positions: [2] }, { backupDir });
+      expect(isEngineError(r)).toBe(true);
+      expect((r as any).error).toBe("library_unreadable");
+      expect(order(dbPath)).toEqual([1, 2, 3, 4]);
+    }
   });
 
   it("returns an ordered undo, because positions shift as it runs", async () => {
@@ -350,6 +528,9 @@ describe("removeTracksFromPlaylist", () => {
       { tool: "add_tracks_to_playlist", arguments: { playlist_id: 1, track_ids: [1], at: "start" } },
       { tool: "add_tracks_to_playlist", arguments: { playlist_id: 1, track_ids: [3], at: { after_position: 2 } } },
     ]);
+    // Everything removed here can come back, so the undo is the whole way back.
+    expect(r.undo_complete).toBe(true);
+    expect(r.undo_note).toBeUndefined();
   });
 
   it("checks expect_track_ids when given, and refuses a mismatch", async () => {
@@ -402,6 +583,56 @@ describe("removeTracksFromPlaylist", () => {
       );
       expect((r as any).error).toBe("invalid_position");
       expect(order(dbPath)).toEqual([1, 9999, 3]);
+    }
+  });
+
+  it("says so instead of promising an undo it cannot execute", async () => {
+    // An entry whose stored origin pair names no track in this library has
+    // no track id to hand back, and the DELETE destroyed the only place that
+    // pair was written down. The undo used to name it anyway, as
+    // `track_ids: [null]` -- a step add_tracks_to_playlist's own schema
+    // rejects, and which the store would answer with "No track with id null
+    // in this library" if it ever got that far. The honest answer is fewer
+    // steps and a flag saying so.
+    {
+      const { dbPath, backupDir } = setupUnresolvable();
+      const r: any = await removeTracksFromPlaylist(dbPath, "lib-uuid", { listId: 1, positions: [2] }, { backupDir });
+      expect(isEngineError(r)).toBe(false);
+      expect(r.removed).toEqual([{ position: 2, track_id: null }]);
+      expect(r.undo).toEqual([]);
+      expect(r.undo_complete).toBe(false);
+      expect(r.undo_note).toMatch(/2/);
+      expect(r.undo_note).toMatch(/backup_path/);
+    }
+    {
+      // Mixed: position 2 cannot come back, position 3 can. Every step that
+      // *is* emitted must be a call the tool accepts and executes, and the
+      // positions must account for the entry that will never return -- an
+      // `after_position: 2` computed as if it had would name a position the
+      // shortened list does not reach.
+      const { dbPath, backupDir } = setupUnresolvable();
+      const r: any = await removeTracksFromPlaylist(dbPath, "lib-uuid", { listId: 1, positions: [2, 3] }, { backupDir });
+      expect(isEngineError(r)).toBe(false);
+      expect(order(dbPath)).toEqual([1]);
+      expect(r.undo_complete).toBe(false);
+      expect(r.undo).toEqual([
+        { tool: "add_tracks_to_playlist", arguments: { playlist_id: 1, track_ids: [3], at: { after_position: 1 } } },
+      ]);
+      for (const step of r.undo) {
+        // The step has to survive the schema its own tool validates against:
+        // `track_ids: [null]` did not, which is how an undo nobody could run
+        // shipped.
+        expect(AddTracksToPlaylistInput.safeParse(step.arguments).success).toBe(true);
+        const back = await addTracksToPlaylist(
+          dbPath,
+          "lib-uuid",
+          { listId: 1, trackIds: step.arguments.track_ids, at: step.arguments.at },
+          { backupDir },
+        );
+        expect(isEngineError(back), JSON.stringify(back)).toBe(false);
+      }
+      // Everything that could come back did, in its original relative order.
+      expect(order(dbPath)).toEqual([1, 3]);
     }
   });
 

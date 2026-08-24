@@ -34,6 +34,22 @@ export interface EditResult {
   positions?: number[];
   removed?: { position: number; track_id: number | null }[];
   undo: UndoStep[];
+  /**
+   * Whether replaying every step of `undo` puts the playlist back exactly as
+   * it was. Always present, never inferred from `undo`'s length: a client
+   * that read a missing field as false -- or a full-looking `undo` as
+   * complete -- would get the one question that matters here backwards.
+   *
+   * False only for removeTracksFromPlaylist, and only for a removal that
+   * included an entry whose stored origin pair matches no track in this
+   * library. Such an entry has no track id to hand back to
+   * add_tracks_to_playlist, so no undo step for it can exist; `undo_note`
+   * then names those positions. The steps that *are* emitted still run, and
+   * still restore everything else to its original position.
+   */
+  undo_complete: boolean;
+  /** Set only when `undo_complete` is false: which positions have no way back, and why. */
+  undo_note?: string;
   backup_path: string;
 }
 
@@ -147,6 +163,16 @@ function resolveOrigins(db: DatabaseSync, trackIds: number[]): OriginRef[] | Eng
     refs.push({ uuid: row.uuid, trackId: row.trackId });
   }
   return refs;
+}
+
+/**
+ * One origin pair as a Map key, joined on NUL because a databaseUuid is free
+ * text: any printable separator is a character some uuid could itself
+ * contain, and a key collision here would refuse a track as duplicate_track
+ * when it is not in the playlist at all.
+ */
+function pairKey(uuid: string, trackId: number): string {
+  return `${uuid}\u0000${trackId}`;
 }
 
 /**
@@ -476,8 +502,11 @@ function classifyWriteFailure(
  * UPDATEs specific to what this write is -- against the open `db` it is
  * handed, and returns either the result to hand back (minus `backup_path`,
  * which this function fills in once it knows COMMIT succeeded) or an
- * `EngineError` it has *already rolled back* before returning, exactly as
- * a `catch` block here would.
+ * `EngineError`. A body that has already written something rolls back before
+ * returning that error, but this function rolls back on that branch too
+ * rather than relying on it: `rollback` is a no-op when there is no
+ * transaction left to undo, and a body that forgot would otherwise leave the
+ * open transaction to `db.close()` -- correct today, and only by accident.
  *
  * `isEngineError`, not a second return channel, is what tells `body`'s
  * success value apart from its failure one: this module already exports
@@ -522,7 +551,10 @@ async function withWriteTransaction<T extends object>(
     db.exec("BEGIN IMMEDIATE");
 
     const result = body(db);
-    if (isEngineError(result)) return result;
+    if (isEngineError(result)) {
+      rollback(db);
+      return result;
+    }
 
     commit = "maybe";
     db.exec("COMMIT");
@@ -750,33 +782,45 @@ export async function addTracksToPlaylist(
       refs = resolveOrigins(precheck, trackIds);
       if (!Array.isArray(refs)) return refs;
 
-      // UNIQUE (listId, databaseUuid, trackId) protects a pair, not a
-      // track, and this check is not stronger than that constraint: it
-      // resolves every existing entry back to a local track and compares
-      // against the request, which is exactly the constraint's own check,
-      // just run early. Its value is failing fast -- before the snapshot is
-      // copied and before a write transaction opens, with a message naming
-      // the track, rather than a UNIQUE-constraint violation surfacing from
-      // inside a transaction and getting mapped back to the same code.
+      // Compared as pairs, in the same direction the write goes: each
+      // existing entry's stored (databaseUuid, trackId) against the pairs
+      // the requested tracks resolve to -- which is exactly what
+      // UNIQUE (listId, databaseUuid, trackId) will compare when the INSERT
+      // runs. Its value is failing fast: before the snapshot is copied and
+      // before a write transaction opens, with a message naming the track,
+      // rather than a UNIQUE-constraint violation surfacing from inside a
+      // transaction and getting mapped back to the same code.
       //
-      // It cannot catch more than the constraint can. An entry whose stored
-      // (databaseUuid, trackId) no longer resolves to any local track --
-      // which is what a library looks like right after a re-origination
-      // moves a track's origin on without updating the entries that named
-      // its old one -- is not a case this check (or the constraint) can
-      // call a duplicate: nothing in the database still says that entry and
-      // the requested track are the same one. That is a property of the
-      // data, not a gap in the check.
+      // The reverse direction -- resolving each entry back to a local track
+      // and asking whether the request names it -- looks equivalent and is
+      // strictly weaker. It goes through Track, so it answers "is there a
+      // local track carrying this entry's pair, and is *that* track the one
+      // asked for", and when two Track rows share one origin pair (measured:
+      // a re-origination that moved some rows and not others) it resolves to
+      // whichever row the query returns first. Ask for the other one and the
+      // check misses, the snapshot is copied, the transaction opens, and
+      // only then does the constraint refuse. Comparing pairs cannot miss
+      // that, and it drops one unindexed Track scan per existing entry from
+      // a path that runs before every add.
+      //
+      // Neither form can catch more than the constraint itself: an entry
+      // whose stored pair no longer names any local track -- what a library
+      // looks like right after a re-origination moved a track's origin on
+      // without updating the entries naming its old one -- is not a
+      // duplicate of anything, because nothing in the database still says
+      // that entry and the requested track are the same one. That is a
+      // property of the data, not a gap in the check.
+      const wanted = new Map<string, number>();
+      for (let i = 0; i < refs.length; i++) wanted.set(pairKey(refs[i]!.uuid, refs[i]!.trackId), trackIds[i]!);
       const existing = precheck
         .prepare("SELECT trackId, databaseUuid FROM PlaylistEntity WHERE listId = ?")
         .all(listId) as { trackId: number; databaseUuid: string }[];
-      const requested = new Set(trackIds);
       for (const e of existing) {
-        const local = resolveLocalTrackId(precheck, e.databaseUuid, e.trackId);
-        if (local !== null && requested.has(local)) {
+        const clash = wanted.get(pairKey(e.databaseUuid, e.trackId));
+        if (clash !== undefined) {
           return err(
             "duplicate_track",
-            `Track ${local} is already in playlist ${listId}; Engine allows a track in a playlist only once.`,
+            `Track ${clash} is already in playlist ${listId}; Engine allows a track in a playlist only once.`,
             { detail: NOT_COMMITTED },
           );
         }
@@ -878,22 +922,42 @@ export async function addTracksToPlaylist(
     db.prepare("UPDATE Playlist SET lastEditTime = datetime('now') WHERE id = ?").run(listId);
 
     const positions = ids.map((_, i) => insertAt + 1 + i);
+    // expect_track_ids, not bare positions: this is the one moment the
+    // server knows exactly which tracks landed at those positions, and a
+    // playlist that changed between this edit and the undo would otherwise
+    // have the undo remove whatever now sits there -- silently, and with no
+    // way for the caller to notice. The ids are the caller's own local track
+    // ids, which is what remove_tracks_from_playlist compares against (it
+    // resolves each entry's stored origin pair back to a local track the
+    // same way). Stale list, refused undo; unchanged list, the undo runs.
     return {
       playlist_id: listId,
       tracks_added: trackRefs.length,
       positions,
-      undo: [{ tool: "remove_tracks_from_playlist", arguments: { playlist_id: listId, positions } }],
+      undo: [
+        {
+          tool: "remove_tracks_from_playlist",
+          arguments: { playlist_id: listId, positions, expect_track_ids: trackIds },
+        },
+      ],
+      undo_complete: true,
     };
   });
 }
 
 /**
  * The local `Track.id` that carries a given origin pair, or null if none
- * does. Shared by addTracksToPlaylist's duplicate check and resolveRemoval,
- * below: both need to go from a PlaylistEntity row's stored (databaseUuid,
- * trackId) -- the origin pair Engine actually stores, see resolveOrigins's
- * comment -- back to the local row a caller's trackIds/expectTrackIds are
- * expressed in.
+ * does -- the reverse of resolveOrigins, going from a PlaylistEntity row's
+ * stored (databaseUuid, trackId) back to the local row a caller's
+ * expectTrackIds and the response's `removed[].track_id` are expressed in.
+ *
+ * Used only by resolveRemoval, which genuinely needs that direction: it has
+ * an entry and must say which local track it holds. addTracksToPlaylist's
+ * duplicate check used to go through here too and no longer does -- it
+ * compares origin pairs directly, which is both stronger and cheaper; see
+ * the comment on that check. Where two Track rows share one origin pair this
+ * function answers with whichever row the query returns first, which is
+ * exactly why the duplicate check must not be built on it.
  */
 function resolveLocalTrackId(db: DatabaseSync, uuid: string, trackId: number): number | null {
   const row = db
@@ -983,7 +1047,10 @@ function resolveRemoval(
  * landed: its `WHEN OLD.trackId > 0` means a row with trackId <= 0 is
  * deleted *without* relinking, leaving its predecessor pointing at a row
  * that is now gone. No real library measured has such a row, but the
- * post-delete gate below is the only thing that would ever notice one.
+ * post-delete check below is the only thing that would ever notice one --
+ * and it checks the surviving order against what was expected, not only
+ * that some sound chain is left, because "sound" and "right" are different
+ * questions and only the second one is what the caller asked for.
  *
  * Shares createPlaylist/addTracksToPlaylist's skeleton: a read-only
  * pre-check first, then withWriteTransaction.
@@ -1057,22 +1124,49 @@ export async function removeTracksFromPlaylist(
       return plan;
     }
 
+    // What the chain must read back as once the deletes have landed: the
+    // entries this call did not name, in their original order. Built here,
+    // before the DELETE, from a walk of the chain BEGIN IMMEDIATE locked --
+    // the same reason addTracksToPlaylist and reorderPlaylist build theirs
+    // up front: a readback check derived from the writes it is meant to
+    // verify checks nothing.
+    const removedIndexes = new Set(plan.map((p) => p.position - 1));
+    const originalRefs = gate.order.length > 0 ? walkFrom(db, listId, gate.order[0]!) : [];
+    const expected = originalRefs.filter((_, i) => !removedIndexes.has(i));
+    const survivors = gate.order.filter((_, i) => !removedIndexes.has(i));
+
     // One statement, no chain maintenance -- see this function's own
     // comment for why the trigger is trusted to relink around every row
     // this deletes, including a batch of several at once.
     const placeholders = plan.map(() => "?").join(", ");
     db.prepare(`DELETE FROM PlaylistEntity WHERE id IN (${placeholders})`).run(...plan.map((p) => p.entryId));
 
-    // The gate that catches what the trigger's WHEN clause does not cover:
-    // a deleted row with trackId <= 0 leaves its predecessor pointing at a
-    // row that no longer exists, and this is the only check in the whole
-    // operation that would notice.
+    // Gate *and* order, the same pairing add and reorder use, and spec §6
+    // asks for here specifically. The gate catches what the trigger's WHEN
+    // clause does not cover: a deleted row with trackId <= 0 leaves its
+    // predecessor pointing at a row that no longer exists. sameOrder catches
+    // the class the gate structurally cannot -- a chain that is still one
+    // sound run but holds the wrong entries, or the wrong number of them,
+    // which is what a delete that took the wrong row (or a trigger this code
+    // does not know about) leaves behind.
+    //
+    // library_unreadable, not playlist_chain_damaged, and deliberately the
+    // same code add and reorder use for their own post-check: the two mean
+    // different things to a client. playlist_chain_damaged means the chain
+    // was already broken before this edit and the edit refused to touch it;
+    // this one means the edit's own verification disagreed with what it
+    // wrote, so the transaction was rolled back. Both leave the library
+    // unchanged (detail: not_committed); only the second says the library
+    // did something this code cannot account for.
+    const newHeadId = survivors.length > 0 ? survivors[0]! : 0;
     const finalGate = gateChain(db, listId);
-    if (!finalGate.ok) {
+    if (!finalGate.ok || !sameOrder(walkFrom(db, listId, newHeadId), expected)) {
       rollback(db);
-      return err("playlist_chain_damaged", `Playlist ${listId}: ${finalGate.reason}. Nothing was changed.`, {
-        detail: NOT_COMMITTED,
-      });
+      return err(
+        "library_unreadable",
+        `The entry chain for playlist ${listId} did not read back as written; nothing was changed.`,
+        { detail: NOT_COMMITTED },
+      );
     }
 
     // No trigger maintains this: measured, changing PlaylistEntity leaves the
@@ -1087,39 +1181,64 @@ export async function removeTracksFromPlaylist(
       .sort((a, b) => a.position - b.position)
       .map((p) => ({ position: p.position, track_id: p.trackId }));
 
+    // An entry whose stored origin pair matches no track in this library has
+    // no track id to hand back, so no add_tracks_to_playlist call can
+    // restore it: the DELETE above destroyed the only place that pair was
+    // written down. Emitting a step for it anyway -- `track_ids: [null]` --
+    // produced an undo its own tool's schema rejects, and the entry was gone
+    // regardless. So no step is emitted for such a position, and the result
+    // says so rather than implying a way back it does not have.
+    const restorable = removed.filter((r) => r.track_id !== null);
+    const lost = removed.filter((r) => r.track_id === null).map((r) => r.position);
+
     // Undo restores in that same ascending order, each step expressed
-    // against the list as it will be *after* the previous step has run --
-    // and that is just `position - 1` computed against the *original*
-    // (pre-removal) position, not recomputed per step. Restoring in
-    // ascending order means that immediately before the row originally at
-    // position p is restored, every row originally before p is present
-    // again -- either it was never removed, or, being an earlier and
-    // already-restored entry, it is back in its exact original spot -- and
-    // nothing originally at or after p has been restored yet. So exactly
-    // p - 1 rows precede that slot at that moment, regardless of how many
-    // other removed positions fall between the previous restore and this
-    // one. Removing positions 1 and 3 from a three-entry list makes this
-    // concrete: restoring 1 first (at "start") and then 3 (at
-    // after_position: 2) reproduces the original order. Restoring 3 first
+    // against the list as it will be *after* the previous step has run.
+    // Restoring in ascending order means that immediately before the row
+    // originally at position p is restored, every row originally before p
+    // that *can* come back is present again -- either it was never removed,
+    // or, being an earlier and already-restored entry, it is back in its
+    // exact original spot -- and nothing originally at or after p has been
+    // restored yet. So the number of rows preceding that slot at that moment
+    // is p - 1 minus the rows originally before p that were removed and
+    // cannot be restored. With nothing lost that is just `position - 1`
+    // computed against the original position: removing positions 1 and 3
+    // from a three-entry list restores 1 first (at "start") and then 3 (at
+    // after_position: 2), reproducing the original order. Restoring 3 first
     // would compute that same after_position: 2 against a list from which 1
     // is *also* still missing -- a single surviving entry -- which is
     // already wrong (there is no position 2 to be after yet); ascending
     // order is what keeps every step's target position valid, not just
-    // correct.
-    const undo: UndoStep[] = removed.map((r) => ({
-      tool: "add_tracks_to_playlist",
-      arguments: {
-        playlist_id: listId,
-        track_ids: [r.track_id],
-        at: r.position === 1 ? "start" : { after_position: r.position - 1 },
-      },
-    }));
+    // correct. Subtracting the lost rows is the same argument applied to a
+    // list that will never get them back: a step that still counted them
+    // would name a position the list does not reach, and be refused.
+    const undo: UndoStep[] = restorable.map((r) => {
+      const before = r.position - 1 - lost.filter((p) => p < r.position).length;
+      return {
+        tool: "add_tracks_to_playlist",
+        arguments: {
+          playlist_id: listId,
+          track_ids: [r.track_id],
+          at: before === 0 ? "start" : { after_position: before },
+        },
+      };
+    });
 
     return {
       playlist_id: listId,
       tracks_removed: removed.length,
       removed,
       undo,
+      undo_complete: lost.length === 0,
+      ...(lost.length === 0
+        ? {}
+        : {
+            undo_note:
+              `Position${lost.length > 1 ? "s" : ""} ${lost.join(", ")} held an entry whose stored ` +
+              `origin pair names no track in this library, so there is no track id to add back and ` +
+              `no undo step can restore it. The other steps put everything else back; the only way ` +
+              `back for ${lost.length > 1 ? "those entries" : "that entry"} is the snapshot at backup_path, ` +
+              `which reverts the whole library.`,
+          }),
     };
   });
 }
@@ -1177,7 +1296,15 @@ function validatePermutation(order: number[], currentLength: number, listId: num
  * spec takes a full permutation rather than a move instruction). Only the
  * entries whose successor actually changes get an UPDATE -- measured on a
  * real library, moving an entry from the middle to the front took exactly
- * two updates -- so a permutation that changes nothing writes nothing.
+ * two updates, and the identity permutation writes no PlaylistEntity row at
+ * all. It is still not a no-op: like every other op here it stamps
+ * `Playlist.lastEditTime`, and the session's snapshot is copied before the
+ * body ever runs, so the identity case costs a timestamp and (once per
+ * session) a snapshot. Left that way deliberately -- "did this permutation
+ * change anything" can only be answered honestly after BEGIN IMMEDIATE, by
+ * which point the snapshot is already taken, and an edit that reports
+ * success without touching lastEditTime would be the one op whose result
+ * Engine cannot see.
  *
  * Shares createPlaylist/addTracksToPlaylist/removeTracksFromPlaylist's
  * skeleton: a read-only pre-check first, then withWriteTransaction.
@@ -1301,6 +1428,7 @@ export async function reorderPlaylist(
     return {
       playlist_id: listId,
       undo: [{ tool: "reorder_playlist", arguments: { playlist_id: listId, order: inverse } }],
+      undo_complete: true,
     };
   });
 }
