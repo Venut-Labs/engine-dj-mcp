@@ -303,3 +303,34 @@ export function reoriginTracks(
   db.exec("COMMIT");
   db.close();
 }
+
+/**
+ * Break one playlist's entry chain the way a real library breaks.
+ *
+ * The reader tolerates all three and says so in `warnings`; the writer must
+ * refuse all three, and a refusal is only testable against a chain that is
+ * genuinely damaged. Measured shapes, not invented ones: a cycle leaves no
+ * row with nextEntityId = 0 at all, which is what made a naive "append to the
+ * tail" silently start a second run.
+ */
+export function damageChain(dbPath: string, listId: number, kind: "cycle" | "dangling" | "two-heads"): void {
+  const db = new DatabaseSync(dbPath);
+  const rows = db
+    .prepare("SELECT id, nextEntityId FROM PlaylistEntity WHERE listId = ? ORDER BY id")
+    .all(listId) as { id: number; nextEntityId: number }[];
+  if (rows.length < 3) throw new Error(`damageChain needs at least 3 entries, list ${listId} has ${rows.length}`);
+  const head = rows[0]!.id;
+  const tail = rows.find((r) => r.nextEntityId === 0)!.id;
+
+  if (kind === "cycle") {
+    db.prepare("UPDATE PlaylistEntity SET nextEntityId = ? WHERE id = ?").run(head, tail);
+  } else if (kind === "dangling") {
+    const gone = Math.max(...rows.map((r) => r.id)) + 1000;
+    db.prepare("UPDATE PlaylistEntity SET nextEntityId = ? WHERE id = ?").run(gone, head);
+  } else {
+    // Sever the link out of the first row: its successor becomes a second
+    // head and the list reads as two disconnected runs.
+    db.prepare("UPDATE PlaylistEntity SET nextEntityId = 0 WHERE id = ?").run(head);
+  }
+  db.close();
+}

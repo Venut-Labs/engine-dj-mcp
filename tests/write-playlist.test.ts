@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { makeLibrary, addPlaylists, reoriginTracks } from "./fixtures/gen-library.js";
-import { createPlaylist, resetSessionSnapshots, sameOrder, walkFrom } from "../src/store/write.js";
+import { createPlaylist, resetSessionSnapshots, sameOrder, walkFrom, checkChain } from "../src/store/write.js";
 import { isEngineError } from "../src/errors.js";
 
 const hotWriterScript = fileURLToPath(new URL("./fixtures/hot-journal-writer.js", import.meta.url));
@@ -665,5 +665,89 @@ describe("walkFrom / sameOrder", () => {
     expect(sameOrder(a, [a[1]!, a[0]!])).toBe(false);
     expect(sameOrder(a, [{ uuid: "lib-uuid", trackId: 1 }, { uuid: "lib-uuid", trackId: 2 }])).toBe(false);
     expect(sameOrder(a, a.slice(0, 1))).toBe(false);
+  });
+});
+
+describe("checkChain", () => {
+  const ok = [
+    { id: 1, next: 2 },
+    { id: 2, next: 3 },
+    { id: 3, next: 0 },
+  ];
+
+  it("accepts a sound chain and reports its order", () => {
+    expect(checkChain(ok)).toEqual({ ok: true, order: [1, 2, 3] });
+  });
+
+  it("accepts an empty list", () => {
+    expect(checkChain([])).toEqual({ ok: true, order: [] });
+  });
+
+  it("refuses a cycle, which leaves no head at all", () => {
+    const r = checkChain([
+      { id: 1, next: 2 },
+      { id: 2, next: 3 },
+      { id: 3, next: 1 },
+    ]);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toMatch(/head/i);
+  });
+
+  it("refuses two disconnected runs, which each look like a head", () => {
+    // The case that made a count-based check report success: walking from
+    // *every* head covers every row, so "the walk covered them all" passes
+    // on a list that is in two pieces.
+    const r = checkChain([
+      { id: 1, next: 0 },
+      { id: 2, next: 3 },
+      { id: 3, next: 0 },
+    ]);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toMatch(/head/i);
+  });
+
+  it("refuses a link to a row that is not there", () => {
+    const r = checkChain([
+      { id: 1, next: 2 },
+      { id: 2, next: 99 },
+    ]);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toMatch(/99/);
+  });
+
+  it("refuses a walk that does not reach every row", () => {
+    // One head, no dangling link, and still broken: 3 points at itself, so
+    // the walk from 1 ends at 2 and never reaches it.
+    const r = checkChain([
+      { id: 1, next: 2 },
+      { id: 2, next: 0 },
+      { id: 3, next: 3 },
+    ]);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toMatch(/reach|cover/i);
+  });
+
+  it("refuses a chain that converges instead of ending", () => {
+    // One head (1), no dangling link, and the walk from 1 visits all three
+    // ids -- 1, 2, 3 -- before it repeats one, so a coverage-only check
+    // would call this sound. It is not: row 3 links back into row 2, an
+    // already-linked interior row, so row 2 has two predecessors and no row
+    // ever points at 0. The chain never ends.
+    const r = checkChain([
+      { id: 1, next: 2 },
+      { id: 2, next: 3 },
+      { id: 3, next: 2 },
+    ]);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toMatch(/end|loop/i);
+  });
+
+  it("refuses a single row that links to itself", () => {
+    // Not covered by the coverage check at all -- a lone self-linked row is
+    // rejected earlier, for having no head. Locked in as its own case so a
+    // future refactor of the head/coverage split cannot silently start
+    // accepting a one-node cycle as a one-row playlist.
+    const r = checkChain([{ id: 1, next: 1 }]);
+    expect(r.ok).toBe(false);
   });
 });

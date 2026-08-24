@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { makeLibrary, addPlaylists } from "./gen-library.js";
+import { makeLibrary, addPlaylists, damageChain } from "./gen-library.js";
 
 let dir: string;
 beforeAll(() => { dir = mkdtempSync(join(tmpdir(), "edj-")); });
@@ -72,6 +72,62 @@ describe("synthetic library", () => {
     expect(oldTailRelinked.nextListId).toBe(third.id);
 
     db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("can damage an entry chain in each way a real library breaks", () => {
+    // The writer must refuse to edit a damaged chain, and refusing is only
+    // testable against a chain that is actually damaged. These three are the
+    // shapes orderByChain already warns about on the read side.
+    const dir = mkdtempSync(join(tmpdir(), "gen-dmg-"));
+    const dbPath = makeLibrary(dir, { tracks: 5 });
+    addPlaylists(dbPath, [
+      {
+        id: 1,
+        title: "Chain",
+        nextListId: 0,
+        entries: [
+          { id: 1, trackId: 1, next: 2 },
+          { id: 2, trackId: 2, next: 3 },
+          { id: 3, trackId: 3, next: 0 },
+        ],
+      },
+    ]);
+
+    const heads = (p: string) => {
+      const db = new DatabaseSync(p, { readOnly: true });
+      const rows = db.prepare("SELECT id, nextEntityId FROM PlaylistEntity WHERE listId = 1").all() as any[];
+      db.close();
+      const targets = new Set(rows.map((r) => r.nextEntityId));
+      return rows.filter((r) => !targets.has(r.id)).length;
+    };
+    const dangling = (p: string) => {
+      const db = new DatabaseSync(p, { readOnly: true });
+      const n = db
+        .prepare(
+          `SELECT COUNT(*) c FROM PlaylistEntity WHERE listId = 1 AND nextEntityId <> 0
+             AND nextEntityId NOT IN (SELECT id FROM PlaylistEntity WHERE listId = 1)`,
+        )
+        .get() as any;
+      db.close();
+      return n.c;
+    };
+
+    const cyc = join(dir, "cyc.db");
+    copyFileSync(dbPath, cyc);
+    damageChain(cyc, 1, "cycle");
+    expect(heads(cyc), "cycle leaves no head").toBe(0);
+
+    const dang = join(dir, "dang.db");
+    copyFileSync(dbPath, dang);
+    damageChain(dang, 1, "dangling");
+    expect(dangling(dang), "dangling link").toBe(1);
+
+    const two = join(dir, "two.db");
+    copyFileSync(dbPath, two);
+    damageChain(two, 1, "two-heads");
+    expect(heads(two), "two disconnected runs").toBe(2);
+
     rmSync(dir, { recursive: true, force: true });
   });
 });

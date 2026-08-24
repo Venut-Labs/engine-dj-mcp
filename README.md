@@ -67,10 +67,11 @@ through 3.0.2 — Engine DJ 4.5 and 5.x.
 
 ## Tools
 
-Nine read-only tools, and a tenth — `create_playlist` — that appears only
-when you start the server with `--allow-writes`. Every tool that reads
-library data also accepts an optional `library` argument — see
-[Choosing a library](#choosing-a-library).
+Nine read-only tools, and four that write — `create_playlist`,
+`add_tracks_to_playlist`, `remove_tracks_from_playlist` and
+`reorder_playlist` — that appear only when you start the server with
+`--allow-writes`. Every tool that reads library data also accepts an
+optional `library` argument — see [Choosing a library](#choosing-a-library).
 
 ### `search_tracks`
 
@@ -204,7 +205,7 @@ server checks staleness itself before answering.
 
 ### `create_playlist`
 
-The only tool that writes, and the only one that is not registered at all
+The first of the four tools that write, none of which is registered at all
 unless the server was started with `--allow-writes`.
 
 Creates one new top-level playlist from track ids — `track_ids` sets both
@@ -236,6 +237,100 @@ journal behind. Every error also carries `detail`: `not_committed` means the
 library is exactly what it was, and `committed_unverified` — the rare one —
 means the write may have landed but could not be verified afterwards, and is
 the only case that hands back a `backup_path`.
+
+### `add_tracks_to_playlist`
+
+Adds one or more tracks to an **existing** playlist — this edits that
+playlist's contents, it does not create a new one (`create_playlist` does
+that). If the playlist's entry chain is already damaged, the write is
+refused outright rather than repaired, and nothing is added.
+
+A playlist that is a **folder** (`is_folder: true` — it has child lists) is
+edited like any other: Engine has no separate folder type, a folder can hold
+entries of its own, and all three edit tools add to, remove from and reorder
+those entries without complaint. The lists inside it are untouched either
+way.
+
+| Argument | What it does |
+| --- | --- |
+| `playlist_id` / `playlist_name` | Exactly one of the two, resolved the same way `get_playlist_tracks` does: a name matching more than one playlist is refused with every candidate's id and full path listed, not guessed at. |
+| `track_ids` | Ids from `search_tracks` or `get_tracks`, in the order they should appear. A track already in the playlist is refused as `duplicate_track` — Engine allows a track in a playlist only once. |
+| `at` | Where the new tracks land, against the playlist's current 1-based positions (the same numbering `get_playlist_tracks` reports): `"start"`, `"end"` (the default), or `{ after_position: n }`. |
+
+The result carries `playlist_id`, `tracks_added`, `positions` — where the
+new tracks landed — `undo`, `undo_complete` (always `true` here) and
+`backup_path`. `undo` is the exact `remove_tracks_from_playlist` call that
+reverses this edit: the positions the tracks landed at, plus
+`expect_track_ids` naming the tracks that landed there, so a playlist
+something else changed in the meantime is refused rather than having the
+wrong rows removed. Call it to undo rather than restoring `backup_path` —
+see [Restoring a snapshot](#restoring-a-snapshot). Refusals add
+`playlist_not_found`, `playlist_chain_damaged` and `invalid_position` to
+`create_playlist`'s own list; `detail` works the same way.
+
+### `remove_tracks_from_playlist`
+
+Removes one or more tracks from an **existing** playlist by position — this
+edits that playlist's contents; it never touches any other playlist. If the
+entry chain is already damaged, the write is refused outright rather than
+repaired.
+
+| Argument | What it does |
+| --- | --- |
+| `playlist_id` / `playlist_name` | Exactly one of the two, resolved the same way `get_playlist_tracks` does. |
+| `positions` | 1-based positions `get_playlist_tracks` reports for this playlist right now. Includes entries whose track is missing from the library (`missing: true`) — removing one is a legitimate way to clean up a hole, and the one removal `undo` cannot reverse (see below). |
+| `expect_track_ids` | Optional, one entry per position: verifies each named position still holds the track expected before anything is removed, refusing the whole call otherwise. `null` means "this position should hold an entry whose track is missing", not "no expectation". |
+
+The result carries `playlist_id`, `tracks_removed`, `removed` — each
+position's `track_id`, `null` for a missing one — `undo`, `undo_complete` and
+`backup_path`. `undo` is a **sequence** of `add_tracks_to_playlist` calls,
+one per removed track that can be restored. Run them in the order given,
+never in parallel and never reversed — each step's target position is
+computed against the list as it stands after the previous step has already
+run, so firing them out of order puts tracks back in the wrong places.
+Preferred over restoring `backup_path` for the same reason as above.
+
+`undo_complete` is `false` when the removal included an entry whose track is
+missing from the library: that entry named a track this library does not
+have, so no `add_tracks_to_playlist` call can put it back, and an
+`undo_note` names those positions. The steps that are returned still run and
+still restore everything else; the missing entries are recoverable only from
+`backup_path`, which reverts the whole library.
+
+Refusals: `playlist_not_found`, `playlist_chain_damaged`, and
+`invalid_position` — for a repeated or out-of-range position, or one that
+does not hold what `expect_track_ids` expected.
+
+`playlist_chain_damaged` always means the same thing for all three edit
+tools: the playlist's entry chain was already broken **before** the edit,
+which is why the edit refused to touch it. If instead the check each edit
+runs on its own work disagrees — the chain did not read back as it was
+written — the transaction is rolled back and that comes back as
+`library_unreadable`, with `detail: "not_committed"`. Both leave the library
+exactly as it was; only the second one is this server saying it does not
+understand what the library just did.
+
+### `reorder_playlist`
+
+Reorders an **existing** playlist's tracks — this changes the order of that
+playlist's existing entries; it adds nothing and removes nothing. If the
+entry chain is already damaged, the write is refused outright rather than
+repaired.
+
+| Argument | What it does |
+| --- | --- |
+| `playlist_id` / `playlist_name` | Exactly one of the two, resolved the same way `get_playlist_tracks` does. |
+| `order` | A full permutation of `1..n`, `n` being the playlist's current entry count. `order[i]` names the *current* 1-based position (from `get_playlist_tracks`) of the track that should end up at position `i + 1`. A partial "move x to y" instruction is not accepted — name every position, including ones that do not move. |
+
+The result carries `playlist_id`, `undo`, `undo_complete` (always `true`
+here) and `backup_path`. `undo` is the exact inverse permutation, as a single
+`reorder_playlist` call. Refusals: `playlist_not_found`,
+`playlist_chain_damaged`, and `invalid_position` if `order` is not a full
+permutation of the playlist's current positions.
+
+Reordering to the order a playlist is already in is accepted and rewrites no
+entry: it still stamps the playlist's `lastEditTime`, and still costs this
+session's snapshot if nothing had been written yet.
 
 ## Resources
 
@@ -278,11 +373,32 @@ created inside your `Engine Library` folder. The search index lives in
 Without `--allow-writes` the server has no tool that can write, and the
 paragraph above holds exactly as written: SQLite itself refuses.
 
-With the flag, one tool appears — `create_playlist`. It adds a new playlist
-and nothing else: no existing playlist is renamed, reordered, emptied or
-deleted, and no track, cue or beatgrid is touched. The single change to an
-existing row is the previous last playlist's link, made by Engine's own
-trigger.
+With the flag, four tools appear. `create_playlist` adds a new playlist and
+nothing else. `add_tracks_to_playlist`, `remove_tracks_from_playlist` and
+`reorder_playlist` go further: with the flag, an **existing** playlist can
+now be changed, not only created — its tracks added to, removed from, or put
+in a different order. What each one touches is the named playlist's own
+entries, plus exactly two rows elsewhere: that playlist's own row, whose
+`lastEditTime` every edit stamps so Engine sees the change, and — for
+`create_playlist` only — the previous last playlist's link, made by Engine's
+own insert trigger. No other playlist is renamed, emptied or deleted, and no
+track, cue or beatgrid is touched by any of the four.
+
+Every edit returns `undo` — the exact tool call that reverses it, expressed
+against the positions the edit itself produced — and `undo_complete`, saying
+whether replaying it puts the playlist back exactly as it was. Replaying
+`undo` is the right way back from an edit; restoring `backup_path` is not,
+because it reverts the **whole library** to before this session's first
+write, discarding every play count, import, cue and beatgrid change Engine
+DJ has recorded since, along with the one edit you actually wanted undone.
+See [Restoring a snapshot](#restoring-a-snapshot).
+
+There is exactly one edit `undo` cannot reverse, and it says so rather than
+pretending otherwise: removing an entry whose track is missing from the
+library (`missing: true`). Such an entry names a track this library does not
+have, so there is no track id to add back — the result comes back with
+`undo_complete: false` and an `undo_note` naming those positions, and the
+steps it does return still restore everything else.
 
 Before the first write of a session the database is snapshotted to
 `~/.engine-dj-mcp/backups/`, and every write of that session returns its
@@ -311,14 +427,18 @@ Engine will show the new playlist after it next re-reads the library.
 `backup_path` is not an undo. It is a copy of the **whole** `m.db` from
 before the session's first write, so putting it back reverts the entire
 library to that moment: every play count, import, cue, beatgrid and rating
-Engine DJ has written since is discarded along with the playlist you wanted
-gone. Reach for it only if the library itself is damaged — the case where
-`create_playlist` comes back with `detail: "committed_unverified"`.
+Engine DJ has written since is discarded along with the one edit you wanted
+gone. Reach for it only if the library itself is damaged — the case where a
+write comes back with `detail: "committed_unverified"`.
 
-**To undo a playlist, delete it in Engine DJ.** Engine's own delete trigger
-repairs the playlist chain and cascades the entries away, which is exactly
-what removing it should do and is not something restoring a snapshot does
-better.
+**To undo a playlist you created, delete it in Engine DJ.** Engine's own
+delete trigger repairs the playlist chain and cascades the entries away,
+which is exactly what removing it should do and is not something restoring
+a snapshot does better. **To undo an edit to an existing playlist, replay
+the `undo` the edit returned instead** — it names the precise
+`add_tracks_to_playlist`, `remove_tracks_from_playlist` or
+`reorder_playlist` call that puts the playlist back exactly as it was,
+without touching anything else Engine DJ has recorded since.
 
 `run_sql` accepts arbitrary SQL, but only the first statement is ever
 executed, and `VACUUM`, `ATTACH` and `DETACH` are rejected outright, so a
@@ -327,7 +447,7 @@ chained or exfiltrating statement cannot slip past the read-only connection.
 If Engine DJ was closed uncleanly and left an unrecovered journal, this
 server will not open the library to "fix" it, with or without
 `--allow-writes` — rolling a journal forward is a repair on someone else's
-file, and `create_playlist` refuses such a library outright rather than
+file, and every write tool refuses such a library outright rather than
 letting SQLite do it on the way in. It reports `library_needs_recovery` and
 asks you to launch Engine DJ once so it can recover its own library.
 
@@ -374,9 +494,9 @@ still test for the blob: `beatData` has no "written but empty" state.
 
 **It writes nothing but playlists, and only when you ask for it.** Without
 `--allow-writes` the library is opened read-only at the OS level and there is
-no tool that could write. With the flag, `create_playlist` adds playlists —
-and that is the whole list. Not a cue, not a tag, not a rating, and not even
-the recovery of a journal Engine DJ left behind.
+no tool that could write. With the flag, the four write tools add, edit and
+reorder playlists — and that is the whole list. Not a cue, not a tag, not a
+rating, and not even the recovery of a journal Engine DJ left behind.
 
 **It does not read play history.** `Track.timeLastPlayed` answers "what have I
 not played in six months?", but the separate Engine history database —
@@ -392,11 +512,12 @@ flag — a folder is simply a playlist that other playlists sit under — so
 `is_folder` means "has child lists". A folder you have emptied is
 indistinguishable from a playlist with no tracks.
 
-**Playlists can be created, not edited.** With `--allow-writes` a new
-playlist can be added; there is no reordering, renaming, deleting, or adding
-a track to a playlist that already exists, and no set lists or suggested
-transitions. It answers questions about the collection and writes down the
-answer if you ask; the mixing is yours.
+**A playlist's tracks can be edited; the playlist itself cannot.** With
+`--allow-writes` a new playlist can be created, and an existing one can have
+tracks added, removed or reordered — but not renamed, deleted, moved between
+folders, or turned into a folder itself, and there are no set lists or
+suggested transitions. It answers questions about the collection and writes
+down the answer if you ask; the mixing is yours.
 
 **Schema 3.0.0 through 3.0.2 only.** Older and newer libraries are listed with
 their version and reported as unsupported rather than read on a guess.

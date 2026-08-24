@@ -1,5 +1,5 @@
 // src/playlists.ts
-import { err, isEngineError, type EngineError } from "./errors.js";
+import { err, isEngineError, type EngineError, type ErrorCode } from "./errors.js";
 import type { QueryProcess } from "./proc/query-client.js";
 
 /**
@@ -447,6 +447,29 @@ function describe(items: readonly PlaylistItem[]): string {
     : shown;
 }
 
+/**
+ * "No such playlist", for both branches resolvePlaylist can reach it from.
+ *
+ * The default `invalid_argument` code has no write-path contract on
+ * `detail` (see errors.ts), so the candidate listing lives there, exactly as
+ * before. `playlist_not_found` is different: a write tool's caller reads
+ * `detail` to learn whether the library changed (see errors.ts), and every
+ * other `playlist_not_found` -- raised inside store/write.ts once an id
+ * reaches it -- carries `detail: "not_committed"`. Nothing was attempted
+ * here either, so this must match, which leaves no room in `detail` for the
+ * candidate listing; it moves into `message` instead, so a human still sees
+ * it.
+ */
+function notFoundError(names: SelectorNames, reason: string, items: readonly PlaylistItem[]): EngineError {
+  const candidates = items.length
+    ? `Playlists (id -- path): ${describe(items)}`
+    : "This library has no playlists.";
+  if (names.notFound) {
+    return err(names.notFound, `${reason}. ${candidates}`, { detail: "not_committed" });
+  }
+  return err("invalid_argument", reason, { detail: candidates });
+}
+
 export interface PlaylistSelector {
   id?: number;
   name?: string;
@@ -456,6 +479,16 @@ export interface PlaylistSelector {
 export interface SelectorNames {
   id: string;
   name: string;
+  /**
+   * The code for "this library has no such playlist", when the caller has a
+   * more accurate one than the default `invalid_argument`. The write tools
+   * pass `playlist_not_found`, which their own store functions already
+   * return for an id that reaches them -- without this, that code was
+   * unreachable through MCP, because resolution runs first and every miss
+   * came back as invalid_argument. Ambiguity is never reported through this:
+   * a name matching several playlists really is a problem with the argument.
+   */
+  notFound?: ErrorCode;
 }
 
 export interface ResolvedPlaylist {
@@ -472,10 +505,14 @@ export interface ResolvedPlaylist {
  * whole function exists to prevent. The error names every candidate with its
  * id and its full path, so the retry is a copy-paste rather than a guess.
  *
- * Deliberately reuses `invalid_argument` rather than adding an error code:
- * the taxonomy is closed (see errors.ts), and "the playlist you named is not
- * in this library" is a problem with the argument, reported the same way an
- * unknown field name is -- with the recognised values in `detail`.
+ * Reuses `invalid_argument` by default rather than adding an error code: the
+ * taxonomy is closed (see errors.ts), and for a reader "the playlist you
+ * named is not in this library" is a problem with the argument, reported the
+ * same way an unknown field name is -- with the recognised values in
+ * `detail`. A caller that already owns a more accurate code for that one
+ * case passes it as `names.notFound`; the write tools do, so their documented
+ * `playlist_not_found` is what a client actually sees. Ambiguity is never
+ * reported through it.
  */
 export async function resolvePlaylist(
   qp: QueryProcess,
@@ -501,11 +538,7 @@ export async function resolvePlaylist(
   if (hasId) {
     const found = tree.items.find((i) => i.id === sel.id);
     if (!found) {
-      return err("invalid_argument", `No playlist with ${names.id} ${sel.id} in this library`, {
-        detail: tree.items.length
-          ? `Playlists (id -- path): ${describe(tree.items)}`
-          : "This library has no playlists.",
-      });
+      return notFoundError(names, `No playlist with ${names.id} ${sel.id} in this library`, tree.items);
     }
     return { playlist: found, warnings: tree.warnings };
   }
@@ -513,11 +546,7 @@ export async function resolvePlaylist(
   const matches = findPlaylistByName(tree.items, sel.name!);
   if (matches.length === 1) return { playlist: matches[0]!, warnings: tree.warnings };
   if (matches.length === 0) {
-    return err("invalid_argument", `No playlist named "${sel.name}" in this library`, {
-      detail: tree.items.length
-        ? `Playlists (id -- path): ${describe(tree.items)}`
-        : "This library has no playlists.",
-    });
+    return notFoundError(names, `No playlist named "${sel.name}" in this library`, tree.items);
   }
   return err("invalid_argument", `"${sel.name}" names ${matches.length} playlists in this library`, {
     detail:

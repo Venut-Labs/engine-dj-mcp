@@ -27,11 +27,34 @@ import { auditLibrary, AuditInput, AUDIT_CHECKS } from "./tools/audit.js";
 import { runSql, RunSqlInput } from "./tools/sql.js";
 import { listLibraries, type LibraryEntry } from "./tools/libraries.js";
 import { refreshIndex } from "./tools/refresh.js";
-import { CreatePlaylistInput, runCreatePlaylist } from "./tools/write-playlist.js";
+import {
+  CreatePlaylistInput,
+  runCreatePlaylist,
+  AddTracksToPlaylistInput,
+  runAddTracksToPlaylist,
+  RemoveTracksFromPlaylistInput,
+  runRemoveTracksFromPlaylist,
+  ReorderPlaylistInput,
+  runReorderPlaylist,
+} from "./tools/write-playlist.js";
 import { err, isEngineError, libraryNeedsRecovery, type EngineError } from "./errors.js";
 
 const RO = { readOnlyHint: true, destructiveHint: false, idempotentHint: true } as const;
+/**
+ * A write that only ever *adds*. `destructiveHint: false` is a claim with a
+ * defined meaning in MCP -- "this tool performs only additive updates" -- and
+ * clients use it to decide whether to confirm with the user first. True of
+ * create_playlist (a new playlist, nothing else touched) and of
+ * add_tracks_to_playlist (new entries, existing ones left where they are).
+ */
 const RW = { readOnlyHint: false, destructiveHint: false, idempotentHint: false } as const;
+/**
+ * A write that can destroy or reorganise what is already there:
+ * remove_tracks_from_playlist deletes entries, reorder_playlist rewrites the
+ * order of a list a DJ may be playing from live. Advertising either as
+ * additive told a client it need not ask before calling.
+ */
+const RW_DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: false } as const;
 
 /**
  * name/version reported to every client on initialize. Read from
@@ -549,7 +572,9 @@ export async function createServer(
           "write of this session; it is a recovery route for a damaged library, NOT an undo. " +
           "Restoring it reverts the entire library to that moment, discarding everything " +
           "Engine DJ has written since (play counts, imports, cue and beatgrid edits). " +
-          "No existing playlist or entry is ever modified; this only adds a new one. " +
+          "No existing playlist is renamed, reordered, emptied or deleted, and no track, cue or " +
+          "beatgrid is touched. The one existing row that moves is the previous last playlist's " +
+          "link, and Engine's own insert trigger is what moves it. " +
           "Fails with playlist_exists if a top-level playlist already has that title, and " +
           "with library_busy if Engine DJ or a player is holding a conflicting lock on the " +
           "library right then -- nothing is written in that case, so retry rather than " +
@@ -571,6 +596,125 @@ export async function createServer(
             args as any,
             opts.backupBaseDir ?? join(homedir(), ".engine-dj-mcp", "backups"),
           ),
+        );
+      },
+    );
+
+    const backupDirFor = () => opts.backupBaseDir ?? join(homedir(), ".engine-dj-mcp", "backups");
+
+    server.registerTool(
+      "add_tracks_to_playlist",
+      {
+        title: "Add tracks to a playlist",
+        description:
+          "Add one or more tracks to an EXISTING playlist -- this edits that playlist's " +
+          "contents, it does NOT create a new one (use create_playlist for that). Name the " +
+          "playlist with playlist_id or playlist_name, exactly one of the two, resolved the " +
+          "same way get_playlist_tracks does: a name matching more than one playlist in this " +
+          "library is refused, listing every candidate's id and full path, rather than guessed " +
+          "at. track_ids are ids from search_tracks or get_tracks; a track already in the " +
+          "playlist is refused as duplicate_track, since Engine allows a track in a playlist " +
+          "only once. at chooses where the new tracks land, using the playlist's current " +
+          "1-based positions (the same numbering get_playlist_tracks reports): \"start\", " +
+          "\"end\" (the default), or { after_position: n }. If this playlist's entry chain is " +
+          "already damaged, the write is refused outright rather than repaired -- nothing is " +
+          "added, and the error names what is broken. " +
+          "On success, the result's `undo` is the exact remove_tracks_from_playlist call that " +
+          "reverses this edit -- the positions the new tracks landed at, plus expect_track_ids " +
+          "naming the tracks that landed there, so a list someone changed in the meantime is " +
+          "refused rather than having the wrong rows removed -- and `undo_complete` is true. " +
+          "Call it to undo " +
+          "rather than restoring backup_path, which reverts the WHOLE library to before this " +
+          "session's first write, discarding every play count, import, cue and beatgrid change " +
+          "Engine DJ has recorded since -- not just this one edit. backup_path is only a " +
+          "last-resort recovery route for a damaged library, never an undo. " +
+          LIBRARY_SELECTION_NOTE,
+        inputSchema: { ...AddTracksToPlaylistInput.shape, library: LibraryArg },
+        annotations: RW,
+      },
+      async (args) => {
+        const state = await acquire(args.library);
+        if (isEngineError(state)) return reply(state);
+        return reply(
+          await runAddTracksToPlaylist(state.qp, state.lib.path, state.lib.uuid, args as any, backupDirFor()),
+        );
+      },
+    );
+
+    server.registerTool(
+      "remove_tracks_from_playlist",
+      {
+        title: "Remove tracks from a playlist",
+        description:
+          "Remove one or more tracks from an EXISTING playlist by position -- this edits that " +
+          "playlist's contents; it never touches any other playlist. Name the playlist with " +
+          "playlist_id or playlist_name, exactly one of the two, resolved the same way " +
+          "get_playlist_tracks does (an ambiguous name is refused with every candidate listed, " +
+          "not guessed at). positions are the 1-based positions get_playlist_tracks reports " +
+          "for THIS playlist right now -- they include entries whose track is missing from the " +
+          "library (get_playlist_tracks marks those missing: true), and removing one of those " +
+          "is a legitimate way to clean up a hole -- but it is the one removal that cannot be " +
+          "undone: such an entry names no track id, so no add_tracks_to_playlist call can put " +
+          "it back, and the result says so with undo_complete: false plus an undo_note naming " +
+          "those positions. expect_track_ids is optional and, when " +
+          "given, must have one entry per position: it verifies each named position still " +
+          "holds the track expected before anything is removed, refusing the whole call " +
+          "otherwise; null there means \"this position should hold an entry whose track is " +
+          "missing\", not \"no expectation\". If this playlist's entry chain is already " +
+          "damaged, the write is refused outright rather than repaired. " +
+          "On success, the result's `undo` is a SEQUENCE of add_tracks_to_playlist calls, one " +
+          "per removed track THAT CAN BE RESTORED -- run them IN THE ORDER GIVEN, never in " +
+          "parallel and never " +
+          "reversed: each step's target position is computed against the list as it stands " +
+          "after the previous step has already run, so firing them out of order or " +
+          "concurrently puts tracks back in the wrong places. Check `undo_complete`: false " +
+          "means one or more removed entries had no track to name and are gone for good -- " +
+          "`undo_note` says which positions, and the remaining steps still restore everything " +
+          "else. Preferred over restoring " +
+          "backup_path, which reverts the WHOLE library to before this session's first write, " +
+          "discarding everything Engine DJ has recorded since -- not just this edit. " +
+          LIBRARY_SELECTION_NOTE,
+        inputSchema: { ...RemoveTracksFromPlaylistInput.shape, library: LibraryArg },
+        annotations: RW_DESTRUCTIVE,
+      },
+      async (args) => {
+        const state = await acquire(args.library);
+        if (isEngineError(state)) return reply(state);
+        return reply(
+          await runRemoveTracksFromPlaylist(state.qp, state.lib.path, state.lib.uuid, args as any, backupDirFor()),
+        );
+      },
+    );
+
+    server.registerTool(
+      "reorder_playlist",
+      {
+        title: "Reorder a playlist",
+        description:
+          "Reorder an EXISTING playlist's tracks -- this changes the order of that playlist's " +
+          "existing entries; it adds nothing and removes nothing. Name the playlist with " +
+          "playlist_id or playlist_name, exactly one of the two, resolved the same way " +
+          "get_playlist_tracks does (an ambiguous name is refused with every candidate listed, " +
+          "not guessed at). order must be a full permutation of 1..n, n being the playlist's " +
+          "current entry count: order[i] names the CURRENT 1-based position (from " +
+          "get_playlist_tracks) of the track that should end up at position i + 1. A partial " +
+          "'move x to y' instruction is not accepted -- name every position, including ones " +
+          "that do not move. If this playlist's entry chain is already damaged, the write is " +
+          "refused outright rather than repaired. " +
+          "On success, the result's `undo` is the exact inverse permutation, as a single " +
+          "reorder_playlist call, and `undo_complete` is true; prefer it over restoring " +
+          "backup_path, which reverts the " +
+          "WHOLE library to before this session's first write, discarding everything Engine DJ " +
+          "has recorded since -- not just this reorder. " +
+          LIBRARY_SELECTION_NOTE,
+        inputSchema: { ...ReorderPlaylistInput.shape, library: LibraryArg },
+        annotations: RW_DESTRUCTIVE,
+      },
+      async (args) => {
+        const state = await acquire(args.library);
+        if (isEngineError(state)) return reply(state);
+        return reply(
+          await runReorderPlaylist(state.qp, state.lib.path, state.lib.uuid, args as any, backupDirFor()),
         );
       },
     );
