@@ -42,6 +42,51 @@ function lib() {
   return { dir, dbPath };
 }
 
+/**
+ * Two playlists, so a test can prove `playlist_name` resolves against the
+ * one actually named, not a `playlist_id ?? 1` that would be indistinguishable
+ * from real resolution against `lib()`'s single-playlist fixture. "Second"
+ * carries three entries, enough for a reorder to be meaningful too.
+ */
+function libTwo() {
+  const dir = mkdtempSync(join(tmpdir(), "wt-"));
+  const dbPath = makeLibrary(dir, { tracks: 8, uuid: "tool-uuid" });
+  addPlaylists(dbPath, [
+    { id: 1, title: "Old", nextListId: 2, entries: [{ id: 1, trackId: 1, next: 0 }] },
+    {
+      id: 2,
+      title: "Second",
+      nextListId: 0,
+      entries: [
+        { id: 2, trackId: 2, next: 3 },
+        { id: 3, trackId: 3, next: 4 },
+        { id: 4, trackId: 4, next: 0 },
+      ],
+    },
+  ]);
+  return { dir, dbPath };
+}
+
+/** Entry chain of one playlist, head to tail, as track ids. */
+function trackOrder(dbPath: string, listId: number): number[] {
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  const rows = db
+    .prepare("SELECT id, trackId, nextEntityId FROM PlaylistEntity WHERE listId = ?")
+    .all(listId) as any[];
+  db.close();
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const targets = new Set(rows.map((r) => r.nextEntityId));
+  let cur = rows.find((r) => !targets.has(r.id));
+  const out: number[] = [];
+  const seen = new Set<number>();
+  while (cur && !seen.has(cur.id)) {
+    seen.add(cur.id);
+    out.push(cur.trackId);
+    cur = byId.get(cur.nextEntityId);
+  }
+  return out;
+}
+
 describe("create_playlist tool", () => {
   it("is absent unless the server was started with writes enabled", async () => {
     const { dir } = lib();
@@ -142,6 +187,61 @@ describe("playlist edit tools", () => {
     const db = new DatabaseSync(dbPath, { readOnly: true });
     expect((db.prepare("SELECT COUNT(*) c FROM PlaylistEntity WHERE listId = 1").get() as any).c).toBe(1);
     db.close();
+    await client.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // Task 6's review left this uncovered: reorder_playlist was checked only
+  // for presence in tools/list, never actually called through the MCP
+  // layer. A runReorderPlaylist that always threw, or silently did nothing,
+  // would have passed everything else in this file.
+  it("reorders a playlist end to end, and its undo restores the original order", async () => {
+    const { dir, dbPath } = libTwo();
+    const { client } = await connectedClient([dir], join(dir, "sc"), {
+      allowWrites: true,
+      backupBaseDir: join(dir, "b"),
+    });
+
+    expect(trackOrder(dbPath, 2)).toEqual([2, 3, 4]);
+
+    const res: any = await client.callTool({
+      name: "reorder_playlist",
+      arguments: { playlist_id: 2, order: [3, 1, 2] },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(trackOrder(dbPath, 2)).toEqual([4, 2, 3]);
+
+    const undo = res.structuredContent.undo[0];
+    expect(undo.tool).toBe("reorder_playlist");
+    const back: any = await client.callTool({ name: undo.tool, arguments: undo.arguments });
+    expect(back.isError).toBeFalsy();
+    expect(trackOrder(dbPath, 2)).toEqual([2, 3, 4]);
+
+    await client.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // The other tests in this file resolve playlist_name against libraries
+  // holding exactly one playlist, so a resolveListId that ignored
+  // playlist_name entirely and used `playlist_id ?? 1` would be
+  // indistinguishable from real name resolution. This fixture holds two.
+  it("resolves playlist_name against the playlist actually named, not playlist_id ?? 1", async () => {
+    const { dir, dbPath } = libTwo();
+    const { client } = await connectedClient([dir], join(dir, "sc"), {
+      allowWrites: true,
+      backupBaseDir: join(dir, "b"),
+    });
+
+    const res: any = await client.callTool({
+      name: "add_tracks_to_playlist",
+      arguments: { playlist_name: "Second", track_ids: [5], at: "end" },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(res.structuredContent.playlist_id).toBe(2);
+    expect(trackOrder(dbPath, 2)).toEqual([2, 3, 4, 5]);
+    // "Old" (id 1), not named by this call, must be untouched.
+    expect(trackOrder(dbPath, 1)).toEqual([1]);
+
     await client.close();
     rmSync(dir, { recursive: true, force: true });
   });
