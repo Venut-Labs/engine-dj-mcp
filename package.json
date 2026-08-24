@@ -1,6 +1,6 @@
 {
   "name": "engine-dj-mcp",
-  "version": "0.11.3",
+  "version": "0.12.0",
   "description": "MCP server for an Engine DJ library: search and audit it, read cues and beatgrids, and build playlists when you ask. Not affiliated with inMusic or Denon DJ.",
   "keywords": [
     "mcp",
