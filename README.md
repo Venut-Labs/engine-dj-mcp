@@ -245,6 +245,12 @@ playlist's contents, it does not create a new one (`create_playlist` does
 that). If the playlist's entry chain is already damaged, the write is
 refused outright rather than repaired, and nothing is added.
 
+A playlist that is a **folder** (`is_folder: true` — it has child lists) is
+edited like any other: Engine has no separate folder type, a folder can hold
+entries of its own, and all three edit tools add to, remove from and reorder
+those entries without complaint. The lists inside it are untouched either
+way.
+
 | Argument | What it does |
 | --- | --- |
 | `playlist_id` / `playlist_name` | Exactly one of the two, resolved the same way `get_playlist_tracks` does: a name matching more than one playlist is refused with every candidate's id and full path listed, not guessed at. |
@@ -252,12 +258,15 @@ refused outright rather than repaired, and nothing is added.
 | `at` | Where the new tracks land, against the playlist's current 1-based positions (the same numbering `get_playlist_tracks` reports): `"start"`, `"end"` (the default), or `{ after_position: n }`. |
 
 The result carries `playlist_id`, `tracks_added`, `positions` — where the
-new tracks landed — `undo` and `backup_path`. `undo` is the exact
-`remove_tracks_from_playlist` call that reverses this edit; call it to undo
-rather than restoring `backup_path` — see
-[Restoring a snapshot](#restoring-a-snapshot). Refusals add
-`playlist_not_found` and `invalid_position` to `create_playlist`'s own list;
-`detail` works the same way.
+new tracks landed — `undo`, `undo_complete` (always `true` here) and
+`backup_path`. `undo` is the exact `remove_tracks_from_playlist` call that
+reverses this edit: the positions the tracks landed at, plus
+`expect_track_ids` naming the tracks that landed there, so a playlist
+something else changed in the meantime is refused rather than having the
+wrong rows removed. Call it to undo rather than restoring `backup_path` —
+see [Restoring a snapshot](#restoring-a-snapshot). Refusals add
+`playlist_not_found`, `playlist_chain_damaged` and `invalid_position` to
+`create_playlist`'s own list; `detail` works the same way.
 
 ### `remove_tracks_from_playlist`
 
@@ -269,19 +278,37 @@ repaired.
 | Argument | What it does |
 | --- | --- |
 | `playlist_id` / `playlist_name` | Exactly one of the two, resolved the same way `get_playlist_tracks` does. |
-| `positions` | 1-based positions `get_playlist_tracks` reports for this playlist right now. Includes entries whose track is missing from the library (`missing: true`) — removing one is a legitimate way to clean up a hole. |
+| `positions` | 1-based positions `get_playlist_tracks` reports for this playlist right now. Includes entries whose track is missing from the library (`missing: true`) — removing one is a legitimate way to clean up a hole, and the one removal `undo` cannot reverse (see below). |
 | `expect_track_ids` | Optional, one entry per position: verifies each named position still holds the track expected before anything is removed, refusing the whole call otherwise. `null` means "this position should hold an entry whose track is missing", not "no expectation". |
 
 The result carries `playlist_id`, `tracks_removed`, `removed` — each
-position's `track_id`, `null` for a missing one — `undo` and `backup_path`.
-`undo` is a **sequence** of `add_tracks_to_playlist` calls, one per removed
-track. Run them in the order given, never in parallel and never reversed —
-each step's target position is computed against the list as it stands after
-the previous step has already run, so firing them out of order puts tracks
-back in the wrong places. Preferred over restoring `backup_path` for the
-same reason as above. Refusals: `playlist_not_found`, `playlist_chain_damaged`,
-and `invalid_position` — for a repeated or out-of-range position, or one that
+position's `track_id`, `null` for a missing one — `undo`, `undo_complete` and
+`backup_path`. `undo` is a **sequence** of `add_tracks_to_playlist` calls,
+one per removed track that can be restored. Run them in the order given,
+never in parallel and never reversed — each step's target position is
+computed against the list as it stands after the previous step has already
+run, so firing them out of order puts tracks back in the wrong places.
+Preferred over restoring `backup_path` for the same reason as above.
+
+`undo_complete` is `false` when the removal included an entry whose track is
+missing from the library: that entry named a track this library does not
+have, so no `add_tracks_to_playlist` call can put it back, and an
+`undo_note` names those positions. The steps that are returned still run and
+still restore everything else; the missing entries are recoverable only from
+`backup_path`, which reverts the whole library.
+
+Refusals: `playlist_not_found`, `playlist_chain_damaged`, and
+`invalid_position` — for a repeated or out-of-range position, or one that
 does not hold what `expect_track_ids` expected.
+
+`playlist_chain_damaged` always means the same thing for all three edit
+tools: the playlist's entry chain was already broken **before** the edit,
+which is why the edit refused to touch it. If instead the check each edit
+runs on its own work disagrees — the chain did not read back as it was
+written — the transaction is rolled back and that comes back as
+`library_unreadable`, with `detail: "not_committed"`. Both leave the library
+exactly as it was; only the second one is this server saying it does not
+understand what the library just did.
 
 ### `reorder_playlist`
 
@@ -295,10 +322,15 @@ repaired.
 | `playlist_id` / `playlist_name` | Exactly one of the two, resolved the same way `get_playlist_tracks` does. |
 | `order` | A full permutation of `1..n`, `n` being the playlist's current entry count. `order[i]` names the *current* 1-based position (from `get_playlist_tracks`) of the track that should end up at position `i + 1`. A partial "move x to y" instruction is not accepted — name every position, including ones that do not move. |
 
-The result carries `playlist_id`, `undo` and `backup_path`. `undo` is the
-exact inverse permutation, as a single `reorder_playlist` call. Refusals:
-`playlist_not_found`, `playlist_chain_damaged`, and `invalid_position` if
-`order` is not a full permutation of the playlist's current positions.
+The result carries `playlist_id`, `undo`, `undo_complete` (always `true`
+here) and `backup_path`. `undo` is the exact inverse permutation, as a single
+`reorder_playlist` call. Refusals: `playlist_not_found`,
+`playlist_chain_damaged`, and `invalid_position` if `order` is not a full
+permutation of the playlist's current positions.
+
+Reordering to the order a playlist is already in is accepted and rewrites no
+entry: it still stamps the playlist's `lastEditTime`, and still costs this
+session's snapshot if nothing had been written yet.
 
 ## Resources
 
@@ -345,16 +377,28 @@ With the flag, four tools appear. `create_playlist` adds a new playlist and
 nothing else. `add_tracks_to_playlist`, `remove_tracks_from_playlist` and
 `reorder_playlist` go further: with the flag, an **existing** playlist can
 now be changed, not only created — its tracks added to, removed from, or put
-in a different order. Nothing outside the one named playlist's own entries
-is ever touched: no other playlist is renamed, emptied or deleted, and no
-track, cue or beatgrid is touched by any of the four. Every edit returns
-`undo` — the exact tool call that reverses it, expressed against the
-positions the edit itself produced. Replaying `undo` is the right way back
-from an edit; restoring `backup_path` is not, because it reverts the
-**whole library** to before this session's first write, discarding every
-play count, import, cue and beatgrid change Engine DJ has recorded since,
-along with the one edit you actually wanted undone. See
-[Restoring a snapshot](#restoring-a-snapshot).
+in a different order. What each one touches is the named playlist's own
+entries, plus exactly two rows elsewhere: that playlist's own row, whose
+`lastEditTime` every edit stamps so Engine sees the change, and — for
+`create_playlist` only — the previous last playlist's link, made by Engine's
+own insert trigger. No other playlist is renamed, emptied or deleted, and no
+track, cue or beatgrid is touched by any of the four.
+
+Every edit returns `undo` — the exact tool call that reverses it, expressed
+against the positions the edit itself produced — and `undo_complete`, saying
+whether replaying it puts the playlist back exactly as it was. Replaying
+`undo` is the right way back from an edit; restoring `backup_path` is not,
+because it reverts the **whole library** to before this session's first
+write, discarding every play count, import, cue and beatgrid change Engine
+DJ has recorded since, along with the one edit you actually wanted undone.
+See [Restoring a snapshot](#restoring-a-snapshot).
+
+There is exactly one edit `undo` cannot reverse, and it says so rather than
+pretending otherwise: removing an entry whose track is missing from the
+library (`missing: true`). Such an entry names a track this library does not
+have, so there is no track id to add back — the result comes back with
+`undo_complete: false` and an `undo_note` naming those positions, and the
+steps it does return still restore everything else.
 
 Before the first write of a session the database is snapshotted to
 `~/.engine-dj-mcp/backups/`, and every write of that session returns its
