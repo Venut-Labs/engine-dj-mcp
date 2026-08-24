@@ -4,8 +4,58 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { makeLibrary } from "./fixtures/gen-library.js";
-import { snapshotLibrary } from "../src/store/backup.js";
+import { snapshotLibrary, evictable } from "../src/store/backup.js";
 import { isEngineError } from "../src/errors.js";
+
+describe("evictable", () => {
+  const U = "u";
+  const names = (tag: string, stamps: string[], legacy: string[]) => [
+    ...stamps.map((x) => `${U}-${tag}-${x}.db`),
+    ...legacy.map((x) => `${U}-${x}.db`),
+  ];
+
+  it("orders by the stamp, not by the filename, so a low tag cannot evict the newest", () => {
+    // The defect this exists for. Sorting whole names compares a tag against
+    // a year at the same offset, and a tag is hex: "1e269292c523" < "2026",
+    // so with a low tag the newest snapshot sorted to the head of the list
+    // and was deleted -- the very file the caller had just been handed as
+    // its way back. It passed locally under tag "cf11e2d00f88" and failed in
+    // CI under "1e269292c523" on identical code, which is exactly how a bug
+    // that depends on a hash behaves.
+    // The mix is what exposes it: among names sharing one tag, sorting by
+    // name and sorting by stamp agree. It takes an untagged neighbour, whose
+    // name carries a year where the tagged one carries hex, to put them in
+    // conflict.
+    const tagged = Array.from({ length: 6 }, (_, i) => `2026-08-2${i}T00-00-00-000Z`);
+    const legacy = Array.from({ length: 6 }, (_, i) => `2020-01-0${i}T00-00-00-000Z`);
+    for (const tag of ["1e269292c523", "cf11e2d00f88"]) {
+      const out = evictable(names(tag, tagged, legacy), U, tag);
+      // Twelve files, ten kept: the two evicted are the oldest untagged ones,
+      // never the freshly written snapshot.
+      expect(out, tag).toEqual([`${U}-${legacy[0]}.db`, `${U}-${legacy[1]}.db`]);
+      expect(out, tag).not.toContain(`${U}-${tag}-${tagged[5]}.db`);
+    }
+  });
+
+  it("ages untagged names out first, whatever their stamp says", () => {
+    // They predate the tagged scheme, so they predate anything written since
+    // -- including an untagged file whose stamp reads later than a tagged
+    // one, which a clock change or a restored backup can produce.
+    const tag = "1e269292c523";
+    const tagged = Array.from({ length: 10 }, (_, i) => `2020-01-0${i}T00-00-00-000Z`);
+    const out = evictable(names(tag, tagged, ["2099-01-01T00-00-00-000Z"]), U, tag);
+    expect(out).toEqual([`${U}-2099-01-01T00-00-00-000Z.db`]);
+  });
+
+  it("keeps everything while the window is not full, and ignores other libraries", () => {
+    const out = evictable(
+      [...names("aa11", ["2026-01-01T00-00-00-000Z"], []), "other-uuid-bb22-2026-01-01T00-00-00-000Z.db", "notes.txt"],
+      U,
+      "aa11",
+    );
+    expect(out).toEqual([]);
+  });
+});
 
 describe("snapshotLibrary", () => {
   it("copies a readable library and the copy holds the same rows", async () => {

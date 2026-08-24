@@ -37,11 +37,66 @@ function stamp(): string {
   return `${iso}-${String(++counter).padStart(10, "0")}`;
 }
 
+/**
+ * The snapshots to delete, oldest first, from a directory listing.
+ *
+ * Two name shapes live here: the tagged `${uuid}-${tag}-${stamp}.db` written
+ * now, and the untagged `${uuid}-${stamp}.db` an earlier version wrote.
+ * Without the second, those sat outside every namespace and were never
+ * reclaimed -- up to KEEP full copies of a library, kept forever, on any
+ * upgrading user. Two libraries sharing a uuid is precisely why the tag
+ * exists, and an untagged file cannot say which of them it came from, so
+ * ageing them out under whichever library writes next is the only thing left
+ * to do with them.
+ *
+ * Ordering is by the stamp alone, never by the whole filename. Sorting the
+ * names as text compares a tag against a year at the same offset, and a tag
+ * is hex: `1e269292c523` sorts *before* `2026-...`, so a library whose path
+ * happens to hash to a tag starting 0 or 1 had its newest snapshot land at
+ * the head of the list and be deleted -- the file the caller had just been
+ * handed as its way back. Measured: it passed locally under the tag
+ * `cf11e2d00f88` and failed in CI under `1e269292c523`, same code.
+ *
+ * Untagged files sort before every tagged one regardless of stamp: they
+ * predate the tagged scheme, so they predate anything written since.
+ */
+export function evictable(names: string[], uuid: string, tag: string): string[] {
+  const tagged = `${uuid}-${tag}-`;
+  const legacy = new RegExp(`^${uuid}-(\\d{4}-.*)\\.db$`);
+  const mine: { name: string; old: boolean; stamp: string }[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".db")) continue;
+    if (name.startsWith(tagged)) {
+      mine.push({ name, old: false, stamp: name.slice(tagged.length, -3) });
+      continue;
+    }
+    const m = legacy.exec(name);
+    if (m) mine.push({ name, old: true, stamp: m[1]! });
+  }
+  mine.sort((a, b) => (a.old !== b.old ? (a.old ? -1 : 1) : a.stamp < b.stamp ? -1 : a.stamp > b.stamp ? 1 : 0));
+  return mine.slice(0, Math.max(0, mine.length - KEEP)).map((x) => x.name);
+}
+
 export async function snapshotLibrary(
   mdbPath: string,
   uuid: string,
   baseDir: string,
 ): Promise<string | EngineError> {
+  // node:sqlite stopped needing a flag in 22.13, which is where this
+  // project's floor used to sit -- but backup() only arrived in 22.16. On
+  // 22.13 through 22.15 the read path works perfectly and this one throws
+  // "backup is not a function", which is what CI reported on its very first
+  // run against the declared floor. `engines` now says 22.16, and npm only
+  // enforces that under engine-strict, so the check is here too: a version
+  // number a user can act on beats a TypeError from inside a dependency.
+  if (typeof backup !== "function") {
+    return err(
+      "library_unreadable",
+      `This Node cannot snapshot a library before writing to it: node:sqlite gained backup() in ` +
+        `22.16.0 and this is ${process.version}. Upgrade Node, or run without --allow-writes.`,
+    );
+  }
+
   let src: DatabaseSync | undefined;
   try {
     mkdirSync(baseDir, { recursive: true });
@@ -59,21 +114,8 @@ export async function snapshotLibrary(
     src.close();
     src = undefined;
 
-    // Snapshots this library owns: the tagged shape above, plus the untagged
-    // `${uuid}-${stamp}.db` an earlier version wrote. Without the second,
-    // those sat outside every namespace and were never reclaimed -- up to
-    // KEEP full copies of a library, kept forever, on any upgrading user.
-    // They predate the tag and therefore predate everything written since,
-    // which is why folding them into one window evicts them first. Two
-    // libraries sharing a uuid is precisely why the tag exists, and an
-    // untagged file cannot say which of them it came from -- ageing them out
-    // under whichever library writes next is the only thing left to do.
-    const legacy = new RegExp(`^${uuid}-\\d{4}-`);
-    const mine = readdirSync(baseDir)
-      .filter((f) => f.endsWith(".db") && (f.startsWith(prefix) || legacy.test(f)))
-      .sort();
-    for (const old of mine.slice(0, Math.max(0, mine.length - KEEP))) {
-      rmSync(join(baseDir, old), { force: true });
+    for (const stale of evictable(readdirSync(baseDir), uuid, libraryTag(mdbPath))) {
+      rmSync(join(baseDir, stale), { force: true });
     }
     return dest;
   } catch (e) {

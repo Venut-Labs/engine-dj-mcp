@@ -59,7 +59,9 @@ the configuration you are reading:
 }
 ```
 
-**Requirements:** Node.js 22.13 or newer (for the unflagged `node:sqlite`;
+**Requirements:** Node.js 22.16 or newer (`node:sqlite` stopped needing a
+flag in 22.13, but the pre-write snapshot uses its `backup()`, added in
+22.16;
 there are no native dependencies), and an Engine DJ library at schema 3.0.0
 through 3.0.2 — Engine DJ 4.5 and 5.x.
 

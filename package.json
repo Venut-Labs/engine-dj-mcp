@@ -27,7 +27,7 @@
   },
   "type": "module",
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=22.16.0"
   },
   "bin": {
     "engine-dj-mcp": "dist/index.js"
