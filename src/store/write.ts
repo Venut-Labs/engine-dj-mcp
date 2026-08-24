@@ -11,7 +11,7 @@
 // verify, commit, check, close.
 import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { err, libraryNeedsRecovery, type EngineError } from "../errors.js";
+import { err, isEngineError, libraryNeedsRecovery, type EngineError } from "../errors.js";
 import { snapshotLibrary } from "./backup.js";
 import { hasHotJournal } from "./connections.js";
 
@@ -288,6 +288,17 @@ export function checkChain(rows: { id: number; next: number }[]): ChainCheck {
 }
 
 /**
+ * `checkChain(readChain(db, listId))` in one call. Every point in an edit
+ * that needs to know whether a playlist's entry chain is currently sound --
+ * the pre-check, the transaction right after BEGIN IMMEDIATE, and the
+ * post-write readback -- asks the same question of the same two functions,
+ * so it asks it through the same name.
+ */
+function gateChain(db: DatabaseSync, listId: number): ChainCheck {
+  return checkChain(readChain(db, listId));
+}
+
+/**
  * Roll back, swallowing a failure of the rollback itself.
  *
  * Every caller is already returning a specific error -- the chain did not read
@@ -456,6 +467,81 @@ function classifyWriteFailure(
   );
 }
 
+/**
+ * Owns everything past the read-only pre-check that every write op in this
+ * module does identically: snapshot, open, `PRAGMA foreign_keys = ON`,
+ * `BEGIN IMMEDIATE`, commit, verify, and classify whatever went wrong.
+ * `body` does the one thing that differs between ops -- the INSERTs and
+ * UPDATEs specific to what this write is -- against the open `db` it is
+ * handed, and returns either the result to hand back (minus `backup_path`,
+ * which this function fills in once it knows COMMIT succeeded) or an
+ * `EngineError` it has *already rolled back* before returning, exactly as
+ * a `catch` block here would.
+ *
+ * `isEngineError`, not a second return channel, is what tells `body`'s
+ * success value apart from its failure one: this module already exports
+ * that check for callers, so reusing it here means a body never has to wrap
+ * its result to disambiguate the two.
+ */
+async function withWriteTransaction<T extends object>(
+  mdbPath: string,
+  uuid: string,
+  subject: string,
+  opts: { backupDir: string },
+  body: (db: DatabaseSync) => T | EngineError,
+): Promise<(T & { backup_path: string }) | EngineError> {
+  // Snapshot here, before the write connection is even opened, not after
+  // BEGIN IMMEDIATE. Taking it with RESERVED held meant a full-database copy
+  // -- tens of seconds on a multi-gigabyte USB library -- ran while every
+  // write Engine DJ attempted failed with SQLITE_BUSY, and a second
+  // concurrent call in this process (the MCP SDK dispatches concurrently)
+  // was told the library was locked by Engine DJ when it was this server
+  // holding the lock. Snapshotting before BEGIN IMMEDIATE used to mean a
+  // call that turned out to be busy spent a slot on every retry -- ten busy
+  // retries, ten full copies, evicting every genuine pre-write snapshot from
+  // backup.ts's KEEP window. The per-session memo (sessionSnapshot, above)
+  // is what makes moving it here safe: a session that only ever gets
+  // library_busy now leaves exactly one snapshot, not one per retry, so
+  // nothing is evicted. The hot-journal check and the read-only pre-check
+  // that ran before this was ever called still run first, so a call doomed
+  // by either of those still never copies anything.
+  const snapshot = await sessionSnapshot(mdbPath, uuid, opts.backupDir);
+  // snapshotLibrary sets no detail of its own (src/store/backup.ts); this is
+  // still a pre-commit failure, so the discriminator applies here too.
+  if (typeof snapshot !== "string") return { ...snapshot, detail: NOT_COMMITTED };
+  const backupPath = snapshot;
+
+  let db: DatabaseSync | undefined;
+  let open = false;
+  let commit: CommitState = "not yet";
+  try {
+    db = new DatabaseSync(mdbPath);
+    open = true;
+    db.exec("PRAGMA foreign_keys = ON");
+    db.exec("BEGIN IMMEDIATE");
+
+    const result = body(db);
+    if (isEngineError(result)) return result;
+
+    commit = "maybe";
+    db.exec("COMMIT");
+    commit = "yes";
+
+    const verifyErr = verifyAfterCommit(db, subject, backupPath);
+    if (verifyErr) return verifyErr;
+
+    return { ...result, backup_path: backupPath };
+  } catch (e) {
+    return classifyWriteFailure(e, commit, subject, mdbPath, backupPath, db, open);
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* already closed */
+    }
+  }
+}
+
 export async function createPlaylist(
   mdbPath: string,
   uuid: string,
@@ -513,37 +599,9 @@ export async function createPlaylist(
     }
   }
   if (!Array.isArray(refs)) return refs;
+  const trackRefs = refs;
 
-  // Snapshot here, before the write connection is even opened, not after
-  // BEGIN IMMEDIATE. Taking it with RESERVED held meant a full-database copy
-  // -- tens of seconds on a multi-gigabyte USB library -- ran while every
-  // write Engine DJ attempted failed with SQLITE_BUSY, and a second
-  // concurrent create_playlist call in this process (the MCP SDK dispatches
-  // concurrently) was told the library was locked by Engine DJ when it was
-  // this server holding the lock. Snapshotting before BEGIN IMMEDIATE used
-  // to mean a call that turned out to be busy spent a slot on every retry --
-  // ten busy retries, ten full copies, evicting every genuine pre-write
-  // snapshot from backup.ts's KEEP window. The per-session memo
-  // (sessionSnapshot, above) is what makes moving it here safe: a session
-  // that only ever gets library_busy now leaves exactly one snapshot, not
-  // one per retry, so nothing is evicted. The hot-journal check and the
-  // read-only pre-check above still run first, so a call doomed by either of
-  // those still never copies anything.
-  const snapshot = await sessionSnapshot(mdbPath, uuid, opts.backupDir);
-  // snapshotLibrary sets no detail of its own (src/store/backup.ts); this is
-  // still a pre-commit failure, so the discriminator applies here too.
-  if (typeof snapshot !== "string") return { ...snapshot, detail: NOT_COMMITTED };
-  const backupPath = snapshot;
-
-  let db: DatabaseSync | undefined;
-  let open = false;
-  let commit: CommitState = "not yet";
-  try {
-    db = new DatabaseSync(mdbPath);
-    open = true;
-    db.exec("PRAGMA foreign_keys = ON");
-    db.exec("BEGIN IMMEDIATE");
-
+  return withWriteTransaction(mdbPath, uuid, title, opts, (db) => {
     // nextListId = 0 appends: Engine's own insert triggers move the tail
     // marker off the previous last row and point it at this one.
     const ins = db
@@ -565,7 +623,7 @@ export async function createPlaylist(
     );
     const link = db.prepare("UPDATE PlaylistEntity SET nextEntityId = ? WHERE id = ?");
     const ids: number[] = [];
-    for (const ref of refs) {
+    for (const ref of trackRefs) {
       ids.push(Number(insEntity.run(listId, ref.trackId, ref.uuid).lastInsertRowid));
     }
     for (let i = 0; i + 1 < ids.length; i++) link.run(ids[i + 1], ids[i]);
@@ -582,7 +640,7 @@ export async function createPlaylist(
     // PlaylistEntity row left behind by some earlier deleted playlist would
     // fail every create_playlist call on that library forever, blaming this
     // write for damage that predates it.)
-    if (ids.length > 0 && !sameOrder(walkFrom(db, listId, ids[0]!), refs)) {
+    if (ids.length > 0 && !sameOrder(walkFrom(db, listId, ids[0]!), trackRefs)) {
       rollback(db);
       return err(
         "library_unreadable",
@@ -596,23 +654,39 @@ export async function createPlaylist(
     // than one tail is not a state this transaction can produce. Restating
     // that as a runtime check would be a tautology, not a safety net.
 
-    commit = "maybe";
-    db.exec("COMMIT");
-    commit = "yes";
+    return { playlist_id: listId, title, tracks_added: trackRefs.length };
+  });
+}
 
-    const verifyErr = verifyAfterCommit(db, title, backupPath);
-    if (verifyErr) return verifyErr;
+/** Where `addTracksToPlaylist`'s `at` can put the new run. */
+export type InsertAt = "end" | "start" | { after_position: number };
 
-    return { playlist_id: listId, title, tracks_added: refs.length, backup_path: backupPath };
-  } catch (e) {
-    return classifyWriteFailure(e, commit, title, mdbPath, backupPath, db, open);
-  } finally {
-    try {
-      db?.close();
-    } catch {
-      /* already closed */
-    }
+/**
+ * Resolves `at` against a chain's *current* order into a 0-based insert
+ * index, or `invalid_position` if `after_position` names a position that
+ * order does not have.
+ *
+ * Called twice by addTracksToPlaylist, against two different reads of the
+ * same chain, deliberately: once in the pre-check, to fail fast, and again
+ * inside the transaction against the chain BEGIN IMMEDIATE just locked. The
+ * second call is the one that matters -- the pre-check's `order` can be
+ * stale by the time the lock is held, and reusing its answer instead of
+ * recomputing this one would mean a playlist that shrank in between turns a
+ * clean invalid_position refusal into `gate.order[insertAt - 1]` reading
+ * past the end of the array.
+ */
+function resolveInsertAt(order: number[], at: InsertAt, listId: number): number | EngineError {
+  if (at === "start") return 0;
+  if (at === "end") return order.length;
+  const p = at.after_position;
+  if (!Number.isInteger(p) || p < 1 || p > order.length) {
+    return err(
+      "invalid_position",
+      `Playlist ${listId} has ${order.length} entries; after_position must be between 1 and ${order.length}.`,
+      { detail: NOT_COMMITTED },
+    );
   }
+  return p;
 }
 
 /**
@@ -621,21 +695,21 @@ export async function createPlaylist(
  *
  * Shares its skeleton with createPlaylist: a read-only pre-check first (cheap
  * enough to rule out the common failure modes without ever opening the
- * library for writing), then the per-session snapshot, then one BEGIN
- * IMMEDIATE. Where createPlaylist builds a chain from nothing, this extends
- * one that already exists, so it also has to confirm that chain is sound
- * before it touches it -- twice. The pre-check reads and gates it once, both
- * to fail fast (and skip the snapshot) for a playlist that cannot be edited
- * at all, and because validating `at` needs to know how many entries the
- * playlist currently has. The transaction reads and gates it again after
- * BEGIN IMMEDIATE, because that lock is the first moment nothing else can
- * change the chain -- gating on the pre-check's read alone would be gating
- * on one that could already be stale.
+ * library for writing), then withWriteTransaction. Where createPlaylist
+ * builds a chain from nothing, this extends one that already exists, so it
+ * also has to confirm that chain is sound before it touches it -- twice. The
+ * pre-check gates it once, both to fail fast (and skip the snapshot) for a
+ * playlist that cannot be edited at all, and because validating `at` needs
+ * to know how many entries the playlist currently has. The transaction gates
+ * it again after BEGIN IMMEDIATE, because that lock is the first moment
+ * nothing else can change the chain -- gating on the pre-check's read alone,
+ * or reusing the insert position it computed, would be trusting one that
+ * could already be stale.
  */
 export async function addTracksToPlaylist(
   mdbPath: string,
   uuid: string,
-  input: { listId: number; trackIds: number[]; at: "end" | "start" | { after_position: number } },
+  input: { listId: number; trackIds: number[]; at: InsertAt },
   opts: { backupDir: string },
 ): Promise<EditResult | EngineError> {
   const { listId, trackIds, at } = input;
@@ -644,12 +718,15 @@ export async function addTracksToPlaylist(
   // classifyWriteFailure's shared messages.
   const subject = `playlist ${listId}`;
 
+  if (trackIds.length === 0) {
+    return err("invalid_argument", "Name at least one track to add.", { detail: NOT_COMMITTED });
+  }
+
   // See createPlaylist for why this has to be checked before anything else
   // even tries to open the file.
   if (hasHotJournal(mdbPath)) return { ...libraryNeedsRecovery(), detail: NOT_COMMITTED };
 
   let refs: OriginRef[] | EngineError;
-  let insertAt: number;
   {
     let precheck: DatabaseSync | undefined;
     try {
@@ -662,7 +739,7 @@ export async function addTracksToPlaylist(
         });
       }
 
-      const gate = checkChain(readChain(precheck, listId));
+      const gate = gateChain(precheck, listId);
       if (!gate.ok) {
         return err("playlist_chain_damaged", `Playlist ${listId}: ${gate.reason}. Nothing was changed.`, {
           detail: NOT_COMMITTED,
@@ -672,15 +749,23 @@ export async function addTracksToPlaylist(
       refs = resolveOrigins(precheck, trackIds);
       if (!Array.isArray(refs)) return refs;
 
-      // UNIQUE (listId, databaseUuid, trackId) protects a pair, not a track:
-      // measured, the same trackId under a different databaseUuid inserts
-      // happily. So every existing entry is resolved back to a local track
-      // and compared against the request, rather than trusting the INSERT
-      // below to hit the constraint -- which it would miss for exactly the
-      // state a library is in right after a re-origination, where an entry's
-      // stored (databaseUuid, trackId) no longer matches the track's current
-      // origin. Not hypothetical: this reference library looked like that
-      // two days before this was written.
+      // UNIQUE (listId, databaseUuid, trackId) protects a pair, not a
+      // track, and this check is not stronger than that constraint: it
+      // resolves every existing entry back to a local track and compares
+      // against the request, which is exactly the constraint's own check,
+      // just run early. Its value is failing fast -- before the snapshot is
+      // copied and before a write transaction opens, with a message naming
+      // the track, rather than a UNIQUE-constraint violation surfacing from
+      // inside a transaction and getting mapped back to the same code.
+      //
+      // It cannot catch more than the constraint can. An entry whose stored
+      // (databaseUuid, trackId) no longer resolves to any local track --
+      // which is what a library looks like right after a re-origination
+      // moves a track's origin on without updating the entries that named
+      // its old one -- is not a case this check (or the constraint) can
+      // call a duplicate: nothing in the database still says that entry and
+      // the requested track are the same one. That is a property of the
+      // data, not a gap in the check.
       const existing = precheck
         .prepare("SELECT trackId, databaseUuid FROM PlaylistEntity WHERE listId = ?")
         .all(listId) as { trackId: number; databaseUuid: string }[];
@@ -699,19 +784,11 @@ export async function addTracksToPlaylist(
         }
       }
 
-      if (at === "start") insertAt = 0;
-      else if (at === "end") insertAt = gate.order.length;
-      else {
-        const p = at.after_position;
-        if (!Number.isInteger(p) || p < 1 || p > gate.order.length) {
-          return err(
-            "invalid_position",
-            `Playlist ${listId} has ${gate.order.length} entries; after_position must be between 1 and ${gate.order.length}.`,
-            { detail: NOT_COMMITTED },
-          );
-        }
-        insertAt = p;
-      }
+      // Discarded once it has done its job: only the pass/fail matters here
+      // (see resolveInsertAt's own comment for why the number itself is not
+      // carried across the lock).
+      const insertAt = resolveInsertAt(gate.order, at, listId);
+      if (isEngineError(insertAt)) return insertAt;
     } catch (e) {
       return mapWriteError(e, subject, mdbPath);
     } finally {
@@ -722,30 +799,26 @@ export async function addTracksToPlaylist(
       }
     }
   }
+  const trackRefs = refs;
 
-  // See createPlaylist for why this runs before the write connection opens.
-  const snapshot = await sessionSnapshot(mdbPath, uuid, opts.backupDir);
-  if (typeof snapshot !== "string") return { ...snapshot, detail: NOT_COMMITTED };
-  const backupPath = snapshot;
-
-  let db: DatabaseSync | undefined;
-  let open = false;
-  let commit: CommitState = "not yet";
-  try {
-    db = new DatabaseSync(mdbPath);
-    open = true;
-    db.exec("PRAGMA foreign_keys = ON");
-    db.exec("BEGIN IMMEDIATE");
-
+  return withWriteTransaction(mdbPath, uuid, subject, opts, (db) => {
     // The chain read in the pre-check is re-read here: BEGIN IMMEDIATE is
     // the first moment nothing else can change it, and gating on a chain
     // read before the lock would be gating on a stale one.
-    const gate = checkChain(readChain(db, listId));
+    const gate = gateChain(db, listId);
     if (!gate.ok) {
       rollback(db);
       return err("playlist_chain_damaged", `Playlist ${listId}: ${gate.reason}. Nothing was changed.`, {
         detail: NOT_COMMITTED,
       });
+    }
+
+    // Re-resolved against this read of the chain, not the pre-check's: see
+    // resolveInsertAt's comment.
+    const insertAt = resolveInsertAt(gate.order, at, listId);
+    if (isEngineError(insertAt)) {
+      rollback(db);
+      return insertAt;
     }
 
     // What the final chain should read back as: the existing entries' track
@@ -754,7 +827,7 @@ export async function addTracksToPlaylist(
     // id rather than by row count, so the readback check afterwards does not
     // itself depend on how the writes below number their new rows.
     const existingRefs = gate.order.length > 0 ? walkFrom(db, listId, gate.order[0]!) : [];
-    const expected = [...existingRefs.slice(0, insertAt), ...refs, ...existingRefs.slice(insertAt)];
+    const expected = [...existingRefs.slice(0, insertAt), ...trackRefs, ...existingRefs.slice(insertAt)];
 
     // Insert one row at a time, linking by the id each insert actually
     // returned -- the same reason createPlaylist does: SQLite assigning
@@ -764,7 +837,7 @@ export async function addTracksToPlaylist(
        VALUES (?, ?, ?, 0, 0)`,
     );
     const link = db.prepare("UPDATE PlaylistEntity SET nextEntityId = ? WHERE id = ?");
-    const ids: number[] = refs.map((ref) => Number(insEntity.run(listId, ref.trackId, ref.uuid).lastInsertRowid));
+    const ids: number[] = trackRefs.map((ref) => Number(insEntity.run(listId, ref.trackId, ref.uuid).lastInsertRowid));
     for (let i = 0; i + 1 < ids.length; i++) link.run(ids[i + 1]!, ids[i]!);
 
     if (ids.length > 0) {
@@ -785,8 +858,14 @@ export async function addTracksToPlaylist(
       }
     }
 
+    // Re-gated, not just re-walked: sameOrder alone confirms the *values*
+    // survived the round trip in order, but a wrong implementation could in
+    // principle produce a chain that still walks to the right values from
+    // this head (e.g. a converging link elsewhere) while failing checkChain.
+    // Both are cheap; there is no reason to trust only one of them here.
     const newHeadId = insertAt === 0 ? (ids[0] ?? gate.order[0] ?? 0) : gate.order[0]!;
-    if (!sameOrder(walkFrom(db, listId, newHeadId), expected)) {
+    const finalGate = gateChain(db, listId);
+    if (!finalGate.ok || !sameOrder(walkFrom(db, listId, newHeadId), expected)) {
       rollback(db);
       return err(
         "library_unreadable",
@@ -800,28 +879,12 @@ export async function addTracksToPlaylist(
     // that is the Track convention, and Playlist.lastEditTime is TEXT.
     db.prepare("UPDATE Playlist SET lastEditTime = datetime('now') WHERE id = ?").run(listId);
 
-    commit = "maybe";
-    db.exec("COMMIT");
-    commit = "yes";
-
-    const verifyErr = verifyAfterCommit(db, subject, backupPath);
-    if (verifyErr) return verifyErr;
-
     const positions = ids.map((_, i) => insertAt + 1 + i);
     return {
       playlist_id: listId,
-      tracks_added: refs.length,
+      tracks_added: trackRefs.length,
       positions,
       undo: [{ tool: "remove_tracks_from_playlist", arguments: { playlist_id: listId, positions } }],
-      backup_path: backupPath,
     };
-  } catch (e) {
-    return classifyWriteFailure(e, commit, subject, mdbPath, backupPath, db, open);
-  } finally {
-    try {
-      db?.close();
-    } catch {
-      /* already closed */
-    }
-  }
+  });
 }

@@ -1,9 +1,9 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { mkdtempSync, rmSync, copyFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { makeLibrary, addPlaylists, damageChain, reoriginTracks } from "./fixtures/gen-library.js";
+import { makeLibrary, addPlaylists, damageChain } from "./fixtures/gen-library.js";
 import { addTracksToPlaylist, resetSessionSnapshots } from "../src/store/write.js";
 import { isEngineError } from "../src/errors.js";
 
@@ -29,6 +29,15 @@ function setup() {
       ],
     },
   ]);
+  return { dir, dbPath, backupDir: join(dir, "backups") };
+}
+
+/** Same fixture, but playlist 1 starts with no entries at all. */
+function setupEmpty() {
+  const dir = mkdtempSync(join(tmpdir(), "pe-"));
+  dirs.push(dir);
+  const dbPath = makeLibrary(dir, { tracks: 8, uuid: "lib-uuid" });
+  addPlaylists(dbPath, [{ id: 1, title: "Empty", nextListId: 0, entries: [] }]);
   return { dir, dbPath, backupDir: join(dir, "backups") };
 }
 
@@ -71,6 +80,37 @@ describe("addTracksToPlaylist", () => {
     expect(order(dbPath)).toEqual([1, 8, 2, 3]);
   });
 
+  // A run of more than one track exercises the interior links a single-track
+  // insert cannot: with one track, ids[0] === ids[ids.length - 1], so a
+  // start/end swap in which end of the run gets linked to the surrounding
+  // chain is invisible. These two are the multi-track counterparts of the
+  // two splice tests above.
+  it("prepends a multi-track run in the order given", async () => {
+    const { dbPath, backupDir } = setup();
+    const r = await addTracksToPlaylist(dbPath, "lib-uuid", { listId: 1, trackIds: [7, 8], at: "start" }, { backupDir });
+    expect(isEngineError(r)).toBe(false);
+    expect(order(dbPath)).toEqual([7, 8, 1, 2, 3]);
+    expect((r as any).positions).toEqual([1, 2]);
+  });
+
+  it("inserts a multi-track run after a named position", async () => {
+    const { dbPath, backupDir } = setup();
+    const r = await addTracksToPlaylist(
+      dbPath, "lib-uuid", { listId: 1, trackIds: [7, 8], at: { after_position: 1 } }, { backupDir },
+    );
+    expect(isEngineError(r)).toBe(false);
+    expect(order(dbPath)).toEqual([1, 7, 8, 2, 3]);
+    expect((r as any).positions).toEqual([2, 3]);
+  });
+
+  it("adds to an empty playlist, whose old head is nothing", async () => {
+    const { dbPath, backupDir } = setupEmpty();
+    const r = await addTracksToPlaylist(dbPath, "lib-uuid", { listId: 1, trackIds: [1, 2], at: "start" }, { backupDir });
+    expect(isEngineError(r)).toBe(false);
+    expect(order(dbPath)).toEqual([1, 2]);
+    expect((r as any).positions).toEqual([1, 2]);
+  });
+
   it("refuses to touch a damaged chain, and changes nothing", async () => {
     for (const kind of ["cycle", "dangling", "two-heads"] as const) {
       const { dbPath, backupDir } = setup();
@@ -84,22 +124,21 @@ describe("addTracksToPlaylist", () => {
     }
   });
 
-  it("refuses a track already in the list even when the entry names an older origin", async () => {
-    // UNIQUE (listId, databaseUuid, trackId) protects the pair, not the
-    // track: measured, the same trackId under a different databaseUuid
-    // inserts happily. A library whose entries predate a re-origination is
-    // exactly that state, and it is not hypothetical -- it is what this
-    // reference library looked like on 2026-08-22.
+  it("refuses a track already in the list, failing fast before any snapshot is taken", async () => {
+    // The check's real value is fail-fast: refusing before the snapshot is
+    // copied and before a write transaction opens, with a message naming
+    // the track, rather than a UNIQUE-constraint violation surfacing from
+    // inside a transaction. It is not stronger than that constraint -- see
+    // src/store/write.ts's comment on the check itself for the case it
+    // cannot catch. What it *can* prove, and the constraint alone cannot,
+    // is that none of this ever touched the filesystem: no snapshot copy.
     const { dbPath, backupDir } = setup();
-    reoriginTracks(dbPath, [{ id: 2, originUuid: "older-lib", originTrackId: 902 }]);
-    const db = new DatabaseSync(dbPath);
-    db.prepare("UPDATE PlaylistEntity SET databaseUuid = 'older-lib', trackId = 902 WHERE id = 2").run();
-    db.close();
-
     const r = await addTracksToPlaylist(dbPath, "lib-uuid", { listId: 1, trackIds: [2], at: "end" }, { backupDir });
     expect(isEngineError(r)).toBe(true);
     expect((r as any).error).toBe("duplicate_track");
-    expect(order(dbPath)).toEqual([1, 902, 3]);
+    expect((r as any).detail).toBe("not_committed");
+    expect(existsSync(backupDir)).toBe(false);
+    expect(order(dbPath)).toEqual([1, 2, 3]);
   });
 
   it("updates the playlist's lastEditTime, as a text date", async () => {
@@ -122,11 +161,52 @@ describe("addTracksToPlaylist", () => {
     ]);
   });
 
+  it("refuses an empty trackIds list", async () => {
+    const { dbPath, backupDir } = setup();
+    const r = await addTracksToPlaylist(dbPath, "lib-uuid", { listId: 1, trackIds: [], at: "end" }, { backupDir });
+    expect((r as any).error).toBe("invalid_argument");
+    expect((r as any).detail).toBe("not_committed");
+    expect(existsSync(backupDir)).toBe(false);
+    expect(order(dbPath)).toEqual([1, 2, 3]);
+  });
+
+  it("refuses an unknown playlist", async () => {
+    const { dbPath, backupDir } = setup();
+    const r = await addTracksToPlaylist(dbPath, "lib-uuid", { listId: 999, trackIds: [6], at: "end" }, { backupDir });
+    expect((r as any).error).toBe("playlist_not_found");
+    expect((r as any).detail).toBe("not_committed");
+  });
+
   it("refuses a position outside the list", async () => {
     const { dbPath, backupDir } = setup();
     const r = await addTracksToPlaylist(
       dbPath, "lib-uuid", { listId: 1, trackIds: [6], at: { after_position: 99 } }, { backupDir },
     );
     expect((r as any).error).toBe("invalid_position");
+  });
+
+  it("refuses after_position 0", async () => {
+    const { dbPath, backupDir } = setup();
+    const r = await addTracksToPlaylist(
+      dbPath, "lib-uuid", { listId: 1, trackIds: [6], at: { after_position: 0 } }, { backupDir },
+    );
+    expect((r as any).error).toBe("invalid_position");
+  });
+
+  it("refuses a negative after_position", async () => {
+    const { dbPath, backupDir } = setup();
+    const r = await addTracksToPlaylist(
+      dbPath, "lib-uuid", { listId: 1, trackIds: [6], at: { after_position: -1 } }, { backupDir },
+    );
+    expect((r as any).error).toBe("invalid_position");
+  });
+
+  it("accepts after_position at the legal boundary, equal to the chain's length", async () => {
+    const { dbPath, backupDir } = setup();
+    const r = await addTracksToPlaylist(
+      dbPath, "lib-uuid", { listId: 1, trackIds: [6], at: { after_position: 3 } }, { backupDir },
+    );
+    expect(isEngineError(r)).toBe(false);
+    expect(order(dbPath)).toEqual([1, 2, 3, 6]);
   });
 });
