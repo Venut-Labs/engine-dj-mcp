@@ -169,7 +169,13 @@ function resolveOrigins(db: DatabaseSync, trackIds: number[]): OriginRef[] | Eng
  * One origin pair as a Map key, joined on NUL because a databaseUuid is free
  * text: any printable separator is a character some uuid could itself
  * contain, and a key collision here would refuse a track as duplicate_track
- * when it is not in the playlist at all.
+ * when it is not in the playlist at all. `uuid` must never be null: template
+ * coercion turns `null` into the four characters "null", which would then
+ * collide with an entry whose databaseUuid genuinely is that literal
+ * string. A resolved track's uuid is never null -- resolveOrigins already
+ * refused one that is -- so the only null this module ever sees is a
+ * PlaylistEntity row's own `databaseUuid`, which the caller below skips
+ * rather than passing in here.
  */
 function pairKey(uuid: string, trackId: number): string {
   return `${uuid}\u0000${trackId}`;
@@ -814,8 +820,15 @@ export async function addTracksToPlaylist(
       for (let i = 0; i < refs.length; i++) wanted.set(pairKey(refs[i]!.uuid, refs[i]!.trackId), trackIds[i]!);
       const existing = precheck
         .prepare("SELECT trackId, databaseUuid FROM PlaylistEntity WHERE listId = ?")
-        .all(listId) as { trackId: number; databaseUuid: string }[];
+        .all(listId) as { trackId: number; databaseUuid: string | null }[];
       for (const e of existing) {
+        // A null databaseUuid names a malformed entry (see OrderedEntry in
+        // playlists.ts), never a real origin pair -- no resolved track can
+        // match it, since resolveOrigins already refuses a null uuid. Keying
+        // it would collide with pairKey's own null-coercion trap; skipping
+        // it is what the old `= NULL` comparison did for free, since that
+        // matches no row.
+        if (e.databaseUuid === null) continue;
         const clash = wanted.get(pairKey(e.databaseUuid, e.trackId));
         if (clash !== undefined) {
           return err(
