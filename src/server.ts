@@ -572,7 +572,9 @@ export async function createServer(
           "write of this session; it is a recovery route for a damaged library, NOT an undo. " +
           "Restoring it reverts the entire library to that moment, discarding everything " +
           "Engine DJ has written since (play counts, imports, cue and beatgrid edits). " +
-          "No existing playlist or entry is ever modified; this only adds a new one. " +
+          "No existing playlist is renamed, reordered, emptied or deleted, and no track, cue or " +
+          "beatgrid is touched. The one existing row that moves is the previous last playlist's " +
+          "link, and Engine's own insert trigger is what moves it. " +
           "Fails with playlist_exists if a top-level playlist already has that title, and " +
           "with library_busy if Engine DJ or a player is holding a conflicting lock on the " +
           "library right then -- nothing is written in that case, so retry rather than " +
