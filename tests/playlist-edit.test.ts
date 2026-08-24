@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { makeLibrary, addPlaylists, damageChain, reoriginTracks } from "./fixtures/gen-library.js";
-import { addTracksToPlaylist, removeTracksFromPlaylist, resetSessionSnapshots } from "../src/store/write.js";
+import {
+  addTracksToPlaylist,
+  removeTracksFromPlaylist,
+  reorderPlaylist,
+  resetSessionSnapshots,
+} from "../src/store/write.js";
 import { isEngineError } from "../src/errors.js";
 
 const dirs: string[] = [];
@@ -445,5 +450,73 @@ describe("removeTracksFromPlaylist", () => {
     ]);
     expect(order(dbPath, 2)).toEqual([4, 6]);
     expect(order(dbPath, 1)).toEqual([1, 2, 3]);
+  });
+});
+
+describe("reorderPlaylist", () => {
+  it("applies a full permutation", async () => {
+    const { dbPath, backupDir } = setup();
+    const r = await reorderPlaylist(dbPath, "lib-uuid", { listId: 1, order: [3, 1, 2] }, { backupDir });
+    expect(isEngineError(r)).toBe(false);
+    expect(order(dbPath)).toEqual([3, 1, 2]);
+  });
+
+  it("refuses anything that is not a permutation of 1..n", async () => {
+    const { dbPath, backupDir } = setup();
+    for (const bad of [[1, 2], [1, 2, 2], [1, 2, 4], [0, 1, 2], [1, 2, 3, 3]]) {
+      const r = await reorderPlaylist(dbPath, "lib-uuid", { listId: 1, order: bad }, { backupDir });
+      expect((r as any).error, JSON.stringify(bad)).toBe("invalid_position");
+      expect(order(dbPath), JSON.stringify(bad)).toEqual([1, 2, 3]);
+    }
+  });
+
+  it("returns the inverse permutation as its undo", async () => {
+    const { dbPath, backupDir } = setup();
+    const r: any = await reorderPlaylist(dbPath, "lib-uuid", { listId: 1, order: [3, 1, 2] }, { backupDir });
+    expect(r.undo).toEqual([{ tool: "reorder_playlist", arguments: { playlist_id: 1, order: [2, 3, 1] } }]);
+    // And it round-trips: applying the undo restores the original order.
+    await reorderPlaylist(dbPath, "lib-uuid", { listId: 1, order: [2, 3, 1] }, { backupDir });
+    expect(order(dbPath)).toEqual([1, 2, 3]);
+  });
+
+  it("does nothing to a permutation that changes nothing", async () => {
+    const { dbPath, backupDir } = setup();
+    const r = await reorderPlaylist(dbPath, "lib-uuid", { listId: 1, order: [1, 2, 3] }, { backupDir });
+    expect(isEngineError(r)).toBe(false);
+    expect(order(dbPath)).toEqual([1, 2, 3]);
+  });
+
+  it("refuses to touch a damaged chain, and changes nothing", async () => {
+    for (const kind of ["cycle", "dangling", "two-heads"] as const) {
+      const { dbPath, backupDir } = setup();
+      damageChain(dbPath, 1, kind);
+      const before = order(dbPath);
+      const r = await reorderPlaylist(dbPath, "lib-uuid", { listId: 1, order: [1, 2, 3] }, { backupDir });
+      expect(isEngineError(r), kind).toBe(true);
+      expect((r as any).error, kind).toBe("playlist_chain_damaged");
+      expect((r as any).detail, kind).toBe("not_committed");
+      expect(order(dbPath), kind).toEqual(before);
+    }
+  });
+
+  it("reorders a single-entry playlist as a no-op", async () => {
+    const { dbPath, backupDir } = setupChain(1);
+    const r = await reorderPlaylist(dbPath, "lib-uuid", { listId: 1, order: [1] }, { backupDir });
+    expect(isEngineError(r)).toBe(false);
+    expect(order(dbPath)).toEqual([1]);
+  });
+
+  it("reorders an empty playlist as a no-op", async () => {
+    const { dbPath, backupDir } = setupEmpty();
+    const r = await reorderPlaylist(dbPath, "lib-uuid", { listId: 1, order: [] }, { backupDir });
+    expect(isEngineError(r)).toBe(false);
+    expect(order(dbPath)).toEqual([]);
+  });
+
+  it("refuses an unknown playlist", async () => {
+    const { dbPath, backupDir } = setup();
+    const r = await reorderPlaylist(dbPath, "lib-uuid", { listId: 999, order: [1, 2, 3] }, { backupDir });
+    expect((r as any).error).toBe("playlist_not_found");
+    expect((r as any).detail).toBe("not_committed");
   });
 });

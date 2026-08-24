@@ -1123,3 +1123,184 @@ export async function removeTracksFromPlaylist(
     };
   });
 }
+
+/**
+ * Validates `order` against a chain's current length: it must be a
+ * permutation of `1..n` for `n = currentLength`, not a partial "move X to Y"
+ * instruction. That is deliberate -- a full permutation is the only shape
+ * that can catch a wrong length, a repeat, a zero, a negative or an
+ * out-of-range value in one pass; a move instruction cannot name any of
+ * those at all. Length is checked first and independently of range, so a
+ * too-short or too-long `order` is reported as such rather than as an
+ * in-range element failing to cover the tail.
+ *
+ * Called twice by reorderPlaylist, against two different reads of the same
+ * chain, for the same reason resolveInsertAt and resolveRemoval are: once in
+ * the pre-check, to fail fast, and again inside the transaction against the
+ * chain BEGIN IMMEDIATE just locked -- the pre-check's read can be stale by
+ * the time the lock is held.
+ */
+function validatePermutation(order: number[], currentLength: number, listId: number): EngineError | undefined {
+  if (order.length !== currentLength) {
+    return err(
+      "invalid_position",
+      `Playlist ${listId} has ${currentLength} entries; order must name exactly that many positions.`,
+      { detail: NOT_COMMITTED },
+    );
+  }
+  const seen = new Set<number>();
+  for (const p of order) {
+    if (!Number.isInteger(p) || p < 1 || p > currentLength) {
+      return err(
+        "invalid_position",
+        `order must be a permutation of 1..${currentLength}; ${p} is out of range.`,
+        { detail: NOT_COMMITTED },
+      );
+    }
+    if (seen.has(p)) {
+      return err("invalid_position", `order names position ${p} more than once.`, { detail: NOT_COMMITTED });
+    }
+    seen.add(p);
+  }
+  return undefined;
+}
+
+/**
+ * Reorders an existing playlist's entries to a caller-given permutation of
+ * its current order.
+ *
+ * Unlike add/remove, this rewrites links only -- no INSERT, no DELETE -- so
+ * none of Engine's PlaylistEntity triggers fire and there is no trigger
+ * behaviour to trust or verify here, only the links this function writes
+ * itself. `order[i]` names the *current* 1-based position of the track that
+ * should end up at position `i + 1` (see validatePermutation for why the
+ * spec takes a full permutation rather than a move instruction). Only the
+ * entries whose successor actually changes get an UPDATE -- measured on a
+ * real library, moving an entry from the middle to the front took exactly
+ * two updates -- so a permutation that changes nothing writes nothing.
+ *
+ * Shares createPlaylist/addTracksToPlaylist/removeTracksFromPlaylist's
+ * skeleton: a read-only pre-check first, then withWriteTransaction.
+ */
+export async function reorderPlaylist(
+  mdbPath: string,
+  uuid: string,
+  input: { listId: number; order: number[] },
+  opts: { backupDir: string },
+): Promise<EditResult | EngineError> {
+  const { listId, order: requestedOrder } = input;
+  const subject = `playlist ${listId}`;
+
+  // See createPlaylist for why this has to be checked before anything else
+  // even tries to open the file.
+  if (hasHotJournal(mdbPath)) return { ...libraryNeedsRecovery(), detail: NOT_COMMITTED };
+
+  {
+    let precheck: DatabaseSync | undefined;
+    try {
+      precheck = new DatabaseSync(mdbPath, { readOnly: true });
+
+      const exists = precheck.prepare("SELECT 1 FROM Playlist WHERE id = ?").get(listId);
+      if (!exists) {
+        return err("playlist_not_found", `No playlist with id ${listId} in this library.`, {
+          detail: NOT_COMMITTED,
+        });
+      }
+
+      const gate = gateChain(precheck, listId);
+      if (!gate.ok) {
+        return err("playlist_chain_damaged", `Playlist ${listId}: ${gate.reason}. Nothing was changed.`, {
+          detail: NOT_COMMITTED,
+        });
+      }
+
+      const invalid = validatePermutation(requestedOrder, gate.order.length, listId);
+      if (invalid) return invalid;
+    } catch (e) {
+      return mapWriteError(e, subject, mdbPath);
+    } finally {
+      try {
+        precheck?.close();
+      } catch {
+        /* never opened, or already closed */
+      }
+    }
+  }
+
+  return withWriteTransaction(mdbPath, uuid, subject, opts, (db) => {
+    // Re-read: BEGIN IMMEDIATE is the first moment nothing else can change
+    // the chain, and gating on the pre-check's read alone would be trusting
+    // one that could already be stale.
+    const gate = gateChain(db, listId);
+    if (!gate.ok) {
+      rollback(db);
+      return err("playlist_chain_damaged", `Playlist ${listId}: ${gate.reason}. Nothing was changed.`, {
+        detail: NOT_COMMITTED,
+      });
+    }
+
+    // Re-validated against this read of the chain, not the pre-check's: see
+    // validatePermutation's comment.
+    const invalid = validatePermutation(requestedOrder, gate.order.length, listId);
+    if (invalid) {
+      rollback(db);
+      return invalid;
+    }
+
+    // The entry-identity chain the final order must read back as, built from
+    // this walk -- taken *before* any UPDATE below -- rather than re-queried
+    // afterwards, the same reason addTracksToPlaylist builds `expected` up
+    // front: the readback check must not depend on the writes it is meant to
+    // verify.
+    const originalRefs = gate.order.length > 0 ? walkFrom(db, listId, gate.order[0]!) : [];
+    const expected = requestedOrder.map((p) => originalRefs[p - 1]!);
+
+    // newSeq[i] is the entry id that must sit at position i + 1 once this
+    // returns; each entry's new successor is the id that follows it there,
+    // or 0 for the new tail.
+    const newSeq = requestedOrder.map((p) => gate.order[p - 1]!);
+    const currentNext = new Map(readChain(db, listId).map((r) => [r.id, r.next]));
+    const link = db.prepare("UPDATE PlaylistEntity SET nextEntityId = ? WHERE id = ?");
+    for (let i = 0; i < newSeq.length; i++) {
+      const entryId = newSeq[i]!;
+      const newNext = i + 1 < newSeq.length ? newSeq[i + 1]! : 0;
+      // Only entries whose link actually changes are written -- this is what
+      // keeps a permutation that changes nothing a true no-op rather than n
+      // redundant writes.
+      if (currentNext.get(entryId) !== newNext) link.run(newNext, entryId);
+    }
+
+    // Re-gated, not just re-walked: see addTracksToPlaylist's comment on the
+    // same pairing. gateChain confirms the structure is still one sound
+    // chain; sameOrder confirms the values landed in the requested order.
+    const newHeadId = newSeq.length > 0 ? newSeq[0]! : 0;
+    const finalGate = gateChain(db, listId);
+    if (!finalGate.ok || (newSeq.length > 0 && !sameOrder(walkFrom(db, listId, newHeadId), expected))) {
+      rollback(db);
+      return err(
+        "library_unreadable",
+        `The entry chain for playlist ${listId} did not read back as written; nothing was changed.`,
+        { detail: NOT_COMMITTED },
+      );
+    }
+
+    // No trigger maintains this: measured, changing PlaylistEntity leaves the
+    // parent Playlist row untouched. datetime('now'), not strftime('%s') --
+    // that is the Track convention, and Playlist.lastEditTime is TEXT.
+    db.prepare("UPDATE Playlist SET lastEditTime = datetime('now') WHERE id = ?").run(listId);
+
+    // The inverse permutation: if order[i] = p, then inverse[p - 1] = i + 1.
+    // Applying it undoes this call exactly, because reorderPlaylist's own
+    // effect is just "relabel positions by this permutation" -- composing a
+    // permutation with its inverse is the identity.
+    const inverse: number[] = new Array(requestedOrder.length);
+    for (let i = 0; i < requestedOrder.length; i++) {
+      inverse[requestedOrder[i]! - 1] = i + 1;
+    }
+
+    return {
+      playlist_id: listId,
+      undo: [{ tool: "reorder_playlist", arguments: { playlist_id: listId, order: inverse } }],
+    };
+  });
+}
