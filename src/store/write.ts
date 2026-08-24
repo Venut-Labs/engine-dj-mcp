@@ -770,16 +770,13 @@ export async function addTracksToPlaylist(
       const existing = precheck
         .prepare("SELECT trackId, databaseUuid FROM PlaylistEntity WHERE listId = ?")
         .all(listId) as { trackId: number; databaseUuid: string }[];
-      const resolveLocal = precheck.prepare(
-        "SELECT id FROM Track WHERE originDatabaseUuid = ? AND originTrackId = ?",
-      );
       const requested = new Set(trackIds);
       for (const e of existing) {
-        const local = resolveLocal.get(e.databaseUuid, e.trackId) as { id: number } | undefined;
-        if (local && requested.has(local.id)) {
+        const local = resolveLocalTrackId(precheck, e.databaseUuid, e.trackId);
+        if (local !== null && requested.has(local)) {
           return err(
             "duplicate_track",
-            `Track ${local.id} is already in playlist ${listId}; Engine allows a track in a playlist only once.`,
+            `Track ${local} is already in playlist ${listId}; Engine allows a track in a playlist only once.`,
             { detail: NOT_COMMITTED },
           );
         }
@@ -891,9 +888,27 @@ export async function addTracksToPlaylist(
 }
 
 /**
+ * The local `Track.id` that carries a given origin pair, or null if none
+ * does. Shared by addTracksToPlaylist's duplicate check and resolveRemoval,
+ * below: both need to go from a PlaylistEntity row's stored (databaseUuid,
+ * trackId) -- the origin pair Engine actually stores, see resolveOrigins's
+ * comment -- back to the local row a caller's trackIds/expectTrackIds are
+ * expressed in.
+ */
+function resolveLocalTrackId(db: DatabaseSync, uuid: string, trackId: number): number | null {
+  const row = db
+    .prepare("SELECT id FROM Track WHERE originDatabaseUuid = ? AND originTrackId = ?")
+    .get(uuid, trackId) as { id: number } | undefined;
+  return row ? row.id : null;
+}
+
+/**
  * Validates `positions` against a chain's current order -- in range, no
  * repeats -- and, when `expectTrackIds` is given, that each named position
- * still holds the track a caller who read the list earlier believed it did.
+ * still holds the track a caller who read the list earlier believed it did
+ * (`null` there means "resolves to no local track", not "no expectation" --
+ * see resolveLocalTrackId, above -- so a non-null value at that slot is a
+ * mismatch, same as a wrong id would be at any other slot).
  * Resolves each surviving position to the entry id to delete and the
  * *local* track id it currently holds, translated from the stored origin
  * pair the same way addTracksToPlaylist's duplicate-track check does (null
@@ -910,7 +925,7 @@ function resolveRemoval(
   listId: number,
   order: number[],
   positions: number[],
-  expectTrackIds: number[] | undefined,
+  expectTrackIds: (number | null)[] | undefined,
 ): { position: number; entryId: number; trackId: number | null }[] | EngineError {
   const seen = new Set<number>();
   for (const p of positions) {
@@ -935,14 +950,12 @@ function resolveRemoval(
   }
 
   const entryAt = db.prepare("SELECT trackId, databaseUuid FROM PlaylistEntity WHERE id = ?");
-  const resolveLocal = db.prepare("SELECT id FROM Track WHERE originDatabaseUuid = ? AND originTrackId = ?");
   const plan: { position: number; entryId: number; trackId: number | null }[] = [];
   for (let i = 0; i < positions.length; i++) {
     const position = positions[i]!;
     const entryId = order[position - 1]!;
     const row = entryAt.get(entryId) as { trackId: number; databaseUuid: string };
-    const local = resolveLocal.get(row.databaseUuid, row.trackId) as { id: number } | undefined;
-    const trackId = local ? local.id : null;
+    const trackId = resolveLocalTrackId(db, row.databaseUuid, row.trackId);
     if (expectTrackIds && expectTrackIds[i] !== trackId) {
       return err(
         "invalid_position",
@@ -978,7 +991,7 @@ function resolveRemoval(
 export async function removeTracksFromPlaylist(
   mdbPath: string,
   uuid: string,
-  input: { listId: number; positions: number[]; expectTrackIds?: number[] },
+  input: { listId: number; positions: number[]; expectTrackIds?: (number | null)[] },
   opts: { backupDir: string },
 ): Promise<EditResult | EngineError> {
   const { listId, positions, expectTrackIds } = input;

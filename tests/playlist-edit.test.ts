@@ -41,10 +41,83 @@ function setupEmpty() {
   return { dir, dbPath, backupDir: join(dir, "backups") };
 }
 
-/** Entry chain of list 1, head to tail, as track ids. */
-function order(dbPath: string): number[] {
+/**
+ * Same fixture, but position 2's entry carries an origin pair -- a made-up
+ * databaseUuid paired with a trackId no track in this library was ever
+ * re-originated to -- that resolves to no local Track at all. This is the
+ * only shape that can exercise expectTrackIds: null, which is not "no
+ * expectation" but "expect this slot to resolve to nothing".
+ */
+function setupUnresolvable() {
+  const dir = mkdtempSync(join(tmpdir(), "pe-"));
+  dirs.push(dir);
+  const dbPath = makeLibrary(dir, { tracks: 8, uuid: "lib-uuid" });
+  addPlaylists(dbPath, [
+    {
+      id: 1,
+      title: "Set",
+      nextListId: 0,
+      entries: [
+        { id: 1, trackId: 1, next: 2 },
+        { id: 2, trackId: 9999, next: 3, databaseUuid: "ghost-uuid" },
+        { id: 3, trackId: 3, next: 0 },
+      ],
+    },
+  ]);
+  return { dir, dbPath, backupDir: join(dir, "backups") };
+}
+
+/** A single playlist of `n` entries, id and trackId both 1..n, chained in order. */
+function setupChain(n: number) {
+  const dir = mkdtempSync(join(tmpdir(), "pe-"));
+  dirs.push(dir);
+  const dbPath = makeLibrary(dir, { tracks: n, uuid: "lib-uuid" });
+  const entries = Array.from({ length: n }, (_, i) => ({ id: i + 1, trackId: i + 1, next: i + 2 <= n ? i + 2 : 0 }));
+  addPlaylists(dbPath, [{ id: 1, title: "Set", nextListId: 0, entries }]);
+  return { dir, dbPath, backupDir: join(dir, "backups") };
+}
+
+/**
+ * Two playlists in one library, so a test can prove a result or an undo
+ * step names the playlist it actually ran against rather than a hardcoded
+ * `1` -- every other fixture here has exactly one playlist, which cannot
+ * tell the two apart.
+ */
+function setupTwoPlaylists() {
+  const dir = mkdtempSync(join(tmpdir(), "pe-"));
+  dirs.push(dir);
+  const dbPath = makeLibrary(dir, { tracks: 8, uuid: "lib-uuid" });
+  addPlaylists(dbPath, [
+    {
+      id: 1,
+      title: "Set",
+      nextListId: 2,
+      entries: [
+        { id: 1, trackId: 1, next: 2 },
+        { id: 2, trackId: 2, next: 3 },
+        { id: 3, trackId: 3, next: 0 },
+      ],
+    },
+    {
+      id: 2,
+      title: "Other",
+      nextListId: 0,
+      entries: [
+        { id: 4, trackId: 4, next: 5 },
+        { id: 5, trackId: 5, next: 6 },
+        { id: 6, trackId: 6, next: 0 },
+      ],
+    },
+  ]);
+  return { dir, dbPath, backupDir: join(dir, "backups") };
+}
+
+/** Entry chain of the given list (1 by default), head to tail, as track ids. */
+function order(dbPath: string, listId = 1): number[] {
   const db = new DatabaseSync(dbPath, { readOnly: true });
-  const rows = db.prepare("SELECT id, trackId, nextEntityId FROM PlaylistEntity WHERE listId = 1").all() as any[];
+  const rows = db
+    .prepare("SELECT id, trackId, nextEntityId FROM PlaylistEntity WHERE listId = ?")
+    .all(listId) as any[];
   db.close();
   const byId = new Map(rows.map((r) => [r.id, r]));
   const targets = new Set(rows.map((r) => r.nextEntityId));
@@ -289,5 +362,88 @@ describe("removeTracksFromPlaylist", () => {
       const r = await removeTracksFromPlaylist(dbPath, "lib-uuid", { listId: 1, positions }, { backupDir });
       expect((r as any).error, JSON.stringify(positions)).toBe("invalid_position");
     }
+  });
+
+  it("refuses an empty positions list", async () => {
+    const { dbPath, backupDir } = setup();
+    const r = await removeTracksFromPlaylist(dbPath, "lib-uuid", { listId: 1, positions: [] }, { backupDir });
+    expect((r as any).error).toBe("invalid_argument");
+    expect((r as any).detail).toBe("not_committed");
+    expect(order(dbPath)).toEqual([1, 2, 3]);
+  });
+
+  it("treats expectTrackIds: null as the expectation for an entry with no local track", async () => {
+    // null there is not "no expectation" -- it is "this slot should resolve
+    // to no local track", the same status the response's own removed[].track_id
+    // reports for such an entry. A non-null value at that slot must be
+    // refused exactly like a wrong id anywhere else would be.
+    {
+      const { dbPath, backupDir } = setupUnresolvable();
+      const r: any = await removeTracksFromPlaylist(dbPath, "lib-uuid", { listId: 1, positions: [2] }, { backupDir });
+      expect(isEngineError(r)).toBe(false);
+      expect(r.removed).toEqual([{ position: 2, track_id: null }]);
+    }
+    {
+      const { dbPath, backupDir } = setupUnresolvable();
+      const r = await removeTracksFromPlaylist(
+        dbPath, "lib-uuid", { listId: 1, positions: [2], expectTrackIds: [null] }, { backupDir },
+      );
+      expect(isEngineError(r)).toBe(false);
+    }
+    {
+      const { dbPath, backupDir } = setupUnresolvable();
+      const r = await removeTracksFromPlaylist(
+        dbPath, "lib-uuid", { listId: 1, positions: [2], expectTrackIds: [5] }, { backupDir },
+      );
+      expect((r as any).error).toBe("invalid_position");
+      expect(order(dbPath)).toEqual([1, 9999, 3]);
+    }
+  });
+
+  it("orders the undo correctly for two adjacent removals", async () => {
+    const { dbPath, backupDir } = setupChain(5);
+    const r: any = await removeTracksFromPlaylist(dbPath, "lib-uuid", { listId: 1, positions: [2, 3] }, { backupDir });
+    expect(isEngineError(r)).toBe(false);
+    expect(order(dbPath)).toEqual([1, 4, 5]);
+    expect(r.undo).toEqual([
+      { tool: "add_tracks_to_playlist", arguments: { playlist_id: 1, track_ids: [2], at: { after_position: 1 } } },
+      { tool: "add_tracks_to_playlist", arguments: { playlist_id: 1, track_ids: [3], at: { after_position: 2 } } },
+    ]);
+    // The undo is not just the right shape -- replaying it actually
+    // reconstructs the original order.
+    for (const step of r.undo) {
+      await addTracksToPlaylist(dbPath, "lib-uuid", { listId: 1, trackIds: step.arguments.track_ids, at: step.arguments.at }, { backupDir });
+    }
+    expect(order(dbPath)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("orders the undo correctly for three simultaneous removals", async () => {
+    const { dbPath, backupDir } = setupChain(5);
+    const r: any = await removeTracksFromPlaylist(
+      dbPath, "lib-uuid", { listId: 1, positions: [1, 3, 5] }, { backupDir },
+    );
+    expect(isEngineError(r)).toBe(false);
+    expect(order(dbPath)).toEqual([2, 4]);
+    expect(r.undo).toEqual([
+      { tool: "add_tracks_to_playlist", arguments: { playlist_id: 1, track_ids: [1], at: "start" } },
+      { tool: "add_tracks_to_playlist", arguments: { playlist_id: 1, track_ids: [3], at: { after_position: 2 } } },
+      { tool: "add_tracks_to_playlist", arguments: { playlist_id: 1, track_ids: [5], at: { after_position: 4 } } },
+    ]);
+    for (const step of r.undo) {
+      await addTracksToPlaylist(dbPath, "lib-uuid", { listId: 1, trackIds: step.arguments.track_ids, at: step.arguments.at }, { backupDir });
+    }
+    expect(order(dbPath)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("names the playlist it actually ran against, not a hardcoded 1", async () => {
+    const { dbPath, backupDir } = setupTwoPlaylists();
+    const r: any = await removeTracksFromPlaylist(dbPath, "lib-uuid", { listId: 2, positions: [2] }, { backupDir });
+    expect(isEngineError(r)).toBe(false);
+    expect(r.playlist_id).toBe(2);
+    expect(r.undo).toEqual([
+      { tool: "add_tracks_to_playlist", arguments: { playlist_id: 2, track_ids: [5], at: { after_position: 1 } } },
+    ]);
+    expect(order(dbPath, 2)).toEqual([4, 6]);
+    expect(order(dbPath, 1)).toEqual([1, 2, 3]);
   });
 });
