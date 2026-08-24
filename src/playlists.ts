@@ -447,6 +447,29 @@ function describe(items: readonly PlaylistItem[]): string {
     : shown;
 }
 
+/**
+ * "No such playlist", for both branches resolvePlaylist can reach it from.
+ *
+ * The default `invalid_argument` code has no write-path contract on
+ * `detail` (see errors.ts), so the candidate listing lives there, exactly as
+ * before. `playlist_not_found` is different: a write tool's caller reads
+ * `detail` to learn whether the library changed (see errors.ts), and every
+ * other `playlist_not_found` -- raised inside store/write.ts once an id
+ * reaches it -- carries `detail: "not_committed"`. Nothing was attempted
+ * here either, so this must match, which leaves no room in `detail` for the
+ * candidate listing; it moves into `message` instead, so a human still sees
+ * it.
+ */
+function notFoundError(names: SelectorNames, reason: string, items: readonly PlaylistItem[]): EngineError {
+  const candidates = items.length
+    ? `Playlists (id -- path): ${describe(items)}`
+    : "This library has no playlists.";
+  if (names.notFound) {
+    return err(names.notFound, `${reason}. ${candidates}`, { detail: "not_committed" });
+  }
+  return err("invalid_argument", reason, { detail: candidates });
+}
+
 export interface PlaylistSelector {
   id?: number;
   name?: string;
@@ -515,11 +538,7 @@ export async function resolvePlaylist(
   if (hasId) {
     const found = tree.items.find((i) => i.id === sel.id);
     if (!found) {
-      return err(names.notFound ?? "invalid_argument", `No playlist with ${names.id} ${sel.id} in this library`, {
-        detail: tree.items.length
-          ? `Playlists (id -- path): ${describe(tree.items)}`
-          : "This library has no playlists.",
-      });
+      return notFoundError(names, `No playlist with ${names.id} ${sel.id} in this library`, tree.items);
     }
     return { playlist: found, warnings: tree.warnings };
   }
@@ -527,11 +546,7 @@ export async function resolvePlaylist(
   const matches = findPlaylistByName(tree.items, sel.name!);
   if (matches.length === 1) return { playlist: matches[0]!, warnings: tree.warnings };
   if (matches.length === 0) {
-    return err(names.notFound ?? "invalid_argument", `No playlist named "${sel.name}" in this library`, {
-      detail: tree.items.length
-        ? `Playlists (id -- path): ${describe(tree.items)}`
-        : "This library has no playlists.",
-    });
+    return notFoundError(names, `No playlist named "${sel.name}" in this library`, tree.items);
   }
   return err("invalid_argument", `"${sel.name}" names ${matches.length} playlists in this library`, {
     detail:

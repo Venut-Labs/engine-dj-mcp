@@ -206,6 +206,15 @@ describe("playlist edit tools", () => {
       const res: any = await client.callTool({ name, arguments: args as any });
       expect(res.isError, name).toBe(true);
       expect(res.structuredContent.error, `${name} ${JSON.stringify(args)}`).toBe("playlist_not_found");
+      // Every other playlist_not_found (raised inside store/write.ts once an
+      // id reaches it) carries detail: "not_committed" -- a client reads
+      // that field to decide whether the library changed (errors.ts), and
+      // nothing was ever attempted here either. It has to match, even though
+      // that leaves no room in `detail` for the candidate listing this code
+      // used to carry there; a human still has to be able to find it, so it
+      // is asserted in `message` instead.
+      expect(res.structuredContent.detail, `${name} ${JSON.stringify(args)}`).toBe("not_committed");
+      expect(res.structuredContent.message, `${name} ${JSON.stringify(args)}`).toContain("1 -- Old");
     }
     await client.close();
     rmSync(dir, { recursive: true, force: true });
