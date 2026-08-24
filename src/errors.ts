@@ -27,6 +27,12 @@ export const ERROR_CODES = [
   "playlist_exists",
   "unknown_track",
   "duplicate_track",
+  // Editing an existing playlist. playlist_chain_damaged is the one that
+  // matters: a chain with a cycle or a severed link cannot be edited without
+  // making it worse, and the edit would not notice.
+  "playlist_chain_damaged",
+  "playlist_not_found",
+  "invalid_position",
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];

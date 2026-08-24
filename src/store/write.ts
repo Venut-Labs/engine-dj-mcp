@@ -22,6 +22,27 @@ export interface CreatePlaylistResult {
   backup_path: string;
 }
 
+/**
+ * What editing an existing playlist's entries returns. One shape for
+ * add/remove/reorder alike -- each op leaves the fields it did not touch
+ * undefined rather than the module growing a result type per verb.
+ */
+export interface EditResult {
+  playlist_id: number;
+  tracks_added?: number;
+  tracks_removed?: number;
+  positions?: number[];
+  removed?: { position: number; track_id: number | null }[];
+  undo: UndoStep[];
+  backup_path: string;
+}
+
+/** One step of the tool call that would undo an edit, in the shape a client replays it. */
+export interface UndoStep {
+  tool: string;
+  arguments: Record<string, unknown>;
+}
+
 export interface OriginRef {
   uuid: string;
   trackId: number;
@@ -158,6 +179,20 @@ export function walkFrom(db: DatabaseSync, listId: number, headId: number): Orig
   return out;
 }
 
+/**
+ * One playlist's `PlaylistEntity` rows, in the shape `checkChain` wants: an
+ * entry id and the id it links to (0 for "links to nothing").
+ *
+ * Shared by every op that edits an *existing* playlist's entries --
+ * createPlaylist never calls this, because it builds a chain from nothing
+ * rather than reading one back.
+ */
+export function readChain(db: DatabaseSync, listId: number): { id: number; next: number }[] {
+  return db
+    .prepare("SELECT id, nextEntityId AS next FROM PlaylistEntity WHERE listId = ?")
+    .all(listId) as { id: number; next: number }[];
+}
+
 export interface ChainCheck {
   ok: boolean;
   reason?: string;
@@ -275,23 +310,27 @@ export function sameOrder(a: OriginRef[], b: OriginRef[]): boolean {
 }
 
 /**
- * Turns whatever node:sqlite throws into an EngineError. Shared between the
- * read-only pre-check and the write transaction below it: both open a
- * connection to the same file and can hit the same failure modes (the
- * library gone missing mid-session, Engine holding the lock, a foreign or
- * corrupt schema), and a caller whose promise is typed
- * `Promise<CreatePlaylistResult | EngineError>` must never see one of them
- * escape as a rejection instead.
+ * Turns whatever node:sqlite throws into an EngineError. Shared by every op
+ * in this module -- the read-only pre-check and the write transaction below
+ * it both open a connection to the same file and can hit the same failure
+ * modes (the library gone missing mid-session, Engine holding the lock, a
+ * foreign or corrupt schema), and a caller whose promise is typed
+ * `Promise<... | EngineError>` must never see one of them escape as a
+ * rejection instead.
+ *
+ * `subject` is whatever this write is named for in its own messages -- a new
+ * playlist's title for createPlaylist, `playlist ${listId}` for an op that
+ * edits one that already exists.
  *
  * Every path that reaches this function is one where the library is
  * unchanged: the transaction either never opened or is rolled back by the
  * caller, and a failure at or after COMMIT is answered before this is ever
- * called (see createPlaylist's catch). That is what lets the fallback below
- * say "nothing was changed" without qualification -- it used to say
+ * called (see classifyWriteFailure, below). That is what lets the fallback
+ * below say "nothing was changed" without qualification -- it used to say
  * `Writing "X" failed`, which reads as a half-write even when the failure was
  * "file is not a database" and not one byte was attempted.
  */
-function mapWriteError(e: unknown, title: string, mdbPath: string): EngineError {
+function mapWriteError(e: unknown, subject: string, mdbPath: string): EngineError {
   const msg = (e as Error).message ?? String(e);
   const isUniqueViolation = /UNIQUE constraint failed/i.test(msg);
   // The constraint's *name* never appears in the message SQLite raises --
@@ -299,14 +338,14 @@ function mapWriteError(e: unknown, title: string, mdbPath: string): EngineError 
   // -- so the two conditions are checked independently rather than as one
   // pattern that happens to work only because title leads that index today.
   if (isUniqueViolation && /\bPlaylist\.title\b/.test(msg)) {
-    return err("playlist_exists", `A playlist called "${title}" already exists in this library.`, {
+    return err("playlist_exists", `A playlist called "${subject}" already exists in this library.`, {
       detail: NOT_COMMITTED,
     });
   }
   if (isUniqueViolation && /\bPlaylistEntity\./.test(msg)) {
     return err(
       "duplicate_track",
-      `A track in "${title}" collided with an existing playlist entry; Engine allows a track in a playlist only once.`,
+      `A track in "${subject}" collided with an existing playlist entry; Engine allows a track in a playlist only once.`,
       { detail: NOT_COMMITTED },
     );
   }
@@ -326,9 +365,95 @@ function mapWriteError(e: unknown, title: string, mdbPath: string): EngineError 
   if (/unable to open database file/i.test(msg)) {
     return err("library_not_found", `No Engine library database at ${mdbPath}.`, { detail: NOT_COMMITTED });
   }
-  return err("library_unreadable", `Could not write "${title}": ${msg}. Nothing was changed.`, {
+  return err("library_unreadable", `Could not write "${subject}": ${msg}. Nothing was changed.`, {
     detail: NOT_COMMITTED,
   });
+}
+
+/**
+ * "not yet" until COMMIT is reached; "maybe" for the moment COMMIT is in
+ * flight; "yes" once it returned. Anything thrown while this is not "not
+ * yet" may have left the write on disk -- COMMIT can fail at fsync with
+ * SQLITE_IOERR or SQLITE_FULL after the pages are already there, and the
+ * post-commit check that follows runs against a database that has
+ * definitely changed. Reporting those as not_committed inverts the one
+ * discriminator a client uses to decide whether their library still is what
+ * it was, and drops the snapshot path in exactly the case where it is the
+ * only way back. See classifyWriteFailure, below, which is what reads this.
+ */
+type CommitState = "not yet" | "maybe" | "yes";
+
+/**
+ * The check every write op in this module runs immediately after its own
+ * COMMIT, and the COMMITTED_UNVERIFIED error it produces when the database
+ * does not come back "ok". Shared because this step is identical for every
+ * op here -- only what ran before COMMIT differs.
+ *
+ * quick_check, not integrity_check: both walk every page -- the difference
+ * is that integrity_check additionally cross-checks every index against its
+ * table's actual content, and that cross-check is what dominates the cost on
+ * a library with hundreds of thousands of tracks. quick_check skips only
+ * that verification and still catches the on-disk structural damage (a
+ * malformed b-tree page, say) that a check running right after a write
+ * exists to catch.
+ *
+ * check?.quick_check, not check.quick_check: the pragma is documented to
+ * return at least one row, but a `.get()` that came back undefined here
+ * would raise a TypeError *after* a successful commit, and that lands in
+ * whatever catch block called this as an error about a library that has in
+ * fact already changed. Reading it as "not ok" says the same true thing
+ * without depending on the throw being classified correctly.
+ */
+function verifyAfterCommit(db: DatabaseSync, subject: string, backupPath: string): EngineError | undefined {
+  const check = db.prepare("PRAGMA quick_check").get() as { quick_check?: string } | undefined;
+  if (check?.quick_check === "ok") return undefined;
+  return err(
+    "library_unreadable",
+    `The database reports "${check?.quick_check ?? "no result"}" after writing "${subject}". A snapshot from before this session's first write is at ${backupPath}.`,
+    { detail: COMMITTED_UNVERIFIED, backup_path: backupPath },
+  );
+}
+
+/**
+ * Classifies whatever the write transaction threw, using how far `commit`
+ * had gotten when it did. Shared across every op in this module: the
+ * three-way split below -- never reached COMMIT, SQLITE_BUSY on COMMIT
+ * itself, or past the point of no return -- does not depend on what the
+ * transaction was doing before it threw.
+ *
+ * A COMMIT that returned SQLITE_BUSY is the one in-flight failure SQLite
+ * defines precisely: the transaction stays open and nothing was written, so
+ * it is a plain retry, not an unverified write. Everything else that throws
+ * once COMMIT has started is past the point of no return: no ROLLBACK,
+ * because after a successful COMMIT there is no transaction left to roll
+ * back, and after a COMMIT that failed mid-flight there is no state this
+ * code can reason about well enough to undo by hand (the caller's `finally`
+ * block's db.close() ends anything still open). The honest answer there is
+ * that the write may have gone through, plus the path of the snapshot from
+ * before this session's first write, which is the only case where restoring
+ * one is ever the right next step.
+ */
+function classifyWriteFailure(
+  e: unknown,
+  commit: CommitState,
+  subject: string,
+  mdbPath: string,
+  backupPath: string,
+  db: DatabaseSync | undefined,
+  open: boolean,
+): EngineError {
+  const busyOnCommit = commit === "maybe" && /SQLITE_BUSY|database is locked/i.test((e as Error)?.message ?? "");
+  if (commit === "not yet" || busyOnCommit) {
+    if (open && db) rollback(db);
+    return mapWriteError(e, subject, mdbPath);
+  }
+  const msg = (e as Error)?.message ?? String(e);
+  return err(
+    "library_unreadable",
+    `Writing "${subject}" may have gone through: the library could not be verified afterwards (${msg}). ` +
+      `Check the library in Engine DJ. A snapshot from before this session's first write is at ${backupPath}.`,
+    { detail: COMMITTED_UNVERIFIED, backup_path: backupPath },
+  );
 }
 
 export async function createPlaylist(
@@ -412,18 +537,7 @@ export async function createPlaylist(
 
   let db: DatabaseSync | undefined;
   let open = false;
-  /**
-   * "not yet" until COMMIT is reached; "maybe" for the moment COMMIT is in
-   * flight; "yes" once it returned. Anything thrown while this is not "not
-   * yet" may have left the playlist on disk -- COMMIT can fail at fsync with
-   * SQLITE_IOERR or SQLITE_FULL after the pages are already there, and the
-   * post-commit check below runs against a database that has definitely
-   * changed. Reporting those as not_committed (which is what a single catch
-   * calling mapWriteError did) inverts the one discriminator a client uses to
-   * decide whether their library still is what it was, and drops the snapshot
-   * path in exactly the case where it is the only way back.
-   */
-  let commit: "not yet" | "maybe" | "yes" = "not yet";
+  let commit: CommitState = "not yet";
   try {
     db = new DatabaseSync(mdbPath);
     open = true;
@@ -486,53 +600,223 @@ export async function createPlaylist(
     db.exec("COMMIT");
     commit = "yes";
 
-    // quick_check, not integrity_check: both walk every page -- the
-    // difference is that integrity_check additionally cross-checks every
-    // index against its table's actual content, and that cross-check is
-    // what dominates the cost on a library with hundreds of thousands of
-    // tracks. quick_check skips only that verification and still catches
-    // the on-disk structural damage (a malformed b-tree page, say) that a
-    // check running right after a write exists to catch.
-    //
-    // check?.quick_check, not check.quick_check: the pragma is documented to
-    // return at least one row, but a `.get()` that came back undefined here
-    // would raise a TypeError *after* a successful commit, and that lands in
-    // the catch below as an error about a library that has in fact already
-    // changed. Reading it as "not ok" says the same true thing without
-    // depending on the throw being classified correctly.
-    const check = db.prepare("PRAGMA quick_check").get() as { quick_check?: string } | undefined;
-    if (check?.quick_check !== "ok") {
-      return err(
-        "library_unreadable",
-        `The database reports "${check?.quick_check ?? "no result"}" after writing "${title}". A snapshot from before this session's first write is at ${backupPath}.`,
-        { detail: COMMITTED_UNVERIFIED, backup_path: backupPath },
-      );
-    }
+    const verifyErr = verifyAfterCommit(db, title, backupPath);
+    if (verifyErr) return verifyErr;
 
     return { playlist_id: listId, title, tracks_added: refs.length, backup_path: backupPath };
   } catch (e) {
-    // A COMMIT that returned SQLITE_BUSY is the one in-flight failure SQLite
-    // defines precisely: the transaction stays open and nothing was written,
-    // so it is a plain retry, not an unverified write.
-    const busyOnCommit = commit === "maybe" && /SQLITE_BUSY|database is locked/i.test((e as Error)?.message ?? "");
-    if (commit === "not yet" || busyOnCommit) {
-      if (open && db) rollback(db);
-      return mapWriteError(e, title, mdbPath);
+    return classifyWriteFailure(e, commit, title, mdbPath, backupPath, db, open);
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* already closed */
     }
-    // Past the point of no return. No ROLLBACK: after a successful COMMIT
-    // there is no transaction to roll back, and after a COMMIT that failed
-    // mid-flight there is no state we can reason about well enough to undo
-    // by hand -- db.close() in the finally block ends anything still open.
-    // The honest answer is that the write may have gone through, plus the
-    // path of the snapshot from before this session's first write, which is
-    // the only case where restoring one is ever the right next step.
-    const msg = (e as Error)?.message ?? String(e);
-    return err(
-      "library_unreadable",
-      `Writing "${title}" may have gone through: the library could not be verified afterwards (${msg}). ` +
-        `Check the library in Engine DJ. A snapshot from before this session's first write is at ${backupPath}.`,
-      { detail: COMMITTED_UNVERIFIED, backup_path: backupPath },
+  }
+}
+
+/**
+ * Adds one or more tracks to an existing playlist, at the start, the end, or
+ * after a named position in its current order.
+ *
+ * Shares its skeleton with createPlaylist: a read-only pre-check first (cheap
+ * enough to rule out the common failure modes without ever opening the
+ * library for writing), then the per-session snapshot, then one BEGIN
+ * IMMEDIATE. Where createPlaylist builds a chain from nothing, this extends
+ * one that already exists, so it also has to confirm that chain is sound
+ * before it touches it -- twice. The pre-check reads and gates it once, both
+ * to fail fast (and skip the snapshot) for a playlist that cannot be edited
+ * at all, and because validating `at` needs to know how many entries the
+ * playlist currently has. The transaction reads and gates it again after
+ * BEGIN IMMEDIATE, because that lock is the first moment nothing else can
+ * change the chain -- gating on the pre-check's read alone would be gating
+ * on one that could already be stale.
+ */
+export async function addTracksToPlaylist(
+  mdbPath: string,
+  uuid: string,
+  input: { listId: number; trackIds: number[]; at: "end" | "start" | { after_position: number } },
+  opts: { backupDir: string },
+): Promise<EditResult | EngineError> {
+  const { listId, trackIds, at } = input;
+  // Not a playlist title -- there isn't one here -- but the same role: what
+  // this write is named for in mapWriteError/verifyAfterCommit/
+  // classifyWriteFailure's shared messages.
+  const subject = `playlist ${listId}`;
+
+  // See createPlaylist for why this has to be checked before anything else
+  // even tries to open the file.
+  if (hasHotJournal(mdbPath)) return { ...libraryNeedsRecovery(), detail: NOT_COMMITTED };
+
+  let refs: OriginRef[] | EngineError;
+  let insertAt: number;
+  {
+    let precheck: DatabaseSync | undefined;
+    try {
+      precheck = new DatabaseSync(mdbPath, { readOnly: true });
+
+      const exists = precheck.prepare("SELECT 1 FROM Playlist WHERE id = ?").get(listId);
+      if (!exists) {
+        return err("playlist_not_found", `No playlist with id ${listId} in this library.`, {
+          detail: NOT_COMMITTED,
+        });
+      }
+
+      const gate = checkChain(readChain(precheck, listId));
+      if (!gate.ok) {
+        return err("playlist_chain_damaged", `Playlist ${listId}: ${gate.reason}. Nothing was changed.`, {
+          detail: NOT_COMMITTED,
+        });
+      }
+
+      refs = resolveOrigins(precheck, trackIds);
+      if (!Array.isArray(refs)) return refs;
+
+      // UNIQUE (listId, databaseUuid, trackId) protects a pair, not a track:
+      // measured, the same trackId under a different databaseUuid inserts
+      // happily. So every existing entry is resolved back to a local track
+      // and compared against the request, rather than trusting the INSERT
+      // below to hit the constraint -- which it would miss for exactly the
+      // state a library is in right after a re-origination, where an entry's
+      // stored (databaseUuid, trackId) no longer matches the track's current
+      // origin. Not hypothetical: this reference library looked like that
+      // two days before this was written.
+      const existing = precheck
+        .prepare("SELECT trackId, databaseUuid FROM PlaylistEntity WHERE listId = ?")
+        .all(listId) as { trackId: number; databaseUuid: string }[];
+      const resolveLocal = precheck.prepare(
+        "SELECT id FROM Track WHERE originDatabaseUuid = ? AND originTrackId = ?",
+      );
+      const requested = new Set(trackIds);
+      for (const e of existing) {
+        const local = resolveLocal.get(e.databaseUuid, e.trackId) as { id: number } | undefined;
+        if (local && requested.has(local.id)) {
+          return err(
+            "duplicate_track",
+            `Track ${local.id} is already in playlist ${listId}; Engine allows a track in a playlist only once.`,
+            { detail: NOT_COMMITTED },
+          );
+        }
+      }
+
+      if (at === "start") insertAt = 0;
+      else if (at === "end") insertAt = gate.order.length;
+      else {
+        const p = at.after_position;
+        if (!Number.isInteger(p) || p < 1 || p > gate.order.length) {
+          return err(
+            "invalid_position",
+            `Playlist ${listId} has ${gate.order.length} entries; after_position must be between 1 and ${gate.order.length}.`,
+            { detail: NOT_COMMITTED },
+          );
+        }
+        insertAt = p;
+      }
+    } catch (e) {
+      return mapWriteError(e, subject, mdbPath);
+    } finally {
+      try {
+        precheck?.close();
+      } catch {
+        /* never opened, or already closed */
+      }
+    }
+  }
+
+  // See createPlaylist for why this runs before the write connection opens.
+  const snapshot = await sessionSnapshot(mdbPath, uuid, opts.backupDir);
+  if (typeof snapshot !== "string") return { ...snapshot, detail: NOT_COMMITTED };
+  const backupPath = snapshot;
+
+  let db: DatabaseSync | undefined;
+  let open = false;
+  let commit: CommitState = "not yet";
+  try {
+    db = new DatabaseSync(mdbPath);
+    open = true;
+    db.exec("PRAGMA foreign_keys = ON");
+    db.exec("BEGIN IMMEDIATE");
+
+    // The chain read in the pre-check is re-read here: BEGIN IMMEDIATE is
+    // the first moment nothing else can change it, and gating on a chain
+    // read before the lock would be gating on a stale one.
+    const gate = checkChain(readChain(db, listId));
+    if (!gate.ok) {
+      rollback(db);
+      return err("playlist_chain_damaged", `Playlist ${listId}: ${gate.reason}. Nothing was changed.`, {
+        detail: NOT_COMMITTED,
+      });
+    }
+
+    // What the final chain should read back as: the existing entries' track
+    // identities, with the requested tracks spliced in at the position this
+    // call resolved to. Built before the writes below, from a walk keyed by
+    // id rather than by row count, so the readback check afterwards does not
+    // itself depend on how the writes below number their new rows.
+    const existingRefs = gate.order.length > 0 ? walkFrom(db, listId, gate.order[0]!) : [];
+    const expected = [...existingRefs.slice(0, insertAt), ...refs, ...existingRefs.slice(insertAt)];
+
+    // Insert one row at a time, linking by the id each insert actually
+    // returned -- the same reason createPlaylist does: SQLite assigning
+    // AUTOINCREMENT in ORDER BY order is optimizer behaviour, not a promise.
+    const insEntity = db.prepare(
+      `INSERT INTO PlaylistEntity (listId, trackId, databaseUuid, nextEntityId, membershipReference)
+       VALUES (?, ?, ?, 0, 0)`,
     );
+    const link = db.prepare("UPDATE PlaylistEntity SET nextEntityId = ? WHERE id = ?");
+    const ids: number[] = refs.map((ref) => Number(insEntity.run(listId, ref.trackId, ref.uuid).lastInsertRowid));
+    for (let i = 0; i + 1 < ids.length; i++) link.run(ids[i + 1]!, ids[i]!);
+
+    if (ids.length > 0) {
+      if (insertAt === 0) {
+        // Inserting at the start needs no other row touched, because nothing
+        // links to a head: the new run just becomes the head, ending in
+        // whatever was the old one (0 if the playlist was empty).
+        const oldHead = gate.order.length > 0 ? gate.order[0]! : 0;
+        link.run(oldHead, ids[ids.length - 1]!);
+      } else {
+        // Otherwise the new run is spliced in after gate.order[insertAt - 1]:
+        // its link is repointed at the first new row, and the last new row
+        // takes the link the predecessor had (0 if it was the tail).
+        const predId = gate.order[insertAt - 1]!;
+        const predNext = insertAt < gate.order.length ? gate.order[insertAt]! : 0;
+        link.run(ids[0]!, predId);
+        link.run(predNext, ids[ids.length - 1]!);
+      }
+    }
+
+    const newHeadId = insertAt === 0 ? (ids[0] ?? gate.order[0] ?? 0) : gate.order[0]!;
+    if (!sameOrder(walkFrom(db, listId, newHeadId), expected)) {
+      rollback(db);
+      return err(
+        "library_unreadable",
+        `The entry chain for playlist ${listId} did not read back as written; nothing was changed.`,
+        { detail: NOT_COMMITTED },
+      );
+    }
+
+    // No trigger maintains this: measured, changing PlaylistEntity leaves the
+    // parent Playlist row untouched. datetime('now'), not strftime('%s') --
+    // that is the Track convention, and Playlist.lastEditTime is TEXT.
+    db.prepare("UPDATE Playlist SET lastEditTime = datetime('now') WHERE id = ?").run(listId);
+
+    commit = "maybe";
+    db.exec("COMMIT");
+    commit = "yes";
+
+    const verifyErr = verifyAfterCommit(db, subject, backupPath);
+    if (verifyErr) return verifyErr;
+
+    const positions = ids.map((_, i) => insertAt + 1 + i);
+    return {
+      playlist_id: listId,
+      tracks_added: refs.length,
+      positions,
+      undo: [{ tool: "remove_tracks_from_playlist", arguments: { playlist_id: listId, positions } }],
+      backup_path: backupPath,
+    };
+  } catch (e) {
+    return classifyWriteFailure(e, commit, subject, mdbPath, backupPath, db, open);
   } finally {
     try {
       db?.close();
