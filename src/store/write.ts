@@ -1408,9 +1408,11 @@ export async function reorderPlaylist(
     for (let i = 0; i < newSeq.length; i++) {
       const entryId = newSeq[i]!;
       const newNext = i + 1 < newSeq.length ? newSeq[i + 1]! : 0;
-      // Only entries whose link actually changes are written -- this is what
-      // keeps a permutation that changes nothing a true no-op rather than n
-      // redundant writes.
+      // Only entries whose link actually changes are written -- this avoids
+      // n redundant PlaylistEntity writes for an identity permutation. It
+      // does not make the call itself a no-op: lastEditTime is still stamped
+      // below, and the session's snapshot was already copied before this ran
+      // (see the doc-comment above).
       if (currentNext.get(entryId) !== newNext) link.run(newNext, entryId);
     }
 
