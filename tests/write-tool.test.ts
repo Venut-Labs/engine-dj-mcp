@@ -100,3 +100,49 @@ describe("create_playlist tool", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe("playlist edit tools", () => {
+  it("registers all three edit tools only with writes enabled", async () => {
+    const { dir } = lib();
+    const off = await connectedClient([dir], join(dir, "sc1"));
+    const offNames = (await off.client.listTools()).tools.map((t) => t.name);
+    for (const n of ["add_tracks_to_playlist", "remove_tracks_from_playlist", "reorder_playlist"]) {
+      expect(offNames, n).not.toContain(n);
+    }
+    await off.client.close();
+
+    const on = await connectedClient([dir], join(dir, "sc2"), { allowWrites: true, backupBaseDir: join(dir, "b") });
+    const onTools = (await on.client.listTools()).tools;
+    for (const n of ["add_tracks_to_playlist", "remove_tracks_from_playlist", "reorder_playlist"]) {
+      const t = onTools.find((x) => x.name === n)!;
+      expect(t, n).toBeDefined();
+      expect(t.annotations?.readOnlyHint, n).toBe(false);
+    }
+    await on.client.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("edits a playlist named by name, and hands back a usable undo", async () => {
+    const { dir, dbPath } = lib();
+    const { client } = await connectedClient([dir], join(dir, "sc"), {
+      allowWrites: true,
+      backupBaseDir: join(dir, "b"),
+    });
+    const res: any = await client.callTool({
+      name: "add_tracks_to_playlist",
+      arguments: { playlist_name: "Old", track_ids: [4] },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(res.structuredContent.undo[0].tool).toBe("remove_tracks_from_playlist");
+
+    const undo = res.structuredContent.undo[0];
+    const back: any = await client.callTool({ name: undo.tool, arguments: undo.arguments });
+    expect(back.isError).toBeFalsy();
+
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    expect((db.prepare("SELECT COUNT(*) c FROM PlaylistEntity WHERE listId = 1").get() as any).c).toBe(1);
+    db.close();
+    await client.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
