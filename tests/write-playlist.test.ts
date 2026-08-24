@@ -726,4 +726,28 @@ describe("checkChain", () => {
     expect(r.ok).toBe(false);
     expect(r.reason).toMatch(/reach|cover/i);
   });
+
+  it("refuses a chain that converges instead of ending", () => {
+    // One head (1), no dangling link, and the walk from 1 visits all three
+    // ids -- 1, 2, 3 -- before it repeats one, so a coverage-only check
+    // would call this sound. It is not: row 3 links back into row 2, an
+    // already-linked interior row, so row 2 has two predecessors and no row
+    // ever points at 0. The chain never ends.
+    const r = checkChain([
+      { id: 1, next: 2 },
+      { id: 2, next: 3 },
+      { id: 3, next: 2 },
+    ]);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toMatch(/end|loop/i);
+  });
+
+  it("refuses a single row that links to itself", () => {
+    // Not covered by the coverage check at all -- a lone self-linked row is
+    // rejected earlier, for having no head. Locked in as its own case so a
+    // future refactor of the head/coverage split cannot silently start
+    // accepting a one-node cycle as a one-row playlist.
+    const r = checkChain([{ id: 1, next: 1 }]);
+    expect(r.ok).toBe(false);
+  });
 });

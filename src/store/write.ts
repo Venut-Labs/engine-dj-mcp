@@ -174,11 +174,16 @@ export interface ChainCheck {
  * entries would be worse than one that guesses an order and says so. An edit
  * needs the opposite: a yes or no.
  *
- * Three conditions, and all three are needed because different breakages trip
+ * Four conditions, and each is needed because different breakages trip
  * different ones. Checking only that the walk covered every row is the trap:
  * a list severed into two runs has two heads, and walking from both covers
  * everything -- measured, on a chain broken on purpose, as "5 of 5" while the
- * walk from the real head reached 2.
+ * walk from the real head reached 2. Checking coverage without also checking
+ * that the walk *ended* is a second, subtler version of the same trap: a row
+ * whose next points back into an already-linked interior row (two
+ * predecessors, no row pointing at 0) can visit every row and still never
+ * terminate -- the walk stops only because it revisits a row it has already
+ * seen, not because it reached the end.
  */
 export function checkChain(rows: { id: number; next: number }[]): ChainCheck {
   if (rows.length === 0) return { ok: true, order: [] };
@@ -209,10 +214,33 @@ export function checkChain(rows: { id: number; next: number }[]): ChainCheck {
   const order: number[] = [];
   const seen = new Set<number>();
   let cur: { id: number; next: number } | undefined = heads[0];
+  // Whether the walk stopped by reaching a row whose next is 0, as opposed
+  // to stopping because it looped back onto a row already visited. Coverage
+  // alone cannot tell these apart: a converging chain (row 3 pointing back
+  // into row 2, an already-visited interior row) walks every row before it
+  // repeats one, so `order.length === rows.length` is true for it too. This
+  // flag is what distinguishes ending from merely running out of new rows to
+  // visit.
+  let clean = false;
   while (cur && !seen.has(cur.id)) {
     seen.add(cur.id);
     order.push(cur.id);
-    cur = cur.next === 0 ? undefined : byId.get(cur.next);
+    if (cur.next === 0) {
+      clean = true;
+      cur = undefined;
+    } else {
+      cur = byId.get(cur.next);
+    }
+  }
+  // Checked before coverage, and independently of it: a converging chain can
+  // cover every row while still having no tail, so coverage passing must not
+  // stand in for this.
+  if (!clean) {
+    return {
+      ok: false,
+      reason: "the chain does not end -- it loops back into an entry already visited instead of reaching a terminating entry",
+      order: [],
+    };
   }
   if (order.length !== rows.length) {
     return {
