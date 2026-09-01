@@ -20,7 +20,7 @@ export const LIBRARY_ARG_DESCRIPTION =
   "the supported library holding the most tracks. If two supported libraries hold " +
   "the same most tracks -- what a USB drive and its copy on the computer produce -- " +
   "a read still picks one, but a WRITE refuses with ambiguous_library listing both, " +
-  "since the choice decides which disk changes; pass this argument to settle it.";
+  "since the choice decides which disk changes; ask the user which, then pass it here.";
 
 export const LibraryArg = z.string().min(1).optional().describe(LIBRARY_ARG_DESCRIPTION);
 
@@ -100,8 +100,10 @@ export function ambiguousLibrary(tied: readonly LibraryInfo[]): EngineError {
   const list = tied.map((l) => `${l.uuid} -- ${redactPath(l.path)} (${l.trackCount} tracks)`).join("; ");
   return err(
     "ambiguous_library",
-    `More than one library holds the most tracks, so there is no default to write to. ` +
-      `Pass \`library\` naming one of: ${list}. Nothing was written.`,
+    `More than one library holds the most tracks, so there is no default to write to: ${list}. ` +
+      `Nothing was written. ASK which one to write to, then retry with \`library\` set -- ` +
+      `do not choose for them. These are usually a USB drive and its copy on the computer, ` +
+      `and one of them may be the drive they perform from.`,
     { detail: "not_committed" },
   );
 }

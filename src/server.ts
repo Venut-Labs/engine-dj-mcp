@@ -115,7 +115,7 @@ const LIBRARY_SELECTION_NOTE =
 const WRITE_LIBRARY_TIE_NOTE =
   " If two supported libraries hold the same most tracks -- what a USB drive and its copy on " +
   "the computer produce -- this tool refuses with ambiguous_library rather than picking one, " +
-  "and lists both; nothing is written. Pass `library` to settle it.";
+  "and lists both; nothing is written. Ask the user which one, then retry with `library` set -- do not pick for them, since one of the two may be the drive they perform from.";
 
 function reply(value: unknown) {
   return {

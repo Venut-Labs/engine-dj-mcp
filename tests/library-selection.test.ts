@@ -124,6 +124,11 @@ describe("pickDefaultLibrary", () => {
       expect(e.message).toContain(bit);
     }
     expect(e.detail).toBe("not_committed");
+    // And it tells the reader to ask rather than choose. Without this a model
+    // reading "pass library, here are two" simply takes the first, which puts
+    // the write back on an arbitrary disk and undoes the whole refusal.
+    expect(e.message).toMatch(/ASK which one/);
+    expect(e.message).toMatch(/do not choose for them/);
   });
 
   it("never defaults to an unsupported library while a supported one exists", () => {

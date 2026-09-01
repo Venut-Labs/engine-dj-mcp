@@ -372,6 +372,11 @@ disk changes, and one of the two may be the drive you perform from; scan
 order is not a reason to pick it. Name a library and the write goes through,
 tie or not — the ambiguity being refused is the server's, not yours.
 
+The refusal tells the assistant to **ask you** rather than choose. Otherwise
+"pass `library`, here are the two" is an invitation to take the first one,
+which puts the write back on an arbitrary disk and makes the refusal
+pointless.
+
 Each library gets its own index and its own connection, opened the first time
 you ask that library something. Comparing two libraries against each other —
 *"what is on this drive but not that one?"* — is **not** something this server
