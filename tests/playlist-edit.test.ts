@@ -877,3 +877,44 @@ describe("an undo replayed after Engine has renumbered the entries", () => {
     expect(order(dbPath)).toEqual([7, 1, 2, 3, 6]);
   });
 });
+
+describe("every write names the library it ran against", () => {
+  // Two libraries connected is the ordinary setup for a DJ: the USB drive and
+  // its copy on the computer. The `library` argument decides which one a write
+  // lands on, and until now the result did not say which one that was -- so a
+  // call that resolved to the wrong drive looked exactly like one that did not.
+  //
+  // It also gives `undo` the context it needs. Undo reverses the edit in this
+  // library and cannot reach a copy Engine has since propagated elsewhere
+  // (measured 2026-09-01), so a caller replaying an undo has to be able to see
+  // which library it is replaying into.
+
+  it("reports the uuid and path an add wrote to", async () => {
+    const { dbPath, backupDir } = setup();
+    const r: any = await addTracksToPlaylist(dbPath, "lib-uuid", { listId: 1, trackIds: [6], at: "end" }, { backupDir });
+    expect(r.library).toEqual({ uuid: "lib-uuid", path: dbPath });
+  });
+
+  it("reports it for a remove", async () => {
+    const { dbPath, backupDir } = setup();
+    const r: any = await removeTracksFromPlaylist(dbPath, "lib-uuid", { listId: 1, positions: [1] }, { backupDir });
+    expect(r.library).toEqual({ uuid: "lib-uuid", path: dbPath });
+  });
+
+  it("reports it for a reorder", async () => {
+    const { dbPath, backupDir } = setup();
+    const r: any = await reorderPlaylist(dbPath, "lib-uuid", { listId: 1, order: [3, 1, 2] }, { backupDir });
+    expect(r.library).toEqual({ uuid: "lib-uuid", path: dbPath });
+  });
+
+  it("names the library that was actually written, not the first one to hand", async () => {
+    // A hardcoded or captured-once value would pass all three tests above.
+    const a = setup();
+    const b = setup();
+    const ra: any = await addTracksToPlaylist(a.dbPath, "uuid-a", { listId: 1, trackIds: [6], at: "end" }, { backupDir: a.backupDir });
+    const rb: any = await addTracksToPlaylist(b.dbPath, "uuid-b", { listId: 1, trackIds: [6], at: "end" }, { backupDir: b.backupDir });
+    expect(ra.library).toEqual({ uuid: "uuid-a", path: a.dbPath });
+    expect(rb.library).toEqual({ uuid: "uuid-b", path: b.dbPath });
+    expect(ra.library.path).not.toBe(rb.library.path);
+  });
+});

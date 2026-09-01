@@ -81,6 +81,25 @@ const PACKAGE_INFO = JSON.parse(readFileSync(new URL("../package.json", import.m
  * this repeats the essentials in the description because some clients show a
  * model the description and not the per-property schema documentation.
  */
+/**
+ * Every write result names the library it landed in, and every undo is scoped
+ * to that one library. Engine DJ propagates a playlist change to another
+ * connected library by itself -- measured 2026-09-01: an edit made to the
+ * library on the computer appeared on the USB drive after Engine was next
+ * launched, the copy carrying the very timestamp this server's INSERT had
+ * written. An undo call cannot reach that copy, and reports success anyway,
+ * because within its own library it did exactly what it promised.
+ *
+ * Stated in the description, not just the README, because the caller who has
+ * to act on it is the model holding the undo.
+ */
+const UNDO_SCOPE_NOTE =
+  "`undo` reverses this edit in ONE library: the one the result's `library` field names. " +
+  "Engine DJ copies playlist changes between connected libraries on its own, so launching it " +
+  "with a second library attached can leave a copy of this edit there -- and no undo call " +
+  "reaches that copy. With two libraries connected (a USB drive and its copy on the computer " +
+  "is the usual case), undo separately against each. ";
+
 const LIBRARY_SELECTION_NOTE =
   "With more than one library connected, pass `library` (a uuid or path from list_libraries, " +
   "either the ~/... form or the absolute one) to choose which one; the default is the " +
@@ -572,6 +591,10 @@ export async function createServer(
           "write of this session; it is a recovery route for a damaged library, NOT an undo. " +
           "Restoring it reverts the entire library to that moment, discarding everything " +
           "Engine DJ has written since (play counts, imports, cue and beatgrid edits). " +
+          "The result's `library` field names which library this went into. Engine DJ copies " +
+          "playlist changes between connected libraries on its own (measured for an edit to an " +
+          "existing playlist), so with a second library attached the new playlist may appear " +
+          "there too. " +
           "No existing playlist is renamed, reordered, emptied or deleted, and no track, cue or " +
           "beatgrid is touched. The one existing row that moves is the previous last playlist's " +
           "link, and Engine's own insert trigger is what moves it. " +
@@ -628,6 +651,7 @@ export async function createServer(
           "session's first write, discarding every play count, import, cue and beatgrid change " +
           "Engine DJ has recorded since -- not just this one edit. backup_path is only a " +
           "last-resort recovery route for a damaged library, never an undo. " +
+          UNDO_SCOPE_NOTE +
           LIBRARY_SELECTION_NOTE,
         inputSchema: { ...AddTracksToPlaylistInput.shape, library: LibraryArg },
         annotations: RW,
@@ -673,6 +697,7 @@ export async function createServer(
           "else. Preferred over restoring " +
           "backup_path, which reverts the WHOLE library to before this session's first write, " +
           "discarding everything Engine DJ has recorded since -- not just this edit. " +
+          UNDO_SCOPE_NOTE +
           LIBRARY_SELECTION_NOTE,
         inputSchema: { ...RemoveTracksFromPlaylistInput.shape, library: LibraryArg },
         annotations: RW_DESTRUCTIVE,
@@ -706,6 +731,7 @@ export async function createServer(
           "backup_path, which reverts the " +
           "WHOLE library to before this session's first write, discarding everything Engine DJ " +
           "has recorded since -- not just this reorder. " +
+          UNDO_SCOPE_NOTE +
           LIBRARY_SELECTION_NOTE,
         inputSchema: { ...ReorderPlaylistInput.shape, library: LibraryArg },
         annotations: RW_DESTRUCTIVE,

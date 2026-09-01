@@ -224,7 +224,7 @@ Each entry stores the track's origin identity — `(originDatabaseUuid,
 originTrackId)`, the pair Engine matches on — not the local row id, so a
 playlist built here reads the same way Engine's own does.
 
-The result carries `playlist_id`, `tracks_added` and `backup_path`. **To undo
+The result carries `playlist_id`, `tracks_added`, `library` and `backup_path`. **To undo
 it, delete the playlist in Engine DJ**; `backup_path` is a whole-library
 snapshot for the case where something went wrong at a lower level, not an
 undo — see [Restoring a snapshot](#restoring-a-snapshot).
@@ -258,13 +258,15 @@ way.
 | `at` | Where the new tracks land, against the playlist's current 1-based positions (the same numbering `get_playlist_tracks` reports): `"start"`, `"end"` (the default), or `{ after_position: n }`. |
 
 The result carries `playlist_id`, `tracks_added`, `positions` — where the
-new tracks landed — `undo`, `undo_complete` (always `true` here) and
-`backup_path`. `undo` is the exact `remove_tracks_from_playlist` call that
+new tracks landed — `undo`, `undo_complete` (always `true` here), `library`
+and `backup_path`. `undo` is the exact `remove_tracks_from_playlist` call that
 reverses this edit: the positions the tracks landed at, plus
 `expect_track_ids` naming the tracks that landed there, so a playlist
 something else changed in the meantime is refused rather than having the
 wrong rows removed. Call it to undo rather than restoring `backup_path` —
-see [Restoring a snapshot](#restoring-a-snapshot). Refusals add
+see [Restoring a snapshot](#restoring-a-snapshot), and
+[An undo covers one library](#an-undo-covers-one-library) for what it does
+not reach. Refusals add
 `playlist_not_found`, `playlist_chain_damaged` and `invalid_position` to
 `create_playlist`'s own list; `detail` works the same way.
 
@@ -282,8 +284,8 @@ repaired.
 | `expect_track_ids` | Optional, one entry per position: verifies each named position still holds the track expected before anything is removed, refusing the whole call otherwise. `null` means "this position should hold an entry whose track is missing", not "no expectation". |
 
 The result carries `playlist_id`, `tracks_removed`, `removed` — each
-position's `track_id`, `null` for a missing one — `undo`, `undo_complete` and
-`backup_path`. `undo` is a **sequence** of `add_tracks_to_playlist` calls,
+position's `track_id`, `null` for a missing one — `undo`, `undo_complete`,
+`library` and `backup_path`. `undo` is a **sequence** of `add_tracks_to_playlist` calls,
 one per removed track that can be restored. Run them in the order given,
 never in parallel and never reversed — each step's target position is
 computed against the list as it stands after the previous step has already
@@ -323,7 +325,7 @@ repaired.
 | `order` | A full permutation of `1..n`, `n` being the playlist's current entry count. `order[i]` names the *current* 1-based position (from `get_playlist_tracks`) of the track that should end up at position `i + 1`. A partial "move x to y" instruction is not accepted — name every position, including ones that do not move. |
 
 The result carries `playlist_id`, `undo`, `undo_complete` (always `true`
-here) and `backup_path`. `undo` is the exact inverse permutation, as a single
+here), `library` and `backup_path`. `undo` is the exact inverse permutation, as a single
 `reorder_playlist` call. Refusals: `playlist_not_found`,
 `playlist_chain_damaged`, and `invalid_position` if `order` is not a full
 permutation of the playlist's current positions.
@@ -421,6 +423,34 @@ holding a conflicting lock at that moment, the write is refused with
 `library_busy` and nothing is changed. Merely having Engine DJ *open* is not
 usually a conflict, and the write normally succeeds with Engine running;
 Engine will show the new playlist after it next re-reads the library.
+
+### An undo covers one library
+
+Every write result carries a `library` field — the `uuid` and `path` of the
+library the write actually landed in. Two libraries connected at once is the
+ordinary setup: a USB drive and its copy on the computer. This is where you
+check which of them a write went to.
+
+**`undo` reverses the edit in that one library, and only there.** Engine DJ
+moves playlist changes between connected libraries by itself, so a copy of
+your edit can end up somewhere `undo` cannot reach.
+
+Measured 2026-09-01. A track was added to a playlist in the library on the
+computer. Engine DJ was then launched with the USB drive attached, and the
+same playlist on the USB came back with the same track added — the copy
+carrying the very `lastEditTime` this server's `INSERT` had written. The
+`undo` was then run and reversed the edit on the computer. The USB kept it.
+
+Nothing was damaged: both libraries stayed sound. But the two had diverged,
+and the `undo` reported success, correctly, because within its own library it
+did exactly what it promised.
+
+So: if a second library is connected, look at the `library` field, and undo
+against each library separately. Undoing before Engine DJ next runs avoids
+the problem entirely.
+
+Which library a change propagates to, and in which direction, is Engine's own
+business — this project does not model it and will not guess at it.
 
 ### Restoring a snapshot
 
