@@ -334,3 +334,69 @@ export function damageChain(dbPath: string, listId: number, kind: "cycle" | "dan
   }
   db.close();
 }
+
+/**
+ * Renumber one playlist's entries the way an Engine DJ launch does: ids become
+ * contiguous, ascending in display order, starting from the list's current
+ * lowest id. The order tracks appear in survives exactly; the ids carrying
+ * them do not.
+ *
+ * Measured 2026-09-01 on the real library. A list this server had edited to
+ * 126 -> 127 -> 616 -> 128 -> 129 -> 130 -> 0 came back from an Engine launch
+ * as 126 -> 127 -> 128 -> 129 -> 130 -> 131 -> 0 -- six tracks, same six
+ * places, every id from the insertion point on shifted by one.
+ *
+ * The danger is not the id that vanishes; 616 is gone and any reference to it
+ * would error honestly. It is the id that survives meaning something else:
+ * 128 was the fourth entry and is now the third. A value we handed a caller
+ * that named an entry by id would, replayed after a launch, succeed against
+ * the wrong row. That is why every undo is expressed as positions plus
+ * expect_track_ids, and this helper exists so a test can hold that line.
+ */
+export function renumberEntries(dbPath: string, listId: number): void {
+  const db = new DatabaseSync(dbPath);
+  try {
+    const rows = db
+      .prepare("SELECT id, nextEntityId FROM PlaylistEntity WHERE listId = ?")
+      .all(listId) as { id: number; nextEntityId: number }[];
+    if (rows.length === 0) return;
+
+    const next = new Map(rows.map((r) => [r.id, r.nextEntityId]));
+    const pointed = new Set(rows.map((r) => r.nextEntityId));
+    const heads = rows.filter((r) => !pointed.has(r.id));
+    if (heads.length !== 1) {
+      throw new Error(`renumberEntries needs exactly one head, list ${listId} has ${heads.length}`);
+    }
+
+    // Walk for display order -- that is what Engine preserves, and it is not
+    // the same as ordering by id, which is the whole point of the helper.
+    const order: number[] = [];
+    for (let cur = heads[0]!.id; cur !== 0; cur = next.get(cur)!) {
+      order.push(cur);
+      if (order.length > rows.length) throw new Error(`renumberEntries: cycle in list ${listId}`);
+    }
+    if (order.length !== rows.length) {
+      throw new Error(
+        `renumberEntries: chain covers ${order.length} of ${rows.length} entries in list ${listId}`,
+      );
+    }
+
+    const base = Math.min(...rows.map((r) => r.id));
+    // Park out of the way first: the target ids overlap the current ones, so a
+    // single pass would collide on the primary key partway through.
+    const max = (db.prepare("SELECT MAX(id) AS m FROM PlaylistEntity").get() as { m: number | null }).m ?? 0;
+    const park = max + 1000;
+
+    db.exec("BEGIN");
+    const setId = db.prepare("UPDATE PlaylistEntity SET id = ? WHERE id = ?");
+    order.forEach((id, i) => setId.run(park + i, id));
+    order.forEach((_, i) => setId.run(base + i, park + i));
+    // Relink in the new numbering. Every nextEntityId still names an old id at
+    // this point, so all of them are rewritten, not just the ones that moved.
+    const setNext = db.prepare("UPDATE PlaylistEntity SET nextEntityId = ? WHERE id = ?");
+    order.forEach((_, i) => setNext.run(i === order.length - 1 ? 0 : base + i + 1, base + i));
+    db.exec("COMMIT");
+  } finally {
+    db.close();
+  }
+}

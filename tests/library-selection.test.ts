@@ -6,9 +6,16 @@ import { dirname, join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { makeLibrary } from "./fixtures/gen-library.js";
+import { makeLibrary, addPlaylists } from "./fixtures/gen-library.js";
+import { DatabaseSync } from "node:sqlite";
 import { createServer } from "../src/server.js";
-import { pickDefaultLibrary, findLibrary, libraryNotFound } from "../src/library-select.js";
+import {
+  pickDefaultLibrary,
+  defaultLibraryTies,
+  ambiguousLibrary,
+  findLibrary,
+  libraryNotFound,
+} from "../src/library-select.js";
 import type { LibraryInfo } from "../src/discovery.js";
 
 /**
@@ -63,6 +70,65 @@ describe("pickDefaultLibrary", () => {
     const second = info({ path: "/b/m.db", trackCount: 100 });
     expect(pickDefaultLibrary([first, second])).toBe(first);
     expect(pickDefaultLibrary([second, first])).toBe(second);
+  });
+
+  it("reports a tie for the default, so a write can refuse instead of guessing", () => {
+    // A USB library and its copy on the computer hold the same tracks, so they
+    // tie precisely because one is a copy of the other -- the ordinary setup
+    // for a DJ, not an exotic one. Measured 2026-09-01: both real libraries
+    // reported 257. Reads may pick either; a write must not.
+    const a = info({ path: "/a/m.db", trackCount: 257 });
+    const b = info({ path: "/b/m.db", trackCount: 257 });
+    expect(defaultLibraryTies([a, b])).toEqual([a, b]);
+  });
+
+  it("reports no tie when one library holds more", () => {
+    const a = info({ path: "/a/m.db", trackCount: 257 });
+    const b = info({ path: "/b/m.db", trackCount: 256 });
+    expect(defaultLibraryTies([a, b])).toEqual([]);
+    expect(defaultLibraryTies([b, a])).toEqual([]);
+  });
+
+  it("reports no tie for a single library, however many tracks it has", () => {
+    expect(defaultLibraryTies([info({ path: "/a/m.db", trackCount: 257 })])).toEqual([]);
+    expect(defaultLibraryTies([])).toEqual([]);
+  });
+
+  it("does not count an unsupported library into a tie it could never win", () => {
+    // pickDefaultLibrary skips unsupported libraries entirely, so one that
+    // happens to hold the same number of tracks is not a competing candidate
+    // and must not make a write refuse.
+    const good = info({ path: "/a/m.db", trackCount: 257 });
+    const old = info({ path: "/b/m.db", trackCount: 257, supported: false, schema: [2, 18, 0] });
+    expect(defaultLibraryTies([good, old])).toEqual([]);
+  });
+
+  it("counts three the same way it counts two", () => {
+    const a = info({ path: "/a/m.db", trackCount: 9 });
+    const b = info({ path: "/b/m.db", trackCount: 9 });
+    const c = info({ path: "/c/m.db", trackCount: 9 });
+    expect(defaultLibraryTies([a, b, c])).toEqual([a, b, c]);
+  });
+
+  it("names every tied candidate in the error, since the caller has to choose one", () => {
+    const a = info({ path: "/a/m.db", trackCount: 257, uuid: "uuid-a" });
+    const b = info({ path: "/b/m.db", trackCount: 257, uuid: "uuid-b" });
+    const e = ambiguousLibrary([a, b]);
+    expect(e.error).toBe("ambiguous_library");
+    // In the message, not in detail. This is only ever returned from a write
+    // tool, and on that path `detail` is reserved for exactly one of two
+    // strings a client reads to decide whether its library changed. Putting
+    // prose there would break that read for the one error where the answer
+    // ("nothing happened") is least ambiguous.
+    for (const bit of ["uuid-a", "uuid-b", "/a/m.db", "/b/m.db", "257"]) {
+      expect(e.message).toContain(bit);
+    }
+    expect(e.detail).toBe("not_committed");
+    // And it tells the reader to ask rather than choose. Without this a model
+    // reading "pass library, here are two" simply takes the first, which puts
+    // the write back on an arbitrary disk and undoes the whole refusal.
+    expect(e.message).toMatch(/ASK which one/);
+    expect(e.message).toMatch(/do not choose for them/);
   });
 
   it("never defaults to an unsupported library while a supported one exists", () => {
@@ -605,5 +671,140 @@ describe("what a model is told about choosing a library", () => {
     expect(text).toContain("most tracks");
     for (const name of TAKES_LIBRARY) expect(text, name).toContain(name);
     await client.close();
+  });
+});
+
+describe("a write with two libraries tied for the default", () => {
+  // The real shape, measured 2026-09-01: the computer's library and the USB
+  // drive both held 257 tracks -- tied because one was a copy of the other,
+  // which is why this is the ordinary setup and not an edge case.
+  let root: string, aRoot: string, bRoot: string, aMdb: string, bMdb: string;
+  let tieSeq = 0;
+
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "edj-tie-"));
+    aRoot = join(root, "a");
+    bRoot = join(root, "b");
+    mkdirSync(aRoot);
+    mkdirSync(bRoot);
+    aMdb = makeLibrary(aRoot, { tracks: 20, uuid: "cccccccc-3333-4333-8333-cccccccccccc" });
+    bMdb = makeLibrary(bRoot, { tracks: 20, uuid: "dddddddd-4444-4444-8444-dddddddddddd" });
+    addPlaylists(aMdb, [{ id: 1, title: "Set", nextListId: 0, entries: [{ id: 1, trackId: 1, next: 0 }] }]);
+    addPlaylists(bMdb, [{ id: 1, title: "Set", nextListId: 0, entries: [{ id: 1, trackId: 1, next: 0 }] }]);
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  const writeServer = async () => {
+    const server = await createServer({
+        roots: [aRoot, bRoot],
+      // Own sidecar root: `base` belongs to the describe above and is
+      // undefined here, and a fresh one per server keeps one test's built
+      // index from making another's refresh report rebuilt: false.
+      sidecarBaseDir: join(root, `sidecars-${++tieSeq}`),
+      allowWrites: true,
+      backupBaseDir: join(root, "backups"),
+    });
+    openServers.push(server);
+    const client = new Client({ name: "tie-client", version: "0" });
+    const [st, ct] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(st), client.connect(ct)]);
+    return client;
+  };
+
+  const entryCount = (mdb: string) => {
+    const db = new DatabaseSync(mdb, { readOnly: true });
+    const n = (db.prepare("SELECT COUNT(*) AS n FROM PlaylistEntity WHERE listId = 1").get() as any).n;
+    db.close();
+    return n as number;
+  };
+
+  it("refuses, naming both candidates, and writes to neither", async () => {
+    const client = await writeServer();
+    const beforeA = entryCount(aMdb);
+    const beforeB = entryCount(bMdb);
+    const r = await client.callTool({
+      name: "add_tracks_to_playlist",
+      arguments: { playlist_id: 1, track_ids: [5] },
+    });
+    const body = r.structuredContent as any;
+    expect(body.error).toBe("ambiguous_library");
+    expect(body.message).toContain("cccccccc-3333-4333-8333-cccccccccccc");
+    expect(body.message).toContain("dddddddd-4444-4444-8444-dddddddddddd");
+    // The one field a client reads to know whether its library changed.
+    expect(body.detail).toBe("not_committed");
+    // Before/after, not absolute counts: "writes to neither" is a statement
+    // about change, and asserting fixed numbers would make this test depend
+    // on which other test in this file ran first.
+    expect(entryCount(aMdb), "library a untouched").toBe(beforeA);
+    expect(entryCount(bMdb), "library b untouched").toBe(beforeB);
+  });
+
+  it("goes through once a library is named, and only into that one", async () => {
+    const client = await writeServer();
+    const beforeA = entryCount(aMdb);
+    const beforeB = entryCount(bMdb);
+    const r = await client.callTool({
+      name: "add_tracks_to_playlist",
+      arguments: { playlist_id: 1, track_ids: [5], library: "dddddddd-4444-4444-8444-dddddddddddd" },
+    });
+    const body = r.structuredContent as any;
+    expect(body.error).toBeUndefined();
+    expect(body.library.uuid).toBe("dddddddd-4444-4444-8444-dddddddddddd");
+    expect(entryCount(bMdb), "the named library got the track").toBe(beforeB + 1);
+    expect(entryCount(aMdb), "the other one did not").toBe(beforeA);
+  });
+
+  it("does not refuse over a library that has since been unplugged", async () => {
+    // knownList() is a cache: it keeps a library that a later scan cannot see,
+    // deliberately, so a momentarily locked drive does not vanish from
+    // list_libraries. For a tie check that caching is wrong in the one
+    // direction that bites -- the USB drive is pulled, one library is left,
+    // and the write is refused naming a drive that is not there.
+    const gone = join(root, "gone");
+    mkdirSync(gone);
+    const goneMdb = makeLibrary(gone, { tracks: 20, uuid: "eeeeeeee-5555-4555-8555-eeeeeeeeeeee" });
+    addPlaylists(goneMdb, [{ id: 1, title: "Set", nextListId: 0, entries: [{ id: 1, trackId: 1, next: 0 }] }]);
+
+    const server = await createServer({
+      roots: [aRoot, gone],
+      sidecarBaseDir: join(root, `sidecars-gone-${++tieSeq}`),
+      allowWrites: true,
+      backupBaseDir: join(root, "backups"),
+    });
+    openServers.push(server);
+    const client = new Client({ name: "gone-client", version: "0" });
+    const [st, ct] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(st), client.connect(ct)]);
+
+    // Both present at startup: the tie is real and the write is refused.
+    const tied = await client.callTool({
+      name: "add_tracks_to_playlist",
+      arguments: { playlist_id: 1, track_ids: [5] },
+    });
+    expect((tied.structuredContent as any).error).toBe("ambiguous_library");
+
+    // The drive is pulled. One library is left, so there is nothing to be
+    // ambiguous about and the write must go through.
+    rmSync(gone, { recursive: true, force: true });
+    const before = entryCount(aMdb);
+    const after = await client.callTool({
+      name: "add_tracks_to_playlist",
+      arguments: { playlist_id: 1, track_ids: [5] },
+    });
+    const body = after.structuredContent as any;
+    expect(body.error, `refused with: ${body.message}`).toBeUndefined();
+    expect(body.library.uuid).toBe("cccccccc-3333-4333-8333-cccccccccccc");
+    expect(entryCount(aMdb)).toBe(before + 1);
+  });
+
+  it("still lets a read choose for itself, because the two are copies", async () => {
+    // Refusing reads as well would make a caller name a library it has no
+    // reason to care about: tied libraries hold the same tracks. The refusal
+    // is about which disk *changes*, and a read changes none.
+    const client = await writeServer();
+    const r = await client.callTool({ name: "search_tracks", arguments: { limit: 1 } });
+    const body = r.structuredContent as any;
+    expect(body.error).toBeUndefined();
+    expect(body.tracks.length).toBe(1);
   });
 });

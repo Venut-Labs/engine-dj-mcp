@@ -69,6 +69,10 @@ describe("createPlaylist", () => {
     expect(isEngineError(r)).toBe(false);
     const ok = r as any;
     expect(ok.tracks_added).toBe(3);
+    // Which library this landed in, for the same reason the edit ops report it:
+    // with a USB drive and its copy on the computer both connected, the result
+    // is the only place a caller can see which of the two it actually hit.
+    expect(ok.library).toEqual({ uuid: "lib-uuid", path: dbPath });
     expect(chain(dbPath, ok.playlist_id).map((e) => e.trackId)).toEqual([5, 2, 4]);
   });
 

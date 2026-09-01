@@ -17,7 +17,10 @@ import { expandHome, redactPath } from "./paths.js";
 export const LIBRARY_ARG_DESCRIPTION =
   "Which library to use: either the uuid or the path reported by list_libraries " +
   "(the reported ~/... form is accepted, as is the absolute path). Omit it to use " +
-  "the supported library holding the most tracks.";
+  "the supported library holding the most tracks. If two supported libraries hold " +
+  "the same most tracks -- what a USB drive and its copy on the computer produce -- " +
+  "a read still picks one, but a WRITE refuses with ambiguous_library listing both, " +
+  "since the choice decides which disk changes; ask the user which, then pass it here.";
 
 export const LibraryArg = z.string().min(1).optional().describe(LIBRARY_ARG_DESCRIPTION);
 
@@ -49,6 +52,60 @@ export function pickDefaultLibrary(libs: readonly LibraryInfo[]): LibraryInfo | 
     if (best === null || (lib.trackCount ?? -1) > (best.trackCount ?? -1)) best = lib;
   }
   return best ?? libs[0] ?? null;
+}
+
+/**
+ * The supported libraries tied for the default pick -- more than one holding
+ * the same, highest track count. Empty when the default is unambiguous, which
+ * includes the single-library case every DJ starts from.
+ *
+ * A tie is not an exotic shape: it is what a USB drive and its copy on the
+ * computer produce, and they tie *because* one is a copy of the other.
+ * Measured 2026-09-01, both real libraries reported 257 tracks.
+ *
+ * For a read, either answer is very nearly the same answer -- the two are
+ * copies -- so `pickDefaultLibrary` keeps choosing, and a read never has to
+ * name a library it does not care about. For a write the choice decides which
+ * physical disk changes, and one of them is the drive the DJ performs from.
+ * Hence: reads choose, writes refuse. Callers wanting the strict behaviour
+ * check this first.
+ *
+ * Skips unsupported libraries for the same reason `pickDefaultLibrary` does:
+ * one can never be chosen while a supported library exists, so it is not a
+ * competing candidate and must not make a write refuse.
+ */
+export function defaultLibraryTies(libs: readonly LibraryInfo[]): LibraryInfo[] {
+  const supported = libs.filter((l) => l.supported);
+  if (supported.length < 2) return [];
+  const best = Math.max(...supported.map((l) => l.trackCount ?? -1));
+  const tied = supported.filter((l) => (l.trackCount ?? -1) === best);
+  return tied.length > 1 ? tied : [];
+}
+
+/**
+ * The refusal for an ambiguous default on a write.
+ *
+ * Every candidate is named, with its track count, because the caller has to
+ * pick one and cannot do that from "it was ambiguous" -- the same reason
+ * get_playlist_tracks lists candidates for an ambiguous playlist name.
+ *
+ * The list goes in `message`, never in `detail`. This is only ever returned
+ * from a write tool, and on that path `detail` carries exactly
+ * `"not_committed"` or `"committed_unverified"` -- a client reads it to
+ * decide whether its library changed. Prose there would break that read for
+ * the one error whose answer is least in doubt: nothing was opened, let alone
+ * written.
+ */
+export function ambiguousLibrary(tied: readonly LibraryInfo[]): EngineError {
+  const list = tied.map((l) => `${l.uuid} -- ${redactPath(l.path)} (${l.trackCount} tracks)`).join("; ");
+  return err(
+    "ambiguous_library",
+    `More than one library holds the most tracks, so there is no default to write to: ${list}. ` +
+      `Nothing was written. ASK which one to write to, then retry with \`library\` set -- ` +
+      `do not choose for them. These are usually a USB drive and its copy on the computer, ` +
+      `and one of them may be the drive they perform from.`,
+    { detail: "not_committed" },
+  );
 }
 
 /**

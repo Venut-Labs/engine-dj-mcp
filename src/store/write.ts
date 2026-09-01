@@ -14,12 +14,30 @@ import { DatabaseSync } from "node:sqlite";
 import { err, isEngineError, libraryNeedsRecovery, type EngineError } from "../errors.js";
 import { snapshotLibrary } from "./backup.js";
 import { hasHotJournal } from "./connections.js";
+import { redactPath } from "../paths.js";
 
 export interface CreatePlaylistResult {
   playlist_id: number;
   title: string;
   tracks_added: number;
+  library: LibraryRef;
   backup_path: string;
+}
+
+/**
+ * Which library a write actually landed in. Two connected libraries -- a USB
+ * drive and its copy on the computer -- is the ordinary setup, so "which one
+ * did that go to" is a question every write result has to answer on its own,
+ * without the caller re-deriving it from an argument it may not have passed.
+ *
+ * It is also the context `undo` needs: an undo reverses the edit in this
+ * library and cannot reach a copy Engine DJ has since propagated to another
+ * one (measured 2026-09-01, see README).
+ */
+export interface LibraryRef {
+  uuid: string;
+  /** The m.db path, in the `~/...` form list_libraries prints. */
+  path: string;
 }
 
 /**
@@ -50,6 +68,7 @@ export interface EditResult {
   undo_complete: boolean;
   /** Set only when `undo_complete` is false: which positions have no way back, and why. */
   undo_note?: string;
+  library: LibraryRef;
   backup_path: string;
 }
 
@@ -525,7 +544,7 @@ async function withWriteTransaction<T extends object>(
   subject: string,
   opts: { backupDir: string },
   body: (db: DatabaseSync) => T | EngineError,
-): Promise<(T & { backup_path: string }) | EngineError> {
+): Promise<(T & { library: LibraryRef; backup_path: string }) | EngineError> {
   // Snapshot here, before the write connection is even opened, not after
   // BEGIN IMMEDIATE. Taking it with RESERVED held meant a full-database copy
   // -- tens of seconds on a multi-gigabyte USB library -- ran while every
@@ -569,7 +588,10 @@ async function withWriteTransaction<T extends object>(
     const verifyErr = verifyAfterCommit(db, subject, backupPath);
     if (verifyErr) return verifyErr;
 
-    return { ...result, backup_path: backupPath };
+    // Filled in here, alongside backup_path, for the same reason: it is the
+    // one place that knows the write succeeded, and doing it per-op would let
+    // a new op ship without it.
+    return { ...result, library: { uuid, path: redactPath(mdbPath) }, backup_path: backupPath };
   } catch (e) {
     return classifyWriteFailure(e, commit, subject, mdbPath, backupPath, db, open);
   } finally {
