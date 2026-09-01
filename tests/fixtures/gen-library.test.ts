@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { makeLibrary, addPlaylists, damageChain } from "./gen-library.js";
+import { makeLibrary, addPlaylists, damageChain, renumberEntries } from "./gen-library.js";
 
 let dir: string;
 beforeAll(() => { dir = mkdtempSync(join(tmpdir(), "edj-")); });
@@ -129,5 +129,80 @@ describe("synthetic library", () => {
     expect(heads(two), "two disconnected runs").toBe(2);
 
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("renumberEntries", () => {
+  it("renumbers entries into display order the way an Engine launch does", () => {
+    // Measured 2026-09-01: Engine rewrote a list this server had edited to
+    // 126 -> 127 -> 616 -> 128 -> 129 -> 130 -> 0 as
+    // 126 -> 127 -> 128 -> 129 -> 130 -> 131 -> 0. Same tracks, same order,
+    // different ids. The helper has to reproduce both halves of that: the
+    // order it keeps, and the ids it does not.
+    const d = mkdtempSync(join(tmpdir(), "renum-"));
+    const dbPath = makeLibrary(d, { tracks: 6 });
+    addPlaylists(dbPath, [
+      {
+        id: 1,
+        title: "Set",
+        nextListId: 0,
+        // An entry with an out-of-line id, as an insert into the middle
+        // produces: AUTOINCREMENT hands out a high number, not a neighbouring one.
+        entries: [
+          { id: 10, trackId: 1, next: 11 },
+          { id: 11, trackId: 2, next: 616 },
+          { id: 616, trackId: 3, next: 12 },
+          { id: 12, trackId: 4, next: 0 },
+        ],
+      },
+    ]);
+
+    const db = new DatabaseSync(dbPath);
+    const walk = () => {
+      const rows = db
+        .prepare("SELECT id, trackId, nextEntityId FROM PlaylistEntity WHERE listId = 1")
+        .all() as { id: number; trackId: number; nextEntityId: number }[];
+      const next = new Map(rows.map((r) => [r.id, r.nextEntityId]));
+      const track = new Map(rows.map((r) => [r.id, r.trackId]));
+      const pointed = new Set(rows.map((r) => r.nextEntityId));
+      const head = rows.find((r) => !pointed.has(r.id))!.id;
+      const ids: number[] = [];
+      for (let cur = head; cur !== 0; cur = next.get(cur)!) ids.push(cur);
+      return { ids, tracks: ids.map((i) => track.get(i)!) };
+    };
+
+    const before = walk();
+    expect(before.ids).toEqual([10, 11, 616, 12]);
+    expect(before.tracks).toEqual([1, 2, 3, 4]);
+
+    renumberEntries(dbPath, 1);
+
+    const after = walk();
+    expect(after.tracks, "display order survives").toEqual([1, 2, 3, 4]);
+    expect(after.ids, "ids become contiguous from the list's lowest").toEqual([10, 11, 12, 13]);
+
+    // The trap this exists to encode: 12 named the last entry and now names
+    // the third. An id that survives means something else afterwards, which
+    // is worse than one that vanishes -- it fails silently instead of loudly.
+    expect(before.ids[3], "id 12 was position 4").toBe(12);
+    expect(after.ids[2], "id 12 is now position 3").toBe(12);
+
+    db.close();
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  it("refuses a chain it cannot walk, rather than inventing an order", () => {
+    const d = mkdtempSync(join(tmpdir(), "renum-"));
+    const dbPath = makeLibrary(d, { tracks: 4 });
+    addPlaylists(dbPath, [
+      { id: 1, title: "Set", nextListId: 0, entries: [
+        { id: 1, trackId: 1, next: 2 },
+        { id: 2, trackId: 2, next: 3 },
+        { id: 3, trackId: 3, next: 0 },
+      ] },
+    ]);
+    damageChain(dbPath, 1, "two-heads");
+    expect(() => renumberEntries(dbPath, 1)).toThrow(/head/);
+    rmSync(d, { recursive: true, force: true });
   });
 });

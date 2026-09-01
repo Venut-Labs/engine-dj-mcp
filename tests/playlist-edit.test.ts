@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { makeLibrary, addPlaylists, damageChain, reoriginTracks } from "./fixtures/gen-library.js";
+import { makeLibrary, addPlaylists, damageChain, reoriginTracks, renumberEntries } from "./fixtures/gen-library.js";
 import {
   addTracksToPlaylist,
   removeTracksFromPlaylist,
@@ -749,5 +749,131 @@ describe("reorderPlaylist", () => {
     const r = await reorderPlaylist(dbPath, "lib-uuid", { listId: 999, order: [1, 2, 3] }, { backupDir });
     expect((r as any).error).toBe("playlist_not_found");
     expect((r as any).detail).toBe("not_committed");
+  });
+});
+
+/** The ids carrying a list's tracks, in display order. */
+function entryIds(dbPath: string, listId = 1): number[] {
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  const rows = db
+    .prepare("SELECT id, nextEntityId FROM PlaylistEntity WHERE listId = ?")
+    .all(listId) as { id: number; nextEntityId: number }[];
+  db.close();
+  const next = new Map(rows.map((r) => [r.id, r.nextEntityId]));
+  const pointed = new Set(rows.map((r) => r.nextEntityId));
+  const out: number[] = [];
+  for (let cur = rows.find((r) => !pointed.has(r.id))!.id; cur !== 0; cur = next.get(cur)!) out.push(cur);
+  return out;
+}
+
+/**
+ * Renumber the way an Engine launch does, and check the renumbering was real.
+ * Without this, a helper that quietly stopped renumbering would leave every
+ * test below green while testing nothing at all -- they assert an undo still
+ * works, which it does either way. Order must survive; ids must not, unless
+ * they already happened to be contiguous in display order, in which case a
+ * renumbering is genuinely a no-op and that is what gets asserted.
+ */
+function engineRelaunch(dbPath: string, listId = 1): void {
+  const before = entryIds(dbPath, listId);
+  const tracks = order(dbPath, listId);
+  renumberEntries(dbPath, listId);
+  const after = entryIds(dbPath, listId);
+  expect(order(dbPath, listId), "an Engine launch preserves display order").toEqual(tracks);
+  const alreadyNormal = before.every((id, i) => id === before[0]! + i);
+  if (alreadyNormal) expect(after, "already contiguous, so nothing to renumber").toEqual(before);
+  else expect(after, "an Engine launch rewrites the ids").not.toEqual(before);
+}
+
+describe("an undo replayed after Engine has renumbered the entries", () => {
+  // Engine rewrites PlaylistEntity ids into display order when it loads a
+  // library (measured 2026-09-01; see renumberEntries). Edit, open Engine to
+  // look at the result, then change your mind is the ordinary sequence, not an
+  // exotic one -- so every undo has to survive a renumbering between being
+  // issued and being replayed.
+  //
+  // These pass today because undo names positions and tracks, never entry ids.
+  // They exist to fail if that is ever "simplified" to ids, which read as more
+  // precise and would be quietly wrong: after a renumbering a surviving id
+  // points at a different row, so an id-based undo would not error, it would
+  // edit the wrong track.
+
+  it("undoes an add, though the id it wrote no longer exists", async () => {
+    const { dbPath, backupDir } = setup();
+    const r: any = await addTracksToPlaylist(
+      dbPath, "lib-uuid", { listId: 1, trackIds: [6], at: { after_position: 1 } }, { backupDir },
+    );
+    expect(order(dbPath)).toEqual([1, 6, 2, 3]);
+    const wrote = entryIds(dbPath);
+
+    engineRelaunch(dbPath);
+    const now = entryIds(dbPath);
+    // The specific hazard, beyond the ids merely differing: the id that held
+    // track 2 before the launch holds track 6 after it. A reference to it
+    // would not error, it would name the wrong track.
+    expect(wrote[2]).toBe(now[1]);
+
+    const step = r.undo[0];
+    const back = await removeTracksFromPlaylist(
+      dbPath, "lib-uuid",
+      { listId: 1, positions: step.arguments.positions, expectTrackIds: step.arguments.expect_track_ids },
+      { backupDir },
+    );
+    expect(isEngineError(back)).toBe(false);
+    expect(order(dbPath)).toEqual([1, 2, 3]);
+  });
+
+  it("undoes a multi-step remove in order, across a renumbering", async () => {
+    const { dbPath, backupDir } = setup();
+    const r: any = await removeTracksFromPlaylist(dbPath, "lib-uuid", { listId: 1, positions: [1, 3] }, { backupDir });
+    expect(order(dbPath)).toEqual([2]);
+
+    engineRelaunch(dbPath);
+
+    for (const step of r.undo) {
+      const back = await addTracksToPlaylist(
+        dbPath, "lib-uuid",
+        { listId: 1, trackIds: step.arguments.track_ids, at: step.arguments.at },
+        { backupDir },
+      );
+      expect(isEngineError(back)).toBe(false);
+      // Each step lands against the list the previous one left behind, and a
+      // renumbering happens between every pair as well -- Engine could have
+      // been opened at any point, not only before the first step.
+      engineRelaunch(dbPath);
+    }
+    expect(order(dbPath)).toEqual([1, 2, 3]);
+  });
+
+  it("undoes a reorder, whose inverse is positions and nothing else", async () => {
+    const { dbPath, backupDir } = setup();
+    const r: any = await reorderPlaylist(dbPath, "lib-uuid", { listId: 1, order: [3, 1, 2] }, { backupDir });
+    expect(order(dbPath)).toEqual([3, 1, 2]);
+
+    engineRelaunch(dbPath);
+
+    const step = r.undo[0];
+    const back = await reorderPlaylist(dbPath, "lib-uuid", { listId: 1, order: step.arguments.order }, { backupDir });
+    expect(isEngineError(back)).toBe(false);
+    expect(order(dbPath)).toEqual([1, 2, 3]);
+  });
+
+  it("still refuses an undo whose slot changed, renumbering or not", async () => {
+    // The renumbering must not be mistaken for the list changing, and a real
+    // change must not be hidden by the renumbering. Both directions matter.
+    const { dbPath, backupDir } = setup();
+    const r: any = await addTracksToPlaylist(dbPath, "lib-uuid", { listId: 1, trackIds: [6], at: "end" }, { backupDir });
+    await addTracksToPlaylist(dbPath, "lib-uuid", { listId: 1, trackIds: [7], at: "start" }, { backupDir });
+    engineRelaunch(dbPath);
+    expect(order(dbPath)).toEqual([7, 1, 2, 3, 6]);
+
+    const step = r.undo[0];
+    const back = await removeTracksFromPlaylist(
+      dbPath, "lib-uuid",
+      { listId: 1, positions: step.arguments.positions, expectTrackIds: step.arguments.expect_track_ids },
+      { backupDir },
+    );
+    expect(isEngineError(back)).toBe(true);
+    expect(order(dbPath)).toEqual([7, 1, 2, 3, 6]);
   });
 });
