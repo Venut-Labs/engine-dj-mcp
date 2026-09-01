@@ -33,6 +33,12 @@ export const ERROR_CODES = [
   "playlist_chain_damaged",
   "playlist_not_found",
   "invalid_position",
+  // No `library` was passed and the default rule names no single winner --
+  // two supported libraries hold the same, highest track count. Its own code
+  // rather than invalid_argument because the useful client response is
+  // specific: ask which drive, then retry with `library` set. Only writes
+  // raise it; see library-select.ts for why reads still choose.
+  "ambiguous_library",
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];

@@ -7,6 +7,8 @@ import { discoverLibraries, defaultRoots, probeLibraries, type LibraryInfo } fro
 import { libraryCandidates, libraryTag, sidecarDir } from "./paths.js";
 import {
   LibraryArg,
+  ambiguousLibrary,
+  defaultLibraryTies,
   findLibrary,
   libraryNotFound,
   pickDefaultLibrary,
@@ -104,6 +106,16 @@ const LIBRARY_SELECTION_NOTE =
   "With more than one library connected, pass `library` (a uuid or path from list_libraries, " +
   "either the ~/... form or the absolute one) to choose which one; the default is the " +
   "supported library with the most tracks.";
+
+/**
+ * Appended to the write tools only. A tie in the default rule is a refusal
+ * there and a free choice on the read side, so the shared note above cannot
+ * carry it without being wrong for one of the two.
+ */
+const WRITE_LIBRARY_TIE_NOTE =
+  " If two supported libraries hold the same most tracks -- what a USB drive and its copy on " +
+  "the computer produce -- this tool refuses with ambiguous_library rather than picking one, " +
+  "and lists both; nothing is written. Pass `library` to settle it.";
 
 function reply(value: unknown) {
   return {
@@ -308,6 +320,32 @@ export async function createServer(
     if (!isEngineError(fresh)) return state;
     if (fresh.error === "index_stale" && state.qp.hasSidecar) return state;
     return fresh;
+  };
+
+  /**
+   * `acquire` for the write tools: identical, except that an omitted
+   * `library` must resolve to exactly one candidate.
+   *
+   * `pickDefaultLibrary` breaks a tie on root-scan order, which is
+   * deterministic and, for a read, fine -- libraries tie because one is a
+   * copy of the other, so either answer is very nearly the same answer, and
+   * making a read demand a `library` it does not care about would be noise.
+   *
+   * A write is not that. The choice decides which physical disk changes, and
+   * one of the two is the drive the DJ performs from; root-scan order is not
+   * a reason to pick it. Measured 2026-09-01: the computer's library and the
+   * USB drive both held 257 tracks, tied precisely because one was a copy of
+   * the other.
+   *
+   * Only the omitted case refuses. A caller who named a library gets it, tie
+   * or no tie -- the ambiguity being refused here is the server's, not theirs.
+   */
+  const acquireForWrite = async (requested?: string): Promise<LibraryState | EngineError> => {
+    if (requested === undefined) {
+      const tied = defaultLibraryTies(knownList());
+      if (tied.length > 1) return ambiguousLibrary(tied);
+    }
+    return acquire(requested);
   };
 
   /**
@@ -605,12 +643,12 @@ export async function createServer(
           "library is unchanged and \"committed_unverified\" when the write may have gone " +
           "through but could not be verified. track_ids may be empty (an empty playlist); a " +
           "track id may appear at most once. " +
-          LIBRARY_SELECTION_NOTE,
+          LIBRARY_SELECTION_NOTE + WRITE_LIBRARY_TIE_NOTE,
         inputSchema: { ...CreatePlaylistInput.shape, library: LibraryArg },
         annotations: RW,
       },
       async (args) => {
-        const state = await acquire(args.library);
+        const state = await acquireForWrite(args.library);
         if (isEngineError(state)) return reply(state);
         return reply(
           await runCreatePlaylist(
@@ -652,12 +690,12 @@ export async function createServer(
           "Engine DJ has recorded since -- not just this one edit. backup_path is only a " +
           "last-resort recovery route for a damaged library, never an undo. " +
           UNDO_SCOPE_NOTE +
-          LIBRARY_SELECTION_NOTE,
+          LIBRARY_SELECTION_NOTE + WRITE_LIBRARY_TIE_NOTE,
         inputSchema: { ...AddTracksToPlaylistInput.shape, library: LibraryArg },
         annotations: RW,
       },
       async (args) => {
-        const state = await acquire(args.library);
+        const state = await acquireForWrite(args.library);
         if (isEngineError(state)) return reply(state);
         return reply(
           await runAddTracksToPlaylist(state.qp, state.lib.path, state.lib.uuid, args as any, backupDirFor()),
@@ -698,12 +736,12 @@ export async function createServer(
           "backup_path, which reverts the WHOLE library to before this session's first write, " +
           "discarding everything Engine DJ has recorded since -- not just this edit. " +
           UNDO_SCOPE_NOTE +
-          LIBRARY_SELECTION_NOTE,
+          LIBRARY_SELECTION_NOTE + WRITE_LIBRARY_TIE_NOTE,
         inputSchema: { ...RemoveTracksFromPlaylistInput.shape, library: LibraryArg },
         annotations: RW_DESTRUCTIVE,
       },
       async (args) => {
-        const state = await acquire(args.library);
+        const state = await acquireForWrite(args.library);
         if (isEngineError(state)) return reply(state);
         return reply(
           await runRemoveTracksFromPlaylist(state.qp, state.lib.path, state.lib.uuid, args as any, backupDirFor()),
@@ -732,12 +770,12 @@ export async function createServer(
           "WHOLE library to before this session's first write, discarding everything Engine DJ " +
           "has recorded since -- not just this reorder. " +
           UNDO_SCOPE_NOTE +
-          LIBRARY_SELECTION_NOTE,
+          LIBRARY_SELECTION_NOTE + WRITE_LIBRARY_TIE_NOTE,
         inputSchema: { ...ReorderPlaylistInput.shape, library: LibraryArg },
         annotations: RW_DESTRUCTIVE,
       },
       async (args) => {
-        const state = await acquire(args.library);
+        const state = await acquireForWrite(args.library);
         if (isEngineError(state)) return reply(state);
         return reply(
           await runReorderPlaylist(state.qp, state.lib.path, state.lib.uuid, args as any, backupDirFor()),

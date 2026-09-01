@@ -357,6 +357,21 @@ tracks**. That matters: the local library Engine DJ creates on install is
 scanned first and is often empty, so "the first one found" would hide the
 drive you actually work from.
 
+When two supported libraries hold the *same* highest number of tracks, that
+rule names no winner — and a tie is the ordinary case, not an exotic one: a
+USB drive and its copy on the computer tie precisely because one is a copy of
+the other. Measured 2026-09-01, both real libraries reported 257 tracks.
+
+**A read still chooses for itself.** Tied libraries hold the same tracks, so
+either answer is very nearly the same answer, and making you name a library
+you have no reason to care about would be noise.
+
+**A write refuses**, with `ambiguous_library` listing every candidate and its
+track count, and `detail: "not_committed"`. The choice decides which physical
+disk changes, and one of the two may be the drive you perform from; scan
+order is not a reason to pick it. Name a library and the write goes through,
+tie or not — the ambiguity being refused is the server's, not yours.
+
 Each library gets its own index and its own connection, opened the first time
 you ask that library something. Comparing two libraries against each other —
 *"what is on this drive but not that one?"* — is **not** something this server
