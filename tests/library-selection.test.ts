@@ -749,6 +749,49 @@ describe("a write with two libraries tied for the default", () => {
     expect(entryCount(aMdb), "the other one did not").toBe(beforeA);
   });
 
+  it("does not refuse over a library that has since been unplugged", async () => {
+    // knownList() is a cache: it keeps a library that a later scan cannot see,
+    // deliberately, so a momentarily locked drive does not vanish from
+    // list_libraries. For a tie check that caching is wrong in the one
+    // direction that bites -- the USB drive is pulled, one library is left,
+    // and the write is refused naming a drive that is not there.
+    const gone = join(root, "gone");
+    mkdirSync(gone);
+    const goneMdb = makeLibrary(gone, { tracks: 20, uuid: "eeeeeeee-5555-4555-8555-eeeeeeeeeeee" });
+    addPlaylists(goneMdb, [{ id: 1, title: "Set", nextListId: 0, entries: [{ id: 1, trackId: 1, next: 0 }] }]);
+
+    const server = await createServer({
+      roots: [aRoot, gone],
+      sidecarBaseDir: join(root, `sidecars-gone-${++tieSeq}`),
+      allowWrites: true,
+      backupBaseDir: join(root, "backups"),
+    });
+    openServers.push(server);
+    const client = new Client({ name: "gone-client", version: "0" });
+    const [st, ct] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(st), client.connect(ct)]);
+
+    // Both present at startup: the tie is real and the write is refused.
+    const tied = await client.callTool({
+      name: "add_tracks_to_playlist",
+      arguments: { playlist_id: 1, track_ids: [5] },
+    });
+    expect((tied.structuredContent as any).error).toBe("ambiguous_library");
+
+    // The drive is pulled. One library is left, so there is nothing to be
+    // ambiguous about and the write must go through.
+    rmSync(gone, { recursive: true, force: true });
+    const before = entryCount(aMdb);
+    const after = await client.callTool({
+      name: "add_tracks_to_playlist",
+      arguments: { playlist_id: 1, track_ids: [5] },
+    });
+    const body = after.structuredContent as any;
+    expect(body.error, `refused with: ${body.message}`).toBeUndefined();
+    expect(body.library.uuid).toBe("cccccccc-3333-4333-8333-cccccccccccc");
+    expect(entryCount(aMdb)).toBe(before + 1);
+  });
+
   it("still lets a read choose for itself, because the two are copies", async () => {
     // Refusing reads as well would make a caller name a library it has no
     // reason to care about: tied libraries hold the same tracks. The refusal

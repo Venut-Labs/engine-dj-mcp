@@ -339,9 +339,24 @@ export async function createServer(
    *
    * Only the omitted case refuses. A caller who named a library gets it, tie
    * or no tie -- the ambiguity being refused here is the server's, not theirs.
+   *
+   * Rescans first, because `knownList()` is a cache that deliberately keeps a
+   * library a later scan cannot see -- so a momentarily locked drive does not
+   * vanish from list_libraries. For a tie check that is wrong in the
+   * direction that bites: pull the USB drive and one library is left, but the
+   * cache still holds two, and the write is refused naming a drive that is no
+   * longer there. rescanLibraries() forgets a candidate whose path is gone,
+   * which is exactly the distinction wanted here, and it also lets a drive
+   * plugged in mid-session be seen at all.
+   *
+   * The cost is one filesystem probe per write, against a write that is about
+   * to copy the entire database for its pre-write snapshot. Reads are left
+   * alone: they run far more often and a stale pick between two copies is not
+   * worth a probe apiece.
    */
   const acquireForWrite = async (requested?: string): Promise<LibraryState | EngineError> => {
     if (requested === undefined) {
+      rescanLibraries();
       const tied = defaultLibraryTies(knownList());
       if (tied.length > 1) return ambiguousLibrary(tied);
     }
