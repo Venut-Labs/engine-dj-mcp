@@ -106,8 +106,10 @@ const SQL_CHECKS: Record<string, SqlCheck> = {
   },
   duplicates: {
     id: "t.id",
-    body: `FROM Track t WHERE LOWER(TRIM(t.artist)) || '|' || LOWER(TRIM(t.title)) IN (
-             SELECT LOWER(TRIM(artist)) || '|' || LOWER(TRIM(title)) FROM Track
+      // fold(), not LOWER(): LOWER is ASCII-only, so a Cyrillic title and the
+      // same title in capitals were not grouped (#9). See semantics.ts.
+    body: `FROM Track t WHERE fold(TRIM(t.artist)) || '|' || fold(TRIM(t.title)) IN (
+             SELECT fold(TRIM(artist)) || '|' || fold(TRIM(title)) FROM Track
              WHERE artist IS NOT NULL AND title IS NOT NULL
              GROUP BY 1 HAVING COUNT(*) > 1)`,
   },

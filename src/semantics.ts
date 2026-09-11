@@ -87,6 +87,12 @@ export function keyDistance(a: string, b: string): number | null {
 export function registerFunctions(db: DatabaseSync, mdbPath: string): void {
   const opts = { deterministic: true } as const;
   db.function("camelot", opts, (key: unknown) => camelot(key === null ? null : Number(key)));
+  // A comparison key for text: one Unicode normalization form, lower-cased by
+  // Unicode rules. SQLite's own LOWER folds ASCII only -- LOWER('ЭЙФОРИЯ')
+  // comes back unchanged -- which made audit_library's duplicates find a
+  // capitalised Latin title and miss a capitalised Cyrillic one (#9).
+  db.function("fold", opts, (text: unknown) =>
+    text === null || text === undefined ? null : String(text).normalize("NFC").toLowerCase());
   db.function("key_name", opts, (key: unknown) => keyName(key === null ? null : Number(key)));
   db.function("tempo", opts, (a: unknown, b: unknown) =>
     tempo(a === null ? null : Number(a), b === null ? null : Number(b)));

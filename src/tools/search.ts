@@ -3,7 +3,7 @@ import { z } from "zod";
 import { createHash } from "node:crypto";
 import { err, isEngineError, type EngineError } from "../errors.js";
 import { camelotNeighbours } from "../semantics.js";
-import { redactPath } from "../paths.js";
+import { redactPath, redactUri } from "../paths.js";
 import { ENTRY_TRACK_MATCH, resolvePlaylist } from "../playlists.js";
 import type { QueryProcess } from "../proc/query-client.js";
 
@@ -50,7 +50,27 @@ export const FIELD_SQL: Record<string, string> = {
   date_added: "t.dateAdded",
   last_played: "t.timeLastPlayed",
   is_analyzed: "t.isAnalyzed",
+  // Reported to decide whether Engine OS streams a track (from Dropbox)
+  // rather than reading it from disk -- not measured here: NULL, NULL and a
+  // mix of NULL/0/5 on both reference libraries, whose tracks all load. Opt-in
+  // only, for diagnosing a track that will not load (#8).
+  streaming_source: "t.streamingSource",
+  streaming_flags: "t.streamingFlags",
+  uri: "t.uri",
 };
+
+/**
+ * How one projected value is handed back. The single place a path-bearing
+ * field is redacted: search_tracks, get_tracks and get_playlist_tracks each
+ * carried their own copy of the `path` check, which is how a new path-bearing
+ * field ends up redacted in two of the three.
+ */
+export function presentField(field: string, value: unknown, redact: boolean): unknown {
+  if (!redact || typeof value !== "string") return value;
+  if (field === "path") return redactPath(value);
+  if (field === "uri") return redactUri(value);
+  return value;
+}
 
 export const SearchInput = z.object({
   q: z.string().optional(),
@@ -392,12 +412,7 @@ export async function searchTracks(
 
   const idx = Object.fromEntries(res.columns.map((c, i) => [c, i]));
   const tracks = res.rows.map((row) =>
-    Object.fromEntries(fields.map((f) => {
-      const value = row[idx[f]!];
-      return [f, input.redact_paths && f === "path" && typeof value === "string"
-        ? redactPath(value)
-        : value];
-    })) as Record<string, unknown>);
+    Object.fromEntries(fields.map((f) => [f, presentField(f, row[idx[f]!], input.redact_paths)])) as Record<string, unknown>);
 
   let next_cursor: string | undefined;
   if (res.rows.length === limit) {

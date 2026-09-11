@@ -918,3 +918,27 @@ describe("every write names the library it ran against", () => {
     expect(ra.library.path).not.toBe(rb.library.path);
   });
 });
+
+describe("editing a playlist that is a folder, for the two edits beyond add", () => {
+  // README says all three edits accept a folder -- a playlist other playlists
+  // sit under, which Engine gives no separate type. Only add was pinned. These
+  // pin the other two, and check the child list is left alone: a folder edit
+  // that reached into its children would be the one way these tools could
+  // touch a playlist they were not named for.
+
+  it("removes from a folder and leaves its child list untouched", async () => {
+    const { dbPath, backupDir } = setupFolder();
+    const r = await removeTracksFromPlaylist(dbPath, "lib-uuid", { listId: 1, positions: [2] }, { backupDir });
+    expect(isEngineError(r)).toBe(false);
+    expect(order(dbPath, 1)).toEqual([1, 3]);
+    expect(order(dbPath, 2)).toEqual([4]);
+  });
+
+  it("reorders a folder and leaves its child list untouched", async () => {
+    const { dbPath, backupDir } = setupFolder();
+    const r = await reorderPlaylist(dbPath, "lib-uuid", { listId: 1, order: [3, 1, 2] }, { backupDir });
+    expect(isEngineError(r)).toBe(false);
+    expect(order(dbPath, 1)).toEqual([3, 1, 2]);
+    expect(order(dbPath, 2)).toEqual([4]);
+  });
+});
