@@ -877,6 +877,10 @@ other.
   says nothing about whether a track will load. Selectable as the fields
   \`streaming_source\`, \`streaming_flags\` and \`uri\`; \`uri\` is redacted like
   \`path\`, including a home directory percent-encoded inside it.
+- SQLite's \`LOWER()\` folds ASCII only: \`LOWER('ЭЙФОРИЯ')\` comes back
+  unchanged. To compare names regardless of case in any script, use
+  \`fold(text)\` -- one Unicode normalization form, lower-cased by Unicode
+  rules. It runs per row, like every function here.
 - A track's natural key across drives is \`(originDatabaseUuid, originTrackId)\`.
 - \`PerformanceData\`'s blob columns are binary and cannot be read with SQL.
   Engine writes \`quickCues\`, \`loops\`, \`beatData\` and

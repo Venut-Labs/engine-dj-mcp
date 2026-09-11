@@ -374,3 +374,55 @@ describe("audit_library — missing_files path resolution", () => {
     expect(after.checks[0]!.sample_ids).not.toContain(3);
   });
 });
+
+describe("duplicates outside ASCII (#9)", () => {
+  // SQLite's LOWER folds ASCII only -- measured in node:sqlite,
+  // LOWER('Диджей ЭЙФОРИЯ') comes back unchanged -- so the same track entered
+  // once in capitals was not a duplicate if its name was Cyrillic, and was if
+  // it was Latin. Its own small fixture: the one above pins exact counts, and
+  // these pairs would move them.
+  let udir: string, umdb: string, uqp: QueryProcess;
+  const EUPHORIA = "Эйфория";
+
+  beforeAll(async () => {
+    udir = mkdtempSync(join(tmpdir(), "edj-audit-u-"));
+    umdb = makeLibrary(udir, { tracks: 6 });
+    const raw = new DatabaseSync(umdb);
+    const set = raw.prepare("UPDATE Track SET artist = ?, title = ? WHERE id = ?");
+    set.run("Meshes", EUPHORIA.normalize("NFC"), 1);
+    set.run("MESHES", EUPHORIA.toUpperCase(), 2);          // case, Cyrillic
+    set.run("Meshes", EUPHORIA.normalize("NFD"), 3);       // й decomposed
+    set.run("Anne", "Breeze", 4);
+    set.run("ANNE", "BREEZE", 5);                           // case, ASCII: already worked
+    set.run("Somebody", "Else", 6);
+    raw.close();
+    const lib = readLibraryInfo(umdb);
+    if (isEngineError(lib)) throw new Error("fixture unreadable");
+    uqp = new QueryProcess(umdb, null, 5000);
+    await new IndexManager(lib, uqp, join(udir, "sidecars")).ensureFresh();
+  });
+  afterAll(() => {
+    uqp.dispose();
+    rmSync(udir, { recursive: true, force: true });
+  });
+
+  const dupIds = async () => {
+    const r = await auditLibrary(uqp, umdb, { checks: ["duplicates"] });
+    if (isEngineError(r)) throw new Error(r.message);
+    return [...r.checks[0]!.sample_ids].sort((a, b) => a - b);
+  };
+
+  it("groups a Cyrillic title with the same title in capitals", async () => {
+    expect(await dupIds()).toEqual(expect.arrayContaining([1, 2]));
+  });
+
+  it("groups a title stored decomposed with the same title composed", async () => {
+    // Not seen in the real libraries -- all 27 non-ASCII rows are NFC -- but
+    // the grouping key is a comparison, and folding to one form costs nothing.
+    expect(await dupIds()).toEqual(expect.arrayContaining([1, 3]));
+  });
+
+  it("still groups an ASCII case pair, and nothing that is not a duplicate", async () => {
+    expect(await dupIds()).toEqual([1, 2, 3, 4, 5]);
+  });
+});
