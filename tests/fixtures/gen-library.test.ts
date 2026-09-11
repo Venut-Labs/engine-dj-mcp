@@ -127,8 +127,60 @@ describe("synthetic library", () => {
     copyFileSync(dbPath, two);
     damageChain(two, 1, "two-heads");
     expect(heads(two), "two disconnected runs").toBe(2);
+    // Two runs that each end properly -- the severed row terminates at 0 --
+    // not one run and a dangling stub. A shape that left the severed row
+    // pointing somewhere would be a different damage, and the writer's
+    // refusal would be tested against the wrong thing.
+    const tails = (() => {
+      const db = new DatabaseSync(two);
+      const n = db.prepare("SELECT COUNT(*) c FROM PlaylistEntity WHERE listId = 1 AND nextEntityId = 0").get() as any;
+      db.close();
+      return n.c as number;
+    })();
+    expect(tails, "both runs end at 0").toBe(2);
+    expect(dangling(two), "and nothing dangles").toBe(0);
 
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("damages an already-cyclic chain further where the shape needs no tail", () => {
+    // The tail used to be looked up up front for every shape, so asking for a
+    // dangling link on a list that was already a cycle died with a bare
+    // TypeError -- though only the cycle shape ever uses the tail.
+    const d = mkdtempSync(join(tmpdir(), "dmg-"));
+    const dbPath = makeLibrary(d, { tracks: 4 });
+    addPlaylists(dbPath, [{ id: 1, title: "Set", nextListId: 0, entries: [
+      { id: 1, trackId: 1, next: 2 }, { id: 2, trackId: 2, next: 3 }, { id: 3, trackId: 3, next: 0 },
+    ] }]);
+    damageChain(dbPath, 1, "cycle");
+    expect(() => damageChain(dbPath, 1, "dangling")).not.toThrow();
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  it("says what is wrong when asked to close a cycle that has no tail left", () => {
+    const d = mkdtempSync(join(tmpdir(), "dmg-"));
+    const dbPath = makeLibrary(d, { tracks: 4 });
+    addPlaylists(dbPath, [{ id: 1, title: "Set", nextListId: 0, entries: [
+      { id: 1, trackId: 1, next: 2 }, { id: 2, trackId: 2, next: 3 }, { id: 3, trackId: 3, next: 0 },
+    ] }]);
+    damageChain(dbPath, 1, "cycle");
+    expect(() => damageChain(dbPath, 1, "cycle")).toThrow(/no tail/);
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  it("refuses a list too short to damage in all three shapes", () => {
+    // Two entries cannot hold a two-heads split and a distinct dangling link at
+    // once, so the helper insists on three rather than quietly producing a
+    // shape the caller did not ask for.
+    const d = mkdtempSync(join(tmpdir(), "dmg-"));
+    const dbPath = makeLibrary(d, { tracks: 4 });
+    addPlaylists(dbPath, [{ id: 1, title: "Set", nextListId: 0, entries: [
+      { id: 1, trackId: 1, next: 2 }, { id: 2, trackId: 2, next: 0 },
+    ] }]);
+    for (const kind of ["cycle", "dangling", "two-heads"] as const) {
+      expect(() => damageChain(dbPath, 1, kind)).toThrow(/at least 3 entries/);
+    }
+    rmSync(d, { recursive: true, force: true });
   });
 });
 

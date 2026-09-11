@@ -233,14 +233,9 @@ it, delete the playlist in Engine DJ**; `backup_path` is a whole-library
 snapshot for the case where something went wrong at a lower level, not an
 undo — see [Restoring a snapshot](#restoring-a-snapshot).
 
-Refusals name themselves: `playlist_exists` for a taken title,
-`unknown_track` for an id this library does not have, `duplicate_track` for
-the same id twice, `library_busy` if something else holds a conflicting lock
-right then, `library_needs_recovery` if Engine DJ left an unrecovered
-journal behind. Every error also carries `detail`: `not_committed` means the
-library is exactly what it was, and `committed_unverified` — the rare one —
-means the write may have landed but could not be verified afterwards, and is
-the only case that hands back a `backup_path`.
+Its own refusals: `playlist_exists` for a taken title, `unknown_track` for an
+id this library does not have, `duplicate_track` for the same id twice — plus
+the ones [every write tool shares](#refusals-every-write-tool-shares).
 
 ### `add_tracks_to_playlist`
 
@@ -270,9 +265,10 @@ something else changed in the meantime is refused rather than having the
 wrong rows removed. Call it to undo rather than restoring `backup_path` —
 see [Restoring a snapshot](#restoring-a-snapshot), and
 [An undo covers one library](#an-undo-covers-one-library) for what it does
-not reach. Refusals add
-`playlist_not_found`, `playlist_chain_damaged` and `invalid_position` to
-`create_playlist`'s own list; `detail` works the same way.
+not reach. Its own refusals: `playlist_not_found`, `playlist_chain_damaged`,
+`invalid_position`, and `unknown_track` / `duplicate_track` as for
+`create_playlist` — plus the ones
+[every write tool shares](#refusals-every-write-tool-shares).
 
 ### `remove_tracks_from_playlist`
 
@@ -303,9 +299,10 @@ have, so no `add_tracks_to_playlist` call can put it back, and an
 still restore everything else; the missing entries are recoverable only from
 `backup_path`, which reverts the whole library.
 
-Refusals: `playlist_not_found`, `playlist_chain_damaged`, and
+Its own refusals: `playlist_not_found`, `playlist_chain_damaged`, and
 `invalid_position` — for a repeated or out-of-range position, or one that
-does not hold what `expect_track_ids` expected.
+does not hold what `expect_track_ids` expected — plus the ones
+[every write tool shares](#refusals-every-write-tool-shares).
 
 `playlist_chain_damaged` always means the same thing for all three edit
 tools: the playlist's entry chain was already broken **before** the edit,
@@ -330,13 +327,41 @@ repaired.
 
 The result carries `playlist_id`, `undo`, `undo_complete` (always `true`
 here), `library` and `backup_path`. `undo` is the exact inverse permutation, as a single
-`reorder_playlist` call. Refusals: `playlist_not_found`,
+`reorder_playlist` call. Its own refusals: `playlist_not_found`,
 `playlist_chain_damaged`, and `invalid_position` if `order` is not a full
-permutation of the playlist's current positions.
+permutation of the playlist's current positions — plus the ones
+[every write tool shares](#refusals-every-write-tool-shares).
 
 Reordering to the order a playlist is already in is accepted and rewrites no
 entry: it still stamps the playlist's `lastEditTime`, and still costs this
 session's snapshot if nothing had been written yet.
+
+### Refusals every write tool shares
+
+These come from what happens before the write itself — choosing the library,
+bringing its index up to date, resolving the playlist — and from the write's
+own checks.
+
+| Code | Means | Nothing written? |
+| --- | --- | --- |
+| `invalid_argument` | The arguments do not make sense — both `playlist_id` and `playlist_name`, an empty list where one is required, or a `playlist_name` that matches several playlists (every candidate is listed). | yes |
+| `library_not_found` | `library` names nothing connected. Lists what is. | yes |
+| `ambiguous_library` | No `library` given, and two libraries tie for the default. Lists both — see [Choosing a library](#choosing-a-library). | yes |
+| `unsupported_schema` | The library's version is outside what this server supports. | yes |
+| `library_needs_recovery` | Engine DJ left an unrecovered journal. Launch Engine once. | yes |
+| `library_busy` | Something holds a conflicting lock right now. Retry. | yes |
+| `index_stale` | The index could not be built yet, typically because Engine holds a lock on a first run. Carries `retry_after_ms`. | yes |
+| `query_timeout`, `query_process_crashed` | The lookup that resolves a playlist failed. Edit tools only. | yes |
+| `library_unreadable` | The library could not be read — or a write's own read-back disagreed with what it wrote, and it was rolled back. | see `detail` |
+
+**`detail` on these errors.** Once the write itself has started, `detail` is
+exactly one of two strings, and a client can read it to decide whether the
+library changed: `not_committed` — the library is what it was — or
+`committed_unverified` — the rare one: the write may have landed but could not
+be confirmed, and only this case hands back a `backup_path`. Refusals raised
+*before* that point — every row above marked "yes" — never opened the library
+for writing, whatever their `detail` says: it may be absent, `not_committed`,
+or explanatory text such as the candidates an ambiguous `playlist_name` lists.
 
 ## Resources
 

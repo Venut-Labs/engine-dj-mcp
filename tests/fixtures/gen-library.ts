@@ -318,12 +318,21 @@ export function damageChain(dbPath: string, listId: number, kind: "cycle" | "dan
   const rows = db
     .prepare("SELECT id, nextEntityId FROM PlaylistEntity WHERE listId = ? ORDER BY id")
     .all(listId) as { id: number; nextEntityId: number }[];
-  if (rows.length < 3) throw new Error(`damageChain needs at least 3 entries, list ${listId} has ${rows.length}`);
+  if (rows.length < 3) {
+    db.close();
+    throw new Error(`damageChain needs at least 3 entries, list ${listId} has ${rows.length}`);
+  }
   const head = rows[0]!.id;
-  const tail = rows.find((r) => r.nextEntityId === 0)!.id;
 
   if (kind === "cycle") {
-    db.prepare("UPDATE PlaylistEntity SET nextEntityId = ? WHERE id = ?").run(head, tail);
+    // Looked up here, not for every shape: only closing a cycle needs the
+    // tail, and a list that is already a cycle has none to find.
+    const tail = rows.find((r) => r.nextEntityId === 0);
+    if (!tail) {
+      db.close();
+      throw new Error(`damageChain: list ${listId} has no tail to close into a cycle -- it is one already`);
+    }
+    db.prepare("UPDATE PlaylistEntity SET nextEntityId = ? WHERE id = ?").run(head, tail.id);
   } else if (kind === "dangling") {
     const gone = Math.max(...rows.map((r) => r.id)) + 1000;
     db.prepare("UPDATE PlaylistEntity SET nextEntityId = ? WHERE id = ?").run(gone, head);

@@ -1396,8 +1396,10 @@ export async function reorderPlaylist(
   return withWriteTransaction(mdbPath, uuid, subject, opts, (db) => {
     // Re-read: BEGIN IMMEDIATE is the first moment nothing else can change
     // the chain, and gating on the pre-check's read alone would be trusting
-    // one that could already be stale.
-    const gate = gateChain(db, listId);
+    // one that could already be stale. Read once and kept: the links rewritten
+    // below are exactly the ones this check passed, not a second read of them.
+    const rows = readChain(db, listId);
+    const gate = checkChain(rows);
     if (!gate.ok) {
       rollback(db);
       return err("playlist_chain_damaged", `Playlist ${listId}: ${gate.reason}. Nothing was changed.`, {
@@ -1425,7 +1427,7 @@ export async function reorderPlaylist(
     // returns; each entry's new successor is the id that follows it there,
     // or 0 for the new tail.
     const newSeq = requestedOrder.map((p) => gate.order[p - 1]!);
-    const currentNext = new Map(readChain(db, listId).map((r) => [r.id, r.next]));
+    const currentNext = new Map(rows.map((r) => [r.id, r.next]));
     const link = db.prepare("UPDATE PlaylistEntity SET nextEntityId = ? WHERE id = ?");
     for (let i = 0; i < newSeq.length; i++) {
       const entryId = newSeq[i]!;
