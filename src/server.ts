@@ -869,6 +869,14 @@ other.
 - \`Track.path\` is relative to the \`Engine Library\` folder and usually
   contains \`..\`. The SQL function \`abs_path(path)\` resolves it against
   this library's location; the home prefix comes back folded to \`~\`.
+- \`Track.streamingSource\`, \`uri\` and \`streamingFlags\` are reported to
+  decide whether Engine OS streams a track (from Dropbox) instead of reading
+  the file. Not measured here: on both reference libraries \`streamingSource\`
+  and \`uri\` are NULL on every track, and \`streamingFlags\` is 5 on about
+  half of them -- tracks that load and play -- so \`streamingFlags\` on its own
+  says nothing about whether a track will load. Selectable as the fields
+  \`streaming_source\`, \`streaming_flags\` and \`uri\`; \`uri\` is redacted like
+  \`path\`, including a home directory percent-encoded inside it.
 - A track's natural key across drives is \`(originDatabaseUuid, originTrackId)\`.
 - \`PerformanceData\`'s blob columns are binary and cannot be read with SQL.
   Engine writes \`quickCues\`, \`loops\`, \`beatData\` and

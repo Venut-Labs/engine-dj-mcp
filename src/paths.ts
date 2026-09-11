@@ -41,6 +41,29 @@ export function redactPath(p: string): string {
 }
 
 /**
+ * redactPath for a URI. A uri carries its path after a scheme and usually
+ * percent-encoded -- the home directory shows up as `%2FUsers%2F<name>`, not
+ * as a leading `/Users/<name>` -- so redactPath's prefix check would never fire
+ * on one, and a "redacted" uri would leak exactly what redaction is there to
+ * hide. Folds every occurrence, raw or encoded, either case of hex digit since
+ * encoders differ. Only a whole path component: the home directory must be
+ * followed by a separator or the end, so a sibling account whose name merely
+ * starts the same is left alone.
+ */
+export function redactUri(u: string): string {
+  const home = homedir();
+  if (!home || home === "/") return u;
+  const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const raw = new RegExp(`${esc(home)}(?=/|$)`, "g");
+  const encoded = esc(encodeURIComponent(home)).replace(
+    /%([0-9A-F])([0-9A-F])/g,
+    (_, a: string, b: string) => `%[${a}${a.toLowerCase()}][${b}${b.toLowerCase()}]`,
+  );
+  const enc = new RegExp(`${encoded}(?=%2[Ff]|$)`, "g");
+  return u.replace(raw, "~").replace(enc, "~");
+}
+
+/**
  * The inverse of redactPath, for values coming back *in*. Every library path
  * this server reports has been through redactPath, so the most obvious way
  * to name a library -- copy the `path` list_libraries just printed -- hands

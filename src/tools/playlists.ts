@@ -1,14 +1,13 @@
 // src/tools/playlists.ts
 import { z } from "zod";
 import { err, isEngineError, type EngineError } from "../errors.js";
-import { redactPath } from "../paths.js";
 import {
   loadPlaylistEntries,
   loadPlaylistTree,
   resolvePlaylist,
   type PlaylistItem,
 } from "../playlists.js";
-import { DEFAULT_FIELDS, FIELD_SQL } from "./search.js";
+import { DEFAULT_FIELDS, FIELD_SQL, presentField } from "./search.js";
 import type { QueryProcess } from "../proc/query-client.js";
 
 /**
@@ -223,17 +222,7 @@ export async function getPlaylistTracks(
     if (isEngineError(res)) return res;
     const idx = Object.fromEntries(res.columns.map((c, i) => [c, i]));
     for (const row of res.rows) {
-      const track = Object.fromEntries(
-        fields.map((f) => {
-          const value = row[idx[f]!];
-          return [
-            f,
-            input.redact_paths && f === "path" && typeof value === "string"
-              ? redactPath(value)
-              : value,
-          ];
-        }),
-      );
+      const track = Object.fromEntries(fields.map((f) => [f, presentField(f, row[idx[f]!], input.redact_paths)]));
       byKey.set(entryKey(String(row[idx.__uuid!]), Number(row[idx.__origin!])), track);
     }
   }

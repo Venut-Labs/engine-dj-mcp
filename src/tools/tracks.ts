@@ -1,8 +1,7 @@
 // src/tools/tracks.ts
 import { z } from "zod";
 import { err, isEngineError, type EngineError } from "../errors.js";
-import { DEFAULT_FIELDS, FIELD_SQL } from "./search.js";
-import { redactPath } from "../paths.js";
+import { DEFAULT_FIELDS, FIELD_SQL, presentField } from "./search.js";
 import type { QueryProcess } from "../proc/query-client.js";
 
 export const GetTracksInput = z.object({
@@ -46,10 +45,7 @@ export async function getTracks(
   const idx = Object.fromEntries(res.columns.map((c, i) => [c, i]));
   const byId = new Map<number, Record<string, unknown>>();
   for (const row of res.rows) {
-    const track = Object.fromEntries(fields.map((f) => {
-      const value = row[idx[f]!];
-      return [f, redact_paths && f === "path" && typeof value === "string" ? redactPath(value) : value];
-    }));
+    const track = Object.fromEntries(fields.map((f) => [f, presentField(f, row[idx[f]!], redact_paths)]));
     byId.set(Number(row[idx.__id!]), track);
   }
   // Preserve the caller's ordering; missing ids are simply absent.
