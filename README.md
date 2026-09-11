@@ -54,10 +54,14 @@ the configuration you are reading:
 ```json
 {
   "mcpServers": {
-    "engine-dj": { "command": "npx", "args": ["-y", "engine-dj-mcp", "--allow-writes"] }
+    "engine-dj": { "command": "npx", "args": ["-y", "engine-dj-mcp@0.13.0", "--allow-writes"] }
   }
 }
 ```
+
+Pin the version in this one. Unpinned, `npx` fetches whatever is newest at
+every launch, and this configuration gives that code write access to your
+library. Pinned, a new release reaches it only when you change the number.
 
 **Requirements:** Node.js 22.16 or newer (`node:sqlite` stopped needing a
 flag in 22.13, but the pre-write snapshot uses its `backup()`, added in
@@ -440,9 +444,21 @@ and without `--allow-writes` not even this.
 The write takes SQLite's own write lock for the length of one transaction and
 does not wait for it: if something else — Engine DJ mid-save, a player — is
 holding a conflicting lock at that moment, the write is refused with
-`library_busy` and nothing is changed. Merely having Engine DJ *open* is not
-usually a conflict, and the write normally succeeds with Engine running;
-Engine will show the new playlist after it next re-reads the library.
+`library_busy` and nothing is changed.
+
+**Quit Engine DJ before writing.** Having Engine open is not usually a lock
+conflict, so the write itself will normally go through — but what Engine then
+does with a change made underneath it has never been measured here. Every
+acceptance check of a write was run with Engine closed. What *has* been
+measured is that Engine does its own work on the library as it loads: it
+renumbers playlist entries, and it copies playlist changes to another
+connected library (see below). Quit, write, relaunch — Engine reads the
+library on startup and shows the change.
+
+Quit, not close. On macOS, closing Engine's window leaves the application
+running: observed 2026-09-01 with the main process and seven
+`OfflineAnalyzer` workers — which write to the database — still alive
+afterwards. Use ⌘Q.
 
 ### An undo covers one library
 
