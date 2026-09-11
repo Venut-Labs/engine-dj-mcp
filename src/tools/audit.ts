@@ -1,5 +1,6 @@
 // src/tools/audit.ts
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
+import { join, parse, sep } from "node:path";
 import { z } from "zod";
 import { err, isEngineError, type EngineError } from "../errors.js";
 import { absTrackPath } from "../paths.js";
@@ -17,7 +18,59 @@ export const AUDIT_CHECKS = [
   "duplicates",
   "empty_metadata",
   "orphan_entries",
+  "path_form_mismatch",
 ] as const;
+
+/**
+ * The checks that read the filesystem rather than the database: each needs
+ * the stored paths themselves, and each answers something no SQL can.
+ */
+export const FILESYSTEM_CHECKS = ["missing_files", "path_form_mismatch"] as const;
+
+/**
+ * Whether a stored path resolves on disk only by ignoring Unicode
+ * normalization.
+ *
+ * Measured 2026-09-11 on Linux 6.17's in-kernel exFAT driver: a path in NFC
+ * does not find a file whose name was written in NFD, while a path that
+ * differs only in case does. macOS forgives both, which is why missing_files
+ * -- asking the host's own lookup -- reports nothing on a Mac for a file that
+ * Linux, and so plausibly Engine OS on a player, would not open. On the
+ * maintainer's USB drive that was 8 tracks: file and folder names macOS wrote
+ * in NFD behind the NFC paths Engine stored.
+ *
+ * Walks the path one component at a time against the real listings, so it
+ * answers the same on every host. A component matching exactly, or in case
+ * only, is fine -- exFAT and Windows ignore case, so reporting it would be
+ * noise. One found only when both sides are brought to NFC marks the path.
+ * One not found at all ends the walk unmarked: that file is missing, which is
+ * missing_files' business, not this check's.
+ *
+ * `listDir` is injected so the comparison can be exercised against an exact
+ * listing on any host; the audit passes a cached readdirSync.
+ */
+export function onlyFoundByIgnoringForm(
+  absPath: string,
+  listDir: (dir: string) => string[] | null,
+): boolean {
+  const { root } = parse(absPath);
+  let dir = root;
+  let formDiffered = false;
+  for (const want of absPath.slice(root.length).split(sep).filter(Boolean)) {
+    const names = listDir(dir);
+    if (!names) return false;
+    const upper = want.toUpperCase();
+    let hit = names.find((n) => n === want) ?? names.find((n) => n.toUpperCase() === upper);
+    if (hit === undefined) {
+      const key = want.normalize("NFC").toUpperCase();
+      hit = names.find((n) => n.normalize("NFC").toUpperCase() === key);
+      if (hit === undefined) return false;
+      formDiffered = true;
+    }
+    dir = join(dir, hit);
+  }
+  return formDiffered;
+}
 
 export const AuditInput = z.object({ checks: z.array(z.string()).optional() });
 export type AuditInput = z.input<typeof AuditInput>;
@@ -171,6 +224,30 @@ export async function auditLibrary(
         if (!existsSync(absTrackPath(mdbPath, String(row[1])))) missing.push(Number(row[0]));
       }
       out.push({ name, count: missing.length, sample_ids: missing.slice(0, SAMPLE) });
+      continue;
+    }
+    if (name === "path_form_mismatch") {
+      // Only a path with a character outside printable ASCII can have a second
+      // normalization form, so only those cross the process boundary -- 22 of
+      // 257 on the reference library -- and each directory is listed once.
+      const res = await qp.run(`SELECT id, path FROM Track WHERE path GLOB '*[^ -~]*' ORDER BY id`);
+      if (isEngineError(res)) return res;
+      const listings = new Map<string, string[] | null>();
+      const listDir = (d: string) => {
+        if (!listings.has(d)) {
+          try {
+            listings.set(d, readdirSync(d));
+          } catch {
+            listings.set(d, null);
+          }
+        }
+        return listings.get(d)!;
+      };
+      const marked: number[] = [];
+      for (const row of res.rows) {
+        if (onlyFoundByIgnoringForm(absTrackPath(mdbPath, String(row[1])), listDir)) marked.push(Number(row[0]));
+      }
+      out.push({ name, count: marked.length, sample_ids: marked.slice(0, SAMPLE) });
       continue;
     }
     const check = SQL_CHECKS[name]!;

@@ -552,6 +552,10 @@ export async function createServer(
       description:
         `Run collection health checks. Available: ${AUDIT_CHECKS.join(", ")}. ` +
         `missing_files resolves each track against the selected library's own folder. ` +
+        `path_form_mismatch finds files that are there, but under a name in a different Unicode ` +
+        `normalization form from the stored path -- macOS opens them anyway, Linux does not ` +
+        `(measured on its exFAT driver), and Engine OS on a player is Linux, so these may fail ` +
+        `to load on hardware while missing_files on a Mac reports nothing. ` +
         `no_cues means "no hot cue is set" -- the quickCues blob is decoded for this, since ` +
         `Engine writes one to every analysed track whether or not a pad is used -- while ` +
         `no_beatgrid means the beatData blob is absent or empty. ` +

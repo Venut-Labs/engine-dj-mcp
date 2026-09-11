@@ -9,7 +9,7 @@ import { cueFrame, emptyCue } from "./fixtures/blob-frames.js";
 import { readLibraryInfo } from "../src/discovery.js";
 import { QueryProcess } from "../src/proc/query-client.js";
 import { IndexManager } from "../src/store/index-manager.js";
-import { auditLibrary, AUDIT_CHECKS } from "../src/tools/audit.js";
+import { auditLibrary, AUDIT_CHECKS, FILESYSTEM_CHECKS, onlyFoundByIgnoringForm } from "../src/tools/audit.js";
 import { isEngineError } from "../src/errors.js";
 
 let dir: string, mdb: string, qp: QueryProcess;
@@ -157,7 +157,7 @@ describe("audit_library", () => {
     expect(r.message.toLowerCase()).toContain("empty");
   });
 
-  it("omitting checks entirely still runs all ten, distinguishing it from an empty array", async () => {
+  it("omitting checks entirely runs every check, distinguishing it from an empty array", async () => {
     const r = await auditLibrary(qp, mdb, {});
     expect(isEngineError(r)).toBe(false);
     if (isEngineError(r)) return;
@@ -181,7 +181,7 @@ describe("audit_library", () => {
       },
     } as unknown as QueryProcess;
 
-    const sqlChecks = AUDIT_CHECKS.filter((c) => c !== "missing_files");
+    const sqlChecks = AUDIT_CHECKS.filter((c) => !(FILESYSTEM_CHECKS as readonly string[]).includes(c));
     const r = await auditLibrary(spy, mdb, { checks: [...sqlChecks] });
     expect(isEngineError(r)).toBe(false);
     if (isEngineError(r)) return;
@@ -424,5 +424,101 @@ describe("duplicates outside ASCII (#9)", () => {
 
   it("still groups an ASCII case pair, and nothing that is not a duplicate", async () => {
     expect(await dupIds()).toEqual([1, 2, 3, 4, 5]);
+  });
+});
+
+describe("path_form_mismatch", () => {
+  // Measured 2026-09-11 on Linux 6.17's in-kernel exFAT driver: a path in NFC
+  // does NOT find a file whose name was written in NFD, while a path differing
+  // only in case does find it. macOS forgives both. On the maintainer's USB
+  // drive 8 tracks resolve only because of that forgiveness -- file or folder
+  // names macOS wrote in NFD behind the NFC path Engine stored -- and Engine OS
+  // on a player is Linux. This check names them; case-only differences are left
+  // out, since exFAT and Windows both ignore case and they would be noise.
+  const nfd = (s: string) => s.normalize("NFD");
+  const nfc = (s: string) => s.normalize("NFC");
+
+  describe("the comparison, against a listing", () => {
+    // A fake filesystem: directory -> the names stored in it, byte for byte.
+    const tree: Record<string, string[]> = {
+      "/": ["lib"],
+      "/lib": ["Music"],
+      "/lib/Music": ["Meshes", "Anne", "CREAM SODA", nfd("Chlär"), nfd("ЭЙФОРИЯ"), nfc("Лауд")],
+      "/lib/Music/Meshes": [nfd("Эйфория.flac")],
+      "/lib/Music/Anne": ["Breeze.flac"],
+      "/lib/Music/CREAM SODA": [nfc("Истерика.flac")],
+      [`/lib/Music/${nfd("Chlär")}`]: ["x.flac"],
+      [`/lib/Music/${nfd("ЭЙФОРИЯ")}`]: ["y.flac"],
+      [`/lib/Music/${nfc("Лауд")}`]: [nfc("Стандарт.flac")],
+    };
+    const list = (d: string) => tree[d] ?? null;
+    const flagged = (p: string) => onlyFoundByIgnoringForm(p, list);
+
+    it("flags a file name stored in the other form", () => {
+      expect(flagged(`/lib/Music/Meshes/${nfc("Эйфория.flac")}`)).toBe(true);
+    });
+    it("flags a folder name stored in the other form", () => {
+      expect(flagged(`/lib/Music/${nfc("Chlär")}/x.flac`)).toBe(true);
+    });
+    it("flags a name that differs in case and form together, since exFAT forgives only the case", () => {
+      expect(flagged(`/lib/Music/${nfc("Эйфория")}/y.flac`)).toBe(true);
+    });
+    it("does not flag a case-only difference", () => {
+      expect(flagged(`/lib/Music/Cream Soda/${nfc("Истерика.flac")}`)).toBe(false);
+    });
+    it("does not flag an exact match, ASCII or not", () => {
+      expect(flagged("/lib/Music/Anne/Breeze.flac")).toBe(false);
+      expect(flagged(`/lib/Music/${nfc("Лауд")}/${nfc("Стандарт.flac")}`)).toBe(false);
+    });
+    it("does not flag a file that is not there at all -- that is missing_files", () => {
+      expect(flagged(`/lib/Music/Meshes/${nfc("Нет.flac")}`)).toBe(false);
+      expect(flagged("/lib/Nowhere/a.flac")).toBe(false);
+    });
+  });
+
+  describe("on disk", () => {
+    let pdir: string, pmdb: string, pqp: QueryProcess;
+    beforeAll(async () => {
+      pdir = mkdtempSync(join(tmpdir(), "edj-audit-form-"));
+      pmdb = makeLibrary(pdir, { tracks: 5 });
+      const lib = dirname(dirname(pmdb));
+      // [track id, path Engine stored (NFC), path actually created on disk]
+      const cases: [number, string, string | null][] = [
+        [1, `Music/Meshes/${nfc("Эйфория.flac")}`, `Music/Meshes/${nfd("Эйфория.flac")}`],
+        [2, "Music/Anne/Breeze.flac", "Music/Anne/Breeze.flac"],
+        [3, `Music/CREAM SODA/${nfc("Истерика.flac")}`, `Music/CREAM SODA/${nfc("Истерика.flac")}`],
+        [4, `Music/${nfc("Chlär")}/x.flac`, `Music/${nfd("Chlär")}/x.flac`],
+        [5, `Music/${nfc("Нет")}/z.flac`, null],
+      ];
+      const raw = new DatabaseSync(pmdb);
+      for (const [id, stored, onDisk] of cases) {
+        raw.prepare("UPDATE Track SET path = ? WHERE id = ?").run(stored, id);
+        if (onDisk) {
+          const target = join(lib, onDisk);
+          mkdirSync(dirname(target), { recursive: true });
+          writeFileSync(target, "");
+        }
+      }
+      raw.close();
+      const info = readLibraryInfo(pmdb);
+      if (isEngineError(info)) throw new Error("fixture unreadable");
+      pqp = new QueryProcess(pmdb, null, 10_000);
+      await new IndexManager(info, pqp, join(pdir, "sidecars")).ensureFresh();
+    });
+    afterAll(() => {
+      pqp.dispose();
+      rmSync(pdir, { recursive: true, force: true });
+    });
+
+    it("names exactly the tracks behind a name in the other form, on any host", async () => {
+      // The answer is about the data -- how the names on disk compare with
+      // the stored paths -- so it is the same on macOS, which would open all
+      // four existing files, and on Linux CI, which would not open two.
+      const r = await auditLibrary(pqp, pmdb, { checks: ["path_form_mismatch"] });
+      if (isEngineError(r)) throw new Error(r.message);
+      expect(r.checks[0]!.name).toBe("path_form_mismatch");
+      expect([...r.checks[0]!.sample_ids].sort((a, b) => a - b)).toEqual([1, 4]);
+      expect(r.checks[0]!.count).toBe(2);
+    });
   });
 });
