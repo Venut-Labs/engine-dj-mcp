@@ -522,6 +522,13 @@ Engine DJ has written since is discarded along with the one edit you wanted
 gone. Reach for it only if the library itself is damaged — the case where a
 write comes back with `detail: "committed_unverified"`.
 
+Snapshots live in `~/.engine-dj-mcp/backups/`, ten per library. Only a name
+ending in `.db` is a snapshot. A file ending in `.partial-<number>` — with or
+without `-journal` after it — is a copy still being written, or one whose
+process died before it finished: **never restore one of those**. A copy is
+renamed to its `.db` name only once it is complete, and an abandoned one is
+cleared the next time that library is snapshotted.
+
 **To undo a playlist you created, delete it in Engine DJ.** Engine's own
 delete trigger repairs the playlist chain and cascades the entries away,
 which is exactly what removing it should do and is not something restoring

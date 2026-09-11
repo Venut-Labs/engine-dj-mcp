@@ -106,7 +106,11 @@ export function abandonedPartials(
   prefix: string,
   isAlive: (pid: number) => boolean = processAlive,
 ): string[] {
-  const partial = /\.db\.partial-(\d+)$/;
+  // With or without `-journal`: SQLite keeps a rollback journal beside the
+  // copy while backup() runs (measured -- it exists mid-copy and is gone once
+  // backup() resolves), so a process killed partway leaves both behind. They
+  // share the pid, so a live copy's journal is spared along with the copy.
+  const partial = /\.db\.partial-(\d+)(-journal)?$/;
   return names.filter((name) => {
     if (!name.startsWith(prefix)) return false;
     const m = partial.exec(name);
@@ -185,7 +189,10 @@ export async function snapshotLibrary(
     // earlier objection to cleaning up on failure -- deleting a file at a path
     // we may not have created -- does not apply to a path no one else can
     // produce.
-    if (partial) rmSync(partial, { force: true });
+    if (partial) {
+      rmSync(partial, { force: true });
+      rmSync(`${partial}-journal`, { force: true });
+    }
     return err(
       "library_unreadable",
       `Could not snapshot ${mdbPath} before writing: ${String(e)}`,

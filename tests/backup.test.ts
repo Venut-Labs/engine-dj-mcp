@@ -206,6 +206,20 @@ describe("a snapshot that does not finish (#3)", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it("removes the journal the dying copy left beside it, too", async () => {
+    const { dir, mdb, base } = lib();
+    await snapshotLibrary(mdb, "snap-uuid", base);
+    const before = readdirSync(base).sort();
+    const dying = async (_src: unknown, dest: string) => {
+      writeFileSync(dest, "partial");
+      writeFileSync(`${dest}-journal`, "journal of a copy that will never finish");
+      throw new Error("ENOSPC: no space left on device");
+    };
+    await snapshotLibrary(mdb, "snap-uuid", base, { backup: dying as any });
+    expect(readdirSync(base).sort()).toEqual(before);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it("never lets a dead copy evict a good snapshot", async () => {
     // Fill the window, then fail once. With the old behaviour the failed copy
     // took the newest slot and the oldest good snapshot was deleted for it.
@@ -245,9 +259,14 @@ describe("a snapshot that does not finish (#3)", () => {
     const prefix = `snap-uuid-${libraryTag(mdb)}-`;
     const orphan = `${prefix}2026-01-01T00-00-00-000Z-0000000001.db.partial-${deadPid()}`;
     writeFileSync(join(base, orphan), "half a database");
+    // SQLite keeps a rollback journal beside the copy while backup() runs --
+    // measured: `<partial>-journal` exists mid-copy and is gone after -- so a
+    // process killed partway leaves the journal behind as well.
+    writeFileSync(join(base, `${orphan}-journal`), "its journal");
 
     await snapshotLibrary(mdb, "snap-uuid", base);
     expect(existsSync(join(base, orphan))).toBe(false);
+    expect(existsSync(join(base, `${orphan}-journal`))).toBe(false);
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -260,9 +279,13 @@ describe("a snapshot that does not finish (#3)", () => {
     const prefix = `snap-uuid-${libraryTag(mdb)}-`;
     const inflight = `${prefix}2026-01-01T00-00-00-000Z-0000000001.db.partial-${process.ppid}`;
     writeFileSync(join(base, inflight), "being written right now");
+    writeFileSync(join(base, `${inflight}-journal`), "and its journal");
 
     await snapshotLibrary(mdb, "snap-uuid", base);
     expect(existsSync(join(base, inflight))).toBe(true);
+    // Deleting a live copy's journal while leaving the copy would be worse
+    // than deleting both: the other server's copy would be left inconsistent.
+    expect(existsSync(join(base, `${inflight}-journal`))).toBe(true);
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -287,8 +310,13 @@ describe("abandonedPartials", () => {
       "u-t-2026-C.db.partial-222",     // writer dead: this one
       "x-y-2026-D.db.partial-222",     // another library
       "u-t-2026-E.db.partial-abc",     // not a pid
+      "u-t-2026-C.db.partial-222-journal", // the dead copy's journal: this one too
+      "u-t-2026-B.db.partial-111-journal", // the live copy's journal: never
     ];
-    expect(abandonedPartials(names, "u-t-", alive)).toEqual(["u-t-2026-C.db.partial-222"]);
+    expect(abandonedPartials(names, "u-t-", alive)).toEqual([
+      "u-t-2026-C.db.partial-222",
+      "u-t-2026-C.db.partial-222-journal",
+    ]);
   });
 
   it("is never counted as a snapshot by rotation", () => {
