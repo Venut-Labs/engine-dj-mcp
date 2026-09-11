@@ -345,14 +345,14 @@ own checks.
 | Code | Means | Nothing written? |
 | --- | --- | --- |
 | `invalid_argument` | The arguments do not make sense — both `playlist_id` and `playlist_name`, an empty list where one is required, or a `playlist_name` that matches several playlists (every candidate is listed). | yes |
-| `library_not_found` | `library` names nothing connected. Lists what is. | yes |
+| `library_not_found` | `library` names nothing connected — the refusal lists what is — or the library's header could not be read. | yes |
 | `ambiguous_library` | No `library` given, and two libraries tie for the default. Lists both — see [Choosing a library](#choosing-a-library). | yes |
 | `unsupported_schema` | The library's version is outside what this server supports. | yes |
 | `library_needs_recovery` | Engine DJ left an unrecovered journal. Launch Engine once. | yes |
 | `library_busy` | Something holds a conflicting lock right now. Retry. | yes |
 | `index_stale` | The index could not be built yet, typically because Engine holds a lock on a first run. Carries `retry_after_ms`. | yes |
 | `query_timeout`, `query_process_crashed` | The lookup that resolves a playlist failed. Edit tools only. | yes |
-| `library_unreadable` | The library could not be read — or a write's own read-back disagreed with what it wrote, and it was rolled back. | see `detail` |
+| `library_unreadable` | The library could not be read; the snapshot taken before the first write could not be made (a full disk, or a Node older than 22.16); or a write's own read-back disagreed with what it wrote, and it was rolled back. | see `detail` |
 
 **`detail` on these errors.** Once the write itself has started, `detail` is
 exactly one of two strings, and a client can read it to decide whether the
