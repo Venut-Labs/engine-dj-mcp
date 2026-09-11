@@ -160,7 +160,7 @@ Positions are sample offsets; cue and loop items also carry seconds.
 
 ### `audit_library`
 
-Ten collection health checks. Returns a count and a small sample of ids per
+Eleven collection health checks. Returns a count and a small sample of ids per
 check, never the full result set — a library with thousands of unanalysed
 tracks should not fill an assistant's context.
 
@@ -173,11 +173,12 @@ tracks should not fill an assistant's context.
 | `no_beatgrid` | Tracks with no beatgrid data |
 | `missing_key` | Tracks with no key detected |
 | `suspicious_bpm` | Analysed and tagged tempo disagree, or tempo is outside 60–200 |
-| `duplicates` | Same artist and title, or same size and length |
+| `duplicates` | Same artist and title, compared regardless of case in any script |
 | `empty_metadata` | No artist or no title |
 | `orphan_entries` | Playlist entries pointing at tracks not in this library — `get_playlist_tracks` shows where each one sits |
+| `path_form_mismatch` | The file is on disk, but its name there — or a folder's on the way — is in a different Unicode form from the path Engine stored. macOS finds it anyway; Linux does not (measured on the kernel's exFAT driver), and Engine OS on a player is Linux, so these may fail to load on hardware. Differences in case alone are not counted: exFAT and Windows ignore case |
 
-`checks` — omit it to run all ten.
+`checks` — omit it to run all eleven.
 
 ### `run_sql`
 

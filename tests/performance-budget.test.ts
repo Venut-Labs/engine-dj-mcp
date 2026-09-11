@@ -11,7 +11,7 @@ import { QueryProcess } from "../src/proc/query-client.js";
 import { IndexManager } from "../src/store/index-manager.js";
 import { searchTracks } from "../src/tools/search.js";
 import { getTrackPerformance } from "../src/tools/performance.js";
-import { auditLibrary, AUDIT_CHECKS } from "../src/tools/audit.js";
+import { auditLibrary, AUDIT_CHECKS, FILESYSTEM_CHECKS } from "../src/tools/audit.js";
 import { isEngineError } from "../src/errors.js";
 
 const N = 50_000;
@@ -48,8 +48,8 @@ afterAll(() => { qp.dispose(); rmSync(dir, { recursive: true, force: true }); })
  *  - get_track_performance: 25 ms. It decodes blobs in the MCP process
  *    rather than the killable child, and truncates its response, so it needs
  *    a number of its own rather than riding on search's.
- *  - audit_library (the nine SQL checks; missing_files is excluded because
- *    it stats every file and is legitimately disk-bound): 500 ms. This one
+ *  - audit_library (the SQL checks; the filesystem checks are excluded because
+ *    they read the disk and are legitimately disk-bound): 500 ms. This one
  *    used to ship every offending row over IPC, so its cost grew with the
  *    library; the budget is what makes a regression back to that visible.
  *
@@ -143,7 +143,7 @@ describe(`performance budgets at ${N} tracks`, () => {
     // Was O(offending rows) over IPC; this budget is what makes a regression
     // back to that visible at 50k tracks. missing_files is excluded because
     // it stats every file and is legitimately disk-bound.
-    const checks = AUDIT_CHECKS.filter((c) => c !== "missing_files");
+    const checks = AUDIT_CHECKS.filter((c) => !(FILESYSTEM_CHECKS as readonly string[]).includes(c));
     const t = performance.now();
     const r = await auditLibrary(qp, mdb, { checks: [...checks] });
     const elapsed = performance.now() - t;
