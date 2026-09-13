@@ -17,10 +17,10 @@ import { expandHome, redactPath } from "./paths.js";
 export const LIBRARY_ARG_DESCRIPTION =
   "Which library to use: either the uuid or the path reported by list_libraries " +
   "(the reported ~/... form is accepted, as is the absolute path). Omit it to use " +
-  "the supported library holding the most tracks. If two supported libraries hold " +
-  "the same most tracks -- what a USB drive and its copy on the computer produce -- " +
-  "a read still picks one, but a WRITE refuses with ambiguous_library listing both, " +
-  "since the choice decides which disk changes; ask the user which, then pass it here.";
+  "the supported library holding the most tracks. A READ may always omit it. A WRITE " +
+  "may omit it only when a single supported library is connected: with two or more, a " +
+  "write refuses with ambiguous_library listing them, since the choice decides which " +
+  "disk changes; ask the user which, then pass it here.";
 
 export const LibraryArg = z.string().min(1).optional().describe(LIBRARY_ARG_DESCRIPTION);
 
@@ -55,31 +55,25 @@ export function pickDefaultLibrary(libs: readonly LibraryInfo[]): LibraryInfo | 
 }
 
 /**
- * The supported libraries tied for the default pick -- more than one holding
- * the same, highest track count. Empty when the default is unambiguous, which
- * includes the single-library case every DJ starts from.
+ * The libraries a write must be told apart between: every supported one, as
+ * soon as there is more than one. Empty when there is nothing to choose --
+ * one supported library, or none -- so a DJ with a single library never has
+ * to name it.
  *
- * A tie is not an exotic shape: it is what a USB drive and its copy on the
- * computer produce, and they tie *because* one is a copy of the other.
- * Measured 2026-09-01, both real libraries reported 257 tracks.
+ * This used to ask a narrower question: which libraries *tied* for the
+ * default pick on track count. That was wrong, and measurably so. A USB drive
+ * and its copy tie only until one of them gains a track; at 258 against 257
+ * the tie is gone and `pickDefaultLibrary` silently takes the larger. For a
+ * playlist that is at least visible on the wrong drive. For a track's genre
+ * it is invisible, and the DJ is left believing the edit did not work.
  *
- * For a read, either answer is very nearly the same answer -- the two are
- * copies -- so `pickDefaultLibrary` keeps choosing, and a read never has to
- * name a library it does not care about. For a write the choice decides which
- * physical disk changes, and one of them is the drive the DJ performs from.
- * Hence: reads choose, writes refuse. Callers wanting the strict behaviour
- * check this first.
- *
- * Skips unsupported libraries for the same reason `pickDefaultLibrary` does:
- * one can never be chosen while a supported library exists, so it is not a
- * competing candidate and must not make a write refuse.
+ * The count was never the question. Which physical disk changes is the
+ * caller's to say, and only reads -- which change nothing -- may be spared
+ * the question.
  */
-export function defaultLibraryTies(libs: readonly LibraryInfo[]): LibraryInfo[] {
+export function writeNeedsLibrary(libs: readonly LibraryInfo[]): LibraryInfo[] {
   const supported = libs.filter((l) => l.supported);
-  if (supported.length < 2) return [];
-  const best = Math.max(...supported.map((l) => l.trackCount ?? -1));
-  const tied = supported.filter((l) => (l.trackCount ?? -1) === best);
-  return tied.length > 1 ? tied : [];
+  return supported.length > 1 ? supported : [];
 }
 
 /**
@@ -100,7 +94,7 @@ export function ambiguousLibrary(tied: readonly LibraryInfo[]): EngineError {
   const list = tied.map((l) => `${l.uuid} -- ${redactPath(l.path)} (${l.trackCount} tracks)`).join("; ");
   return err(
     "ambiguous_library",
-    `More than one library holds the most tracks, so there is no default to write to: ${list}. ` +
+    `More than one library is connected, so there is no default to write to: ${list}. ` +
       `Nothing was written. ASK which one to write to, then retry with \`library\` set -- ` +
       `do not choose for them. These are usually a USB drive and its copy on the computer, ` +
       `and one of them may be the drive they perform from.`,
