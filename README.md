@@ -87,7 +87,7 @@ tempo, key, rating, when a track was added and when it was last played.
 | `q` | Full text over title, artist, album, genre, comment and label. Diacritics are folded, so `bjork` matches `Björk` — Engine's own search does not. |
 | `bpm` | `{ min, max }` or `{ around, tolerance_pct }`. Resolved tempo, so an analysed BPM wins over the tag. |
 | `key` | `{ camelot: [...] }` for exact keys, `{ compatible_with: "8A" }` for harmonic neighbours, `{ mode: "minor" }` for a whole side of the wheel. |
-| `rating` | `{ min, max }`, 0–5. |
+| `rating` | `{ min, max }`, in stars, 0–5. Engine stores 0, 20, 40, 60, 80, 100; the filter converts, so `{ min: 4 }` means four stars and up. The `rating` field hands back the stored number, and `rating_stars` the same thing in stars. |
 | `played` | `{ never: true }`, or `{ before, after }` taking an ISO date or a relative form like `-6 months`. |
 | `added` | `{ before, after }`, same date forms. |
 | `flags` | `analyzed`, `available`, `has_cues`, `has_beatgrid`. `has_cues` means a hot cue is genuinely set — see [Limitations](#limitations). |

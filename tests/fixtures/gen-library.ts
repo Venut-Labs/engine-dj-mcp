@@ -196,7 +196,7 @@ export function makeLibrary(
       `${opts.marker ? opts.marker + " " : ""}${pick(WORDS)} ${pick(WORDS)} ${i}`,
       pick(ARTISTS), `Album ${i % 40}`, pick(GENRES),
       r() < 0.3 ? pick(WORDS) : null, `Label ${i % 20}`,
-      r() < 0.05 ? -1 : Math.floor(r() * 24), Math.floor(r() * 6),
+      r() < 0.05 ? -1 : Math.floor(r() * 24), Math.floor(r() * 6) * 20,  // Engine's units: 0/20/40/60/80/100
       played, played ? 1 : 0, "mp3", r() < 0.9 ? 1 : 0,
       now - Math.floor(r() * 86400 * 1500), 1, now - Math.floor(r() * 86400 * 100),
       uuid, i,

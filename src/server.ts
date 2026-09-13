@@ -872,6 +872,11 @@ other.
   \`bpmAnalyzed\` to within 0.68, and Engine's own interface displays 102 for
   the track stored as 102). \`side.track_derived.tempo\` holds the resolved
   value and is indexed.
+- \`Track.rating\` is 0, 20, 40, 60, 80 or 100 -- one step per star, measured
+  against Engine's own display. The \`rating\` field returns it as stored and
+  \`rating_stars\` returns 0..5; the \`rating\` **filter** takes stars. A value
+  from other software (ID3's POPM is 0..255) is kept exactly in \`rating\` and
+  rounded to the nearest star in \`rating_stars\`.
 - \`Track.path\` is relative to the \`Engine Library\` folder and usually
   contains \`..\`. The SQL function \`abs_path(path)\` resolves it against
   this library's location; the home prefix comes back folded to \`~\`.
