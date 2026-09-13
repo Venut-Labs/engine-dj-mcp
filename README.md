@@ -54,7 +54,7 @@ the configuration you are reading:
 ```json
 {
   "mcpServers": {
-    "engine-dj": { "command": "npx", "args": ["-y", "engine-dj-mcp@0.15.0", "--allow-writes"] }
+    "engine-dj": { "command": "npx", "args": ["-y", "engine-dj-mcp@0.16.0", "--allow-writes"] }
   }
 }
 ```
