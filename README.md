@@ -87,7 +87,7 @@ tempo, key, rating, when a track was added and when it was last played.
 | `q` | Full text over title, artist, album, genre, comment and label. Diacritics are folded, so `bjork` matches `Björk` — Engine's own search does not. |
 | `bpm` | `{ min, max }` or `{ around, tolerance_pct }`. Resolved tempo, so an analysed BPM wins over the tag. |
 | `key` | `{ camelot: [...] }` for exact keys, `{ compatible_with: "8A" }` for harmonic neighbours, `{ mode: "minor" }` for a whole side of the wheel. |
-| `rating` | `{ min, max }`, 0–5. |
+| `rating` | `{ min, max }`, in stars, 0–5. Engine stores 0, 20, 40, 60, 80, 100; the filter converts, so `{ min: 4 }` means four stars and up. The `rating` field hands back the stored number, and `rating_stars` the same thing in stars. |
 | `played` | `{ never: true }`, or `{ before, after }` taking an ISO date or a relative form like `-6 months`. |
 | `added` | `{ before, after }`, same date forms. |
 | `flags` | `analyzed`, `available`, `has_cues`, `has_beatgrid`. `has_cues` means a hot cue is genuinely set — see [Limitations](#limitations). |
@@ -347,7 +347,7 @@ own checks.
 | --- | --- | --- |
 | `invalid_argument` | The arguments do not make sense — both `playlist_id` and `playlist_name`, an empty list where one is required, or a `playlist_name` that matches several playlists (every candidate is listed). | yes |
 | `library_not_found` | `library` names nothing connected — the refusal lists what is — or the library's header could not be read. | yes |
-| `ambiguous_library` | No `library` given, and two libraries tie for the default. Lists both — see [Choosing a library](#choosing-a-library). | yes |
+| `ambiguous_library` | No `library` given, and more than one supported library is connected. Lists them — see [Choosing a library](#choosing-a-library). | yes |
 | `unsupported_schema` | The library's version is outside what this server supports. | yes |
 | `library_needs_recovery` | Engine DJ left an unrecovered journal. Launch Engine once. | yes |
 | `library_busy` | Something holds a conflicting lock right now. Retry. | yes |
@@ -387,20 +387,22 @@ tracks**. That matters: the local library Engine DJ creates on install is
 scanned first and is often empty, so "the first one found" would hide the
 drive you actually work from.
 
-When two supported libraries hold the *same* highest number of tracks, that
-rule names no winner — and a tie is the ordinary case, not an exotic one: a
-USB drive and its copy on the computer tie precisely because one is a copy of
-the other. Measured 2026-09-01, both real libraries reported 257 tracks.
+That rule is enough for a read, which changes nothing: with two libraries
+connected a read picks one, and the `library` field in the result says which.
 
-**A read still chooses for itself.** Tied libraries hold the same tracks, so
-either answer is very nearly the same answer, and making you name a library
-you have no reason to care about would be noise.
+**A write refuses instead**, as soon as more than one supported library is
+connected — whatever their track counts. `ambiguous_library` lists every
+candidate with its track count, and `detail: "not_committed"`.
 
-**A write refuses**, with `ambiguous_library` listing every candidate and its
-track count, and `detail: "not_committed"`. The choice decides which physical
-disk changes, and one of the two may be the drive you perform from; scan
-order is not a reason to pick it. Name a library and the write goes through,
-tie or not — the ambiguity being refused is the server's, not yours.
+The count was never the right question. An earlier version refused only an
+exact tie, reasoning that a USB drive and its copy tie precisely because one
+is a copy of the other — measured 2026-09-01, both real libraries at 257. But
+import one track on one side and the tie is gone, and the default quietly
+takes the larger. A playlist written to the wrong drive is at least visible
+there; a track's genre is not, and you are left believing the edit did not
+work.
+
+With a single library nothing changes: you never have to name it.
 
 The refusal tells the assistant to **ask you** rather than choose. Otherwise
 "pass `library`, here are the two" is an invitation to take the first one,
@@ -493,9 +495,16 @@ library the write actually landed in. Two libraries connected at once is the
 ordinary setup: a USB drive and its copy on the computer. This is where you
 check which of them a write went to.
 
-**`undo` reverses the edit in that one library, and only there.** Engine DJ
-moves playlist changes between connected libraries by itself, so a copy of
-your edit can end up somewhere `undo` cannot reach.
+**`undo` reverses the edit in that one library, and only there.** Each undo
+step names it — by path, in the step's own `library` argument — so replaying
+a step verbatim goes back to the library the edit was made in, not to whatever
+the default is at replay time. That matters because a USB drive and its copy
+hold the same playlist ids and the same track ids: a replay that resolved the
+default could land on the wrong disk, and its `expect_track_ids` would agree,
+both sides having been edited the same way.
+
+Engine DJ moves playlist changes between connected libraries by itself, so a
+copy of your edit can still end up somewhere `undo` cannot reach.
 
 Measured 2026-09-01. A track was added to a playlist in the library on the
 computer. Engine DJ was then launched with the USB drive attached, and the

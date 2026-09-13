@@ -35,6 +35,12 @@ export const FIELD_SQL: Record<string, string> = {
   label: "t.label",
   year: "t.year",
   rating: "t.rating",
+  // Engine stores 0, 20, 40, 60, 80, 100 -- measured: four stars set in Engine
+  // came back as 80. `rating` hands that back as it is; `rating_stars` is the
+  // same thing in the units a person uses, so a caller never has to know the
+  // factor. A value no Engine writes (a third-party tagger's 55) rounds to the
+  // nearest star here and stays exact in `rating`.
+  rating_stars: "CAST(ROUND(COALESCE(t.rating, 0) / 20.0) AS INTEGER)",
   length: "t.length",
   path: "t.path",
   filename: "t.filename",
@@ -320,13 +326,16 @@ export async function searchTracks(
     }
   }
 
+  // In stars, which is what README has always documented and what a person
+  // means. Compared against the raw column, `min: 4` matched 20, 40, 60, 80
+  // and 100 -- every rated track -- and `max: 3` matched only unrated ones.
   if (input.rating?.min !== undefined) {
     filterWhere.push("t.rating >= ?");
-    filterParams.push(input.rating.min);
+    filterParams.push(input.rating.min * 20);
   }
   if (input.rating?.max !== undefined) {
     filterWhere.push("t.rating <= ?");
-    filterParams.push(input.rating.max);
+    filterParams.push(input.rating.max * 20);
   }
 
   if (input.played?.never) filterWhere.push("(t.timeLastPlayed IS NULL OR t.isPlayed = 0)");

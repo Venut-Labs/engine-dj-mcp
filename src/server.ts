@@ -8,7 +8,7 @@ import { libraryCandidates, libraryTag, sidecarDir } from "./paths.js";
 import {
   LibraryArg,
   ambiguousLibrary,
-  defaultLibraryTies,
+  writeNeedsLibrary,
   findLibrary,
   libraryNotFound,
   pickDefaultLibrary,
@@ -108,14 +108,16 @@ const LIBRARY_SELECTION_NOTE =
   "supported library with the most tracks.";
 
 /**
- * Appended to the write tools only. A tie in the default rule is a refusal
- * there and a free choice on the read side, so the shared note above cannot
- * carry it without being wrong for one of the two.
+ * Appended to the write tools only. More than one library is a refusal there
+ * and a free choice on the read side, so the shared note above cannot carry it
+ * without being wrong for one of the two.
  */
-const WRITE_LIBRARY_TIE_NOTE =
-  " If two supported libraries hold the same most tracks -- what a USB drive and its copy on " +
-  "the computer produce -- this tool refuses with ambiguous_library rather than picking one, " +
-  "and lists both; nothing is written. Ask the user which one, then retry with `library` set -- do not pick for them, since one of the two may be the drive they perform from.";
+const WRITE_LIBRARY_NOTE =
+  " With two or more supported libraries connected, this tool refuses with ambiguous_library " +
+  "rather than picking one, and lists them; nothing is written. That is so whatever their track " +
+  "counts are -- the count never said which disk should change. Ask the user which one, then " +
+  "retry with `library` set; do not pick for them, since one of them may be the drive they " +
+  "perform from.";
 
 function reply(value: unknown) {
   return {
@@ -357,8 +359,8 @@ export async function createServer(
   const acquireForWrite = async (requested?: string): Promise<LibraryState | EngineError> => {
     if (requested === undefined) {
       rescanLibraries();
-      const tied = defaultLibraryTies(knownList());
-      if (tied.length > 1) return ambiguousLibrary(tied);
+      const choices = writeNeedsLibrary(knownList());
+      if (choices.length > 0) return ambiguousLibrary(choices);
     }
     return acquire(requested);
   };
@@ -662,7 +664,7 @@ export async function createServer(
           "library is unchanged and \"committed_unverified\" when the write may have gone " +
           "through but could not be verified. track_ids may be empty (an empty playlist); a " +
           "track id may appear at most once. " +
-          LIBRARY_SELECTION_NOTE + WRITE_LIBRARY_TIE_NOTE,
+          LIBRARY_SELECTION_NOTE + WRITE_LIBRARY_NOTE,
         inputSchema: { ...CreatePlaylistInput.shape, library: LibraryArg },
         annotations: RW,
       },
@@ -709,7 +711,7 @@ export async function createServer(
           "Engine DJ has recorded since -- not just this one edit. backup_path is only a " +
           "last-resort recovery route for a damaged library, never an undo. " +
           UNDO_SCOPE_NOTE +
-          LIBRARY_SELECTION_NOTE + WRITE_LIBRARY_TIE_NOTE,
+          LIBRARY_SELECTION_NOTE + WRITE_LIBRARY_NOTE,
         inputSchema: { ...AddTracksToPlaylistInput.shape, library: LibraryArg },
         annotations: RW,
       },
@@ -755,7 +757,7 @@ export async function createServer(
           "backup_path, which reverts the WHOLE library to before this session's first write, " +
           "discarding everything Engine DJ has recorded since -- not just this edit. " +
           UNDO_SCOPE_NOTE +
-          LIBRARY_SELECTION_NOTE + WRITE_LIBRARY_TIE_NOTE,
+          LIBRARY_SELECTION_NOTE + WRITE_LIBRARY_NOTE,
         inputSchema: { ...RemoveTracksFromPlaylistInput.shape, library: LibraryArg },
         annotations: RW_DESTRUCTIVE,
       },
@@ -789,7 +791,7 @@ export async function createServer(
           "WHOLE library to before this session's first write, discarding everything Engine DJ " +
           "has recorded since -- not just this reorder. " +
           UNDO_SCOPE_NOTE +
-          LIBRARY_SELECTION_NOTE + WRITE_LIBRARY_TIE_NOTE,
+          LIBRARY_SELECTION_NOTE + WRITE_LIBRARY_NOTE,
         inputSchema: { ...ReorderPlaylistInput.shape, library: LibraryArg },
         annotations: RW_DESTRUCTIVE,
       },
@@ -870,6 +872,11 @@ other.
   \`bpmAnalyzed\` to within 0.68, and Engine's own interface displays 102 for
   the track stored as 102). \`side.track_derived.tempo\` holds the resolved
   value and is indexed.
+- \`Track.rating\` is 0, 20, 40, 60, 80 or 100 -- one step per star, measured
+  against Engine's own display. The \`rating\` field returns it as stored and
+  \`rating_stars\` returns 0..5; the \`rating\` **filter** takes stars. A value
+  from other software (ID3's POPM is 0..255) is kept exactly in \`rating\` and
+  rounded to the nearest star in \`rating_stars\`.
 - \`Track.path\` is relative to the \`Engine Library\` folder and usually
   contains \`..\`. The SQL function \`abs_path(path)\` resolves it against
   this library's location; the home prefix comes back folded to \`~\`.
