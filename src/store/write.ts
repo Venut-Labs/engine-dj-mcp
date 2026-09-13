@@ -591,7 +591,30 @@ async function withWriteTransaction<T extends object>(
     // Filled in here, alongside backup_path, for the same reason: it is the
     // one place that knows the write succeeded, and doing it per-op would let
     // a new op ship without it.
-    return { ...result, library: { uuid, path: redactPath(mdbPath) }, backup_path: backupPath };
+    const library: LibraryRef = { uuid, path: redactPath(mdbPath) };
+
+    // Every undo step carries the library too, and for a sharper reason than
+    // symmetry: a caller replaying an undo sends `undo.arguments` and nothing
+    // else, so without it the replay resolves whatever library is the default
+    // at replay time. A USB drive and its copy hold the same playlist ids and
+    // the same track ids, so such a replay lands on the wrong disk and
+    // expect_track_ids agrees -- both sides having been edited the same way.
+    //
+    // By path, not by uuid: a library and its clone on a second drive share a
+    // uuid (see store/backup.ts, which tags snapshots by path for exactly
+    // that), and a uuid could not say which of the two to undo in. A path
+    // names one. If that drive has since moved, the replay fails loudly with
+    // library_not_found rather than quietly editing the other copy.
+    //
+    // Injected here rather than in each op so a new op cannot ship without it.
+    const withUndo = result as { undo?: UndoStep[] };
+    if (Array.isArray(withUndo.undo)) {
+      withUndo.undo = withUndo.undo.map((step) => ({
+        ...step,
+        arguments: { library: library.path, ...step.arguments },
+      }));
+    }
+    return { ...result, library, backup_path: backupPath };
   } catch (e) {
     return classifyWriteFailure(e, commit, subject, mdbPath, backupPath, db, open);
   } finally {

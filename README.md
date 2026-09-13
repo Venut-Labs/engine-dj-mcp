@@ -495,9 +495,16 @@ library the write actually landed in. Two libraries connected at once is the
 ordinary setup: a USB drive and its copy on the computer. This is where you
 check which of them a write went to.
 
-**`undo` reverses the edit in that one library, and only there.** Engine DJ
-moves playlist changes between connected libraries by itself, so a copy of
-your edit can end up somewhere `undo` cannot reach.
+**`undo` reverses the edit in that one library, and only there.** Each undo
+step names it — by path, in the step's own `library` argument — so replaying
+a step verbatim goes back to the library the edit was made in, not to whatever
+the default is at replay time. That matters because a USB drive and its copy
+hold the same playlist ids and the same track ids: a replay that resolved the
+default could land on the wrong disk, and its `expect_track_ids` would agree,
+both sides having been edited the same way.
+
+Engine DJ moves playlist changes between connected libraries by itself, so a
+copy of your edit can still end up somewhere `undo` cannot reach.
 
 Measured 2026-09-01. A track was added to a playlist in the library on the
 computer. Engine DJ was then launched with the USB drive attached, and the

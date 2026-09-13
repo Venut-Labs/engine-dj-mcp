@@ -836,6 +836,35 @@ describe("a write with two libraries tied for the default", () => {
     expect(entryCount(aMdb)).toBe(before + 1);
   });
 
+  it("replays an undo into the library the edit was made in, not the default", async () => {
+    // The whole point of carrying the library inside undo.arguments. Both
+    // libraries here hold playlist 1 and track 5, so an undo that resolved the
+    // default at replay time would land on the wrong disk and its
+    // expect_track_ids would agree.
+    const client = await writeServer();
+    const beforeA = entryCount(aMdb);
+    const beforeB = entryCount(bMdb);
+
+    const edit = await client.callTool({
+      name: "add_tracks_to_playlist",
+      // Track 9, not 5: an earlier test in this file already put 5 into this
+      // playlist, and Engine allows a track in a playlist only once.
+      arguments: { playlist_id: 1, track_ids: [9], library: "cccccccc-3333-4333-8333-cccccccccccc" },
+    });
+    const body = edit.structuredContent as any;
+    expect(body.error, `edit refused: ${(edit.structuredContent as any).message}`).toBeUndefined();
+    expect(entryCount(aMdb)).toBe(beforeA + 1);
+
+    // Replayed verbatim, the way a caller replays it: arguments and nothing else.
+    const step = body.undo[0];
+    const back = await client.callTool({ name: step.tool, arguments: step.arguments });
+    const undone = back.structuredContent as any;
+    expect(undone.error, `undo refused: ${undone.message}`).toBeUndefined();
+    expect(undone.library.path).toBe(body.library.path);
+    expect(entryCount(aMdb), "the edited library is back where it started").toBe(beforeA);
+    expect(entryCount(bMdb), "the other one was never touched").toBe(beforeB);
+  });
+
   it("still lets a read choose for itself, because the two are copies", async () => {
     // Refusing reads as well would make a caller name a library it has no
     // reason to care about: tied libraries hold the same tracks. The refusal

@@ -298,7 +298,7 @@ describe("addTracksToPlaylist", () => {
     expect(r.undo).toEqual([
       {
         tool: "remove_tracks_from_playlist",
-        arguments: { playlist_id: 1, positions: [4, 5], expect_track_ids: [6, 5] },
+        arguments: { library: dbPath, playlist_id: 1, positions: [4, 5], expect_track_ids: [6, 5] },
       },
     ]);
     expect(r.undo_complete).toBe(true);
@@ -525,8 +525,8 @@ describe("removeTracksFromPlaylist", () => {
     // Restoring position 1 first puts the later one back at 3; restoring 3
     // first would land the other at 2. The order is part of the answer.
     expect(r.undo).toEqual([
-      { tool: "add_tracks_to_playlist", arguments: { playlist_id: 1, track_ids: [1], at: "start" } },
-      { tool: "add_tracks_to_playlist", arguments: { playlist_id: 1, track_ids: [3], at: { after_position: 2 } } },
+      { tool: "add_tracks_to_playlist", arguments: { library: dbPath, playlist_id: 1, track_ids: [1], at: "start" } },
+      { tool: "add_tracks_to_playlist", arguments: { library: dbPath, playlist_id: 1, track_ids: [3], at: { after_position: 2 } } },
     ]);
     // Everything removed here can come back, so the undo is the whole way back.
     expect(r.undo_complete).toBe(true);
@@ -616,7 +616,7 @@ describe("removeTracksFromPlaylist", () => {
       expect(order(dbPath)).toEqual([1]);
       expect(r.undo_complete).toBe(false);
       expect(r.undo).toEqual([
-        { tool: "add_tracks_to_playlist", arguments: { playlist_id: 1, track_ids: [3], at: { after_position: 1 } } },
+        { tool: "add_tracks_to_playlist", arguments: { library: dbPath, playlist_id: 1, track_ids: [3], at: { after_position: 1 } } },
       ]);
       for (const step of r.undo) {
         // The step has to survive the schema its own tool validates against:
@@ -642,8 +642,8 @@ describe("removeTracksFromPlaylist", () => {
     expect(isEngineError(r)).toBe(false);
     expect(order(dbPath)).toEqual([1, 4, 5]);
     expect(r.undo).toEqual([
-      { tool: "add_tracks_to_playlist", arguments: { playlist_id: 1, track_ids: [2], at: { after_position: 1 } } },
-      { tool: "add_tracks_to_playlist", arguments: { playlist_id: 1, track_ids: [3], at: { after_position: 2 } } },
+      { tool: "add_tracks_to_playlist", arguments: { library: dbPath, playlist_id: 1, track_ids: [2], at: { after_position: 1 } } },
+      { tool: "add_tracks_to_playlist", arguments: { library: dbPath, playlist_id: 1, track_ids: [3], at: { after_position: 2 } } },
     ]);
     // The undo is not just the right shape -- replaying it actually
     // reconstructs the original order.
@@ -661,9 +661,9 @@ describe("removeTracksFromPlaylist", () => {
     expect(isEngineError(r)).toBe(false);
     expect(order(dbPath)).toEqual([2, 4]);
     expect(r.undo).toEqual([
-      { tool: "add_tracks_to_playlist", arguments: { playlist_id: 1, track_ids: [1], at: "start" } },
-      { tool: "add_tracks_to_playlist", arguments: { playlist_id: 1, track_ids: [3], at: { after_position: 2 } } },
-      { tool: "add_tracks_to_playlist", arguments: { playlist_id: 1, track_ids: [5], at: { after_position: 4 } } },
+      { tool: "add_tracks_to_playlist", arguments: { library: dbPath, playlist_id: 1, track_ids: [1], at: "start" } },
+      { tool: "add_tracks_to_playlist", arguments: { library: dbPath, playlist_id: 1, track_ids: [3], at: { after_position: 2 } } },
+      { tool: "add_tracks_to_playlist", arguments: { library: dbPath, playlist_id: 1, track_ids: [5], at: { after_position: 4 } } },
     ]);
     for (const step of r.undo) {
       await addTracksToPlaylist(dbPath, "lib-uuid", { listId: 1, trackIds: step.arguments.track_ids, at: step.arguments.at }, { backupDir });
@@ -677,7 +677,7 @@ describe("removeTracksFromPlaylist", () => {
     expect(isEngineError(r)).toBe(false);
     expect(r.playlist_id).toBe(2);
     expect(r.undo).toEqual([
-      { tool: "add_tracks_to_playlist", arguments: { playlist_id: 2, track_ids: [5], at: { after_position: 1 } } },
+      { tool: "add_tracks_to_playlist", arguments: { library: dbPath, playlist_id: 2, track_ids: [5], at: { after_position: 1 } } },
     ]);
     expect(order(dbPath, 2)).toEqual([4, 6]);
     expect(order(dbPath, 1)).toEqual([1, 2, 3]);
@@ -704,7 +704,7 @@ describe("reorderPlaylist", () => {
   it("returns the inverse permutation as its undo", async () => {
     const { dbPath, backupDir } = setup();
     const r: any = await reorderPlaylist(dbPath, "lib-uuid", { listId: 1, order: [3, 1, 2] }, { backupDir });
-    expect(r.undo).toEqual([{ tool: "reorder_playlist", arguments: { playlist_id: 1, order: [2, 3, 1] } }]);
+    expect(r.undo).toEqual([{ tool: "reorder_playlist", arguments: { library: dbPath, playlist_id: 1, order: [2, 3, 1] } }]);
     // And it round-trips: applying the undo restores the original order.
     await reorderPlaylist(dbPath, "lib-uuid", { listId: 1, order: [2, 3, 1] }, { backupDir });
     expect(order(dbPath)).toEqual([1, 2, 3]);
@@ -940,5 +940,41 @@ describe("editing a playlist that is a folder, for the two edits beyond add", ()
     expect(isEngineError(r)).toBe(false);
     expect(order(dbPath, 1)).toEqual([3, 1, 2]);
     expect(order(dbPath, 2)).toEqual([4]);
+  });
+});
+
+describe("undo names the library it must be replayed into", () => {
+  // The result's `library` field says where the edit landed, but a caller that
+  // replays `undo` sends only `undo.arguments`. Without a library in there, the
+  // replay resolves the default at replay time -- and a USB drive and its copy
+  // hold the same playlist ids and the same track ids, so it would land on the
+  // wrong disk and expect_track_ids would agree, because both sides were
+  // edited the same way.
+
+  it("puts the library into every undo step", async () => {
+    const { dbPath, backupDir } = setup();
+    const add: any = await addTracksToPlaylist(dbPath, "lib-uuid", { listId: 1, trackIds: [6], at: "end" }, { backupDir });
+    expect(add.undo[0].arguments.library).toBe(dbPath);
+
+    const rm: any = await removeTracksFromPlaylist(dbPath, "lib-uuid", { listId: 1, positions: [1, 3] }, { backupDir });
+    expect(rm.undo.length).toBeGreaterThan(1);
+    for (const step of rm.undo) expect(step.arguments.library).toBe(dbPath);
+
+    const ro: any = await reorderPlaylist(dbPath, "lib-uuid", { listId: 1, order: [2, 1] }, { backupDir });
+    expect(ro.undo[0].arguments.library).toBe(dbPath);
+  });
+
+  it("names the library by path, not by uuid, since two drives can share a uuid", async () => {
+    // src/store/backup.ts records the case: a library and its clone on a second
+    // drive carry the same uuid. A uuid would not say which of them to undo in;
+    // a path names exactly one. If that drive has moved, the replay fails
+    // loudly with library_not_found instead of quietly editing the other copy.
+    const a = setup();
+    const b = setup();
+    const ra: any = await addTracksToPlaylist(a.dbPath, "same-uuid", { listId: 1, trackIds: [6], at: "end" }, { backupDir: a.backupDir });
+    const rb: any = await addTracksToPlaylist(b.dbPath, "same-uuid", { listId: 1, trackIds: [6], at: "end" }, { backupDir: b.backupDir });
+    expect(ra.undo[0].arguments.library).not.toBe(rb.undo[0].arguments.library);
+    expect(ra.undo[0].arguments.library).toBe(a.dbPath);
+    expect(rb.undo[0].arguments.library).toBe(b.dbPath);
   });
 });
