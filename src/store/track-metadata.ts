@@ -90,7 +90,7 @@ export async function updateTrackMetadata(
   mdbPath: string,
   uuid: string,
   input: { updates: TrackUpdate[] },
-  opts: { backupDir: string },
+  opts: { backupDir: string; beforeLock?: () => void },
 ): Promise<(TrackMetadataResult & { library: LibraryRef; backup_path?: string }) | EngineError> {
   const { updates } = input;
   const ids = updates.map((u) => u.id);

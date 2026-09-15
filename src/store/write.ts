@@ -546,7 +546,15 @@ export async function withWriteTransaction<T extends object>(
   mdbPath: string,
   uuid: string,
   subject: string,
-  opts: { backupDir: string },
+  opts: {
+    backupDir: string;
+    /**
+     * Test seam only. Runs after the snapshot and before the write connection
+     * opens -- the window in which Engine DJ can still change a row this call
+     * already pre-checked. No production caller passes it.
+     */
+    beforeLock?: () => void;
+  },
   body: (db: DatabaseSync) => T | EngineError,
 ): Promise<(T & { library: LibraryRef; backup_path: string }) | EngineError> {
   // Snapshot here, before the write connection is even opened, not after
@@ -569,6 +577,7 @@ export async function withWriteTransaction<T extends object>(
   // still a pre-commit failure, so the discriminator applies here too.
   if (typeof snapshot !== "string") return { ...snapshot, detail: NOT_COMMITTED };
   const backupPath = snapshot;
+  opts.beforeLock?.();
 
   let db: DatabaseSync | undefined;
   let open = false;

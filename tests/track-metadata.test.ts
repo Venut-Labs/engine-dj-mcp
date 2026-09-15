@@ -177,3 +177,80 @@ describe("updateTrackMetadata", () => {
     expect(existsSync(backupDir)).toBe(false);
   });
 });
+
+describe("updateTrackMetadata re-reads under the lock", () => {
+  // Between the read-only pre-check and BEGIN IMMEDIATE the whole database is
+  // copied for the session snapshot -- long enough for Engine DJ to change a
+  // row. beforeLock plays Engine: it writes on its own connection inside that
+  // window.
+  const engineWrites = (dbPath: string, sql: string, ...params: (string | number)[]) => () => {
+    const other = new DatabaseSync(dbPath);
+    other.prepare(sql).run(...params);
+    other.close();
+  };
+
+  it("counts a row that reached its target meanwhile as unchanged", async () => {
+    const { dbPath, backupDir } = setup();
+    const r = ok(
+      await updateTrackMetadata(dbPath, UUID, { updates: [{ id: 1, genre: "House" }] }, {
+        backupDir,
+        beforeLock: engineWrites(dbPath, "UPDATE Track SET genre = 'House' WHERE id = 1"),
+      }),
+    );
+    expect(r).toMatchObject({ updated: 0, unchanged: 1, changed: [], undo: [] });
+    expect(typeof r.backup_path).toBe("string");
+  });
+
+  it("refuses when an expect stopped matching meanwhile, keeping the other writer's value", async () => {
+    const { dbPath, backupDir } = setup();
+    const e = await updateTrackMetadata(
+      dbPath, UUID,
+      { updates: [{ id: 1, genre: "House", expect: { genre: "Techno" } }] },
+      { backupDir, beforeLock: engineWrites(dbPath, "UPDATE Track SET genre = 'Deep House' WHERE id = 1") },
+    );
+    expect((e as any).error).toBe("stale_value");
+    expect(read(dbPath, 1).genre).toBe("Deep House");
+  });
+
+  it("builds the undo from what was there under the lock, not from the pre-check", async () => {
+    // Otherwise the undo would put back "Techno" and erase the DJ's edit.
+    const { dbPath, backupDir } = setup();
+    const r = ok(
+      await updateTrackMetadata(dbPath, UUID, { updates: [{ id: 1, genre: "House" }] }, {
+        backupDir,
+        beforeLock: engineWrites(dbPath, "UPDATE Track SET genre = 'Deep House' WHERE id = 1"),
+      }),
+    );
+    expect(r.undo[0].arguments.updates).toEqual([{ id: 1, genre: "Deep House", expect: { genre: "House" } }]);
+  });
+
+  it("refuses a track whose origin emptied meanwhile", async () => {
+    const { dbPath, backupDir } = setup();
+    const e = await updateTrackMetadata(dbPath, UUID, { updates: [{ id: 2, genre: "House" }] }, {
+      backupDir,
+      beforeLock: () => setEmptyOrigin(dbPath, 2, "zero-id"),
+    });
+    expect((e as any).error).toBe("track_not_editable");
+    expect(read(dbPath, 2).ot).toBe(0);
+  });
+});
+
+describe("updateTrackMetadata leaves alone what it was not asked to change", () => {
+  it("updates only the named field, not the other four tag columns", async () => {
+    const { dbPath, backupDir } = setup();
+    ok(await updateTrackMetadata(dbPath, UUID, { updates: [{ id: 3, genre: "Acid" }] }, { backupDir }));
+    expect(read(dbPath, 3)).toMatchObject({ genre: "Acid", comment: "old note", label: null, year: 0, rating: 20 });
+  });
+
+  it("does not touch a row whose only named field is already at its target", async () => {
+    const { dbPath, backupDir } = setup();
+    const r = ok(
+      await updateTrackMetadata(dbPath, UUID, {
+        updates: [{ id: 1, genre: "House" }, { id: 4, genre: "Minimal" }],
+      }, { backupDir }),
+    );
+    expect(r).toMatchObject({ updated: 1, unchanged: 1, changed: [{ id: 1, fields: ["genre"] }] });
+    expect(read(dbPath, 4).lastEditTime).toBe(1);
+    expect(read(dbPath, 1).lastEditTime).toBeGreaterThan(1);
+  });
+});
