@@ -39,6 +39,7 @@ import {
   ReorderPlaylistInput,
   runReorderPlaylist,
 } from "./tools/write-playlist.js";
+import { UpdateTrackMetadataInput, runUpdateTrackMetadata } from "./tools/write-track-metadata.js";
 import { err, isEngineError, libraryNeedsRecovery, type EngineError } from "./errors.js";
 
 const RO = { readOnlyHint: true, destructiveHint: false, idempotentHint: true } as const;
@@ -57,6 +58,12 @@ const RW = { readOnlyHint: false, destructiveHint: false, idempotentHint: false 
  * additive told a client it need not ask before calling.
  */
 const RW_DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: false } as const;
+/**
+ * A write that overwrites or clears what is there -- so destructive -- but
+ * that a repeat of the same call leaves alone: a track already holding the
+ * requested values is not written again. update_track_metadata.
+ */
+const RW_OVERWRITE = { readOnlyHint: false, destructiveHint: true, idempotentHint: true } as const;
 
 /**
  * name/version reported to every client on initialize. Read from
@@ -118,6 +125,20 @@ const WRITE_LIBRARY_NOTE =
   "counts are -- the count never said which disk should change. Ask the user which one, then " +
   "retry with `library` set; do not pick for them, since one of them may be the drive they " +
   "perform from.";
+
+/**
+ * Not UNDO_SCOPE_NOTE: that one says Engine copies *playlist* changes between
+ * libraries, which was measured. For track tags, a fresh Engine launch was
+ * measured NOT copying a tag edit made on the USB library to the computer's
+ * library (spec §3.9); the other direction has not been measured for tags,
+ * so repeating the playlist claim here would state a guess as fact.
+ */
+const TRACK_UNDO_NOTE =
+  "`undo` reverses this edit in ONE library: the one the result's `library` field names, and each " +
+  "undo step carries it. It restores the values of the fields that changed; it does not restore " +
+  "lastEditTime, which Engine DJ's own trigger sets on every edit. Keep the undo from the first " +
+  "response: repeating a call that already succeeded finds nothing to change and returns an empty " +
+  "undo. For work spread over several calls, replay their undos in REVERSE order. ";
 
 function reply(value: unknown) {
   return {
@@ -356,12 +377,24 @@ export async function createServer(
    * alone: they run far more often and a stale pick between two copies is not
    * worth a probe apiece.
    */
-  const acquireForWrite = async (requested?: string): Promise<LibraryState | EngineError> => {
+  /**
+   * The library a write may land in, without touching its search index. A
+   * tool that addresses tracks by id needs no index, and building one right
+   * before a write only makes it stale the moment the write commits.
+   * acquireForWrite adds the index for the tools that resolve playlists.
+   */
+  const selectForWrite = (requested?: string): LibraryInfo | EngineError => {
     if (requested === undefined) {
       rescanLibraries();
       const choices = writeNeedsLibrary(knownList());
       if (choices.length > 0) return ambiguousLibrary(choices);
     }
+    return selectLibrary(requested);
+  };
+
+  const acquireForWrite = async (requested?: string): Promise<LibraryState | EngineError> => {
+    const lib = selectForWrite(requested);
+    if (isEngineError(lib)) return lib;
     return acquire(requested);
   };
 
@@ -803,6 +836,48 @@ export async function createServer(
         );
       },
     );
+
+    server.registerTool(
+      "update_track_metadata",
+      {
+        title: "Edit track tags",
+        description:
+          "Change genre, comment, label, year or rating on tracks in this Engine DJ library -- the " +
+          "values Engine shows in its columns. This WRITES to the library's database, not to the audio " +
+          "files' tags. Each entry names a track by id (from search_tracks or get_tracks) and only the " +
+          'fields to change; "" clears a text field; rating_stars is 0-5 (Engine stores 0-100). Up to ' +
+          "200 tracks per call, all or nothing. A track already holding the requested values is left " +
+          "alone and counted in `unchanged`; `changed` lists which fields changed on which tracks. " +
+          "Each refusal names every offending track of its kind -- invalid_argument, unknown_track, " +
+          "track_not_editable (the track cannot be edited without harm -- say so to the user and leave it; " +
+          "do not search for it again), stale_value -- and kinds are reported one at a time, in that order: " +
+          "fix the one reported first and retry to see the next, if any -- except stale_value, which is not " +
+          "something to just retry: see below. stale_value means the track " +
+          "changed after the values in `expect` were read; tell the user which tracks and fields changed. " +
+          "Do NOT rebuild `expect` from a fresh read to force the write -- that would silently overwrite " +
+          "an edit the DJ made since, without their consent. " +
+          "Search results may keep showing the old values while Engine DJ holds the library open; " +
+          "refresh_index cannot help until Engine lets go. " +
+          TRACK_UNDO_NOTE +
+          LIBRARY_SELECTION_NOTE + WRITE_LIBRARY_NOTE,
+        inputSchema: { ...UpdateTrackMetadataInput.shape, library: LibraryArg },
+        annotations: RW_OVERWRITE,
+      },
+      async (args) => {
+        const lib = selectForWrite(args.library);
+        if (isEngineError(lib)) return reply(lib);
+        // ensureFresh is what refuses an unsupported schema for every other
+        // tool; this path skips it, so it must refuse here.
+        if (!lib.supported) {
+          return reply(
+            err("unsupported_schema", `Schema ${lib.schema.join(".")} is not supported`, {
+              detail: "Supported versions are 3.0.0, 3.0.1 and 3.0.2",
+            }),
+          );
+        }
+        return reply(await runUpdateTrackMetadata(lib.path, lib.uuid, args as any, backupDirFor()));
+      },
+    );
   }
 
   /**
@@ -892,6 +967,13 @@ other.
   unchanged. To compare names regardless of case in any script, use
   \`fold(text)\` -- one Unicode normalization form, lower-cased by Unicode
   rules. It runs per row, like every function here.
+- \`Track\` carries two Engine triggers. \`trigger_after_update_only_Track_timestamp\`
+  sets \`lastEditTime\` (epoch seconds) whenever genre, comment, label, year,
+  rating or a dozen other columns are updated -- even to the same value.
+  \`trigger_after_update_Track_fix_origin\` fires on ANY update and rewrites an
+  empty \`(originDatabaseUuid, originTrackId)\` to this library's uuid and the
+  track's own id; in SQLite \`'' = 0\` is false, so a TEXT '' originTrackId does
+  not count as empty.
 - A track's natural key across drives is \`(originDatabaseUuid, originTrackId)\`.
 - \`PerformanceData\`'s blob columns are binary and cannot be read with SQL.
   Engine writes \`quickCues\`, \`loops\`, \`beatData\` and

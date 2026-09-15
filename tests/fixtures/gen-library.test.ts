@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { makeLibrary, addPlaylists, damageChain, renumberEntries } from "./gen-library.js";
+import { makeLibrary, addPlaylists, damageChain, renumberEntries, stampEditTimes, setEmptyOrigin } from "./gen-library.js";
 
 let dir: string;
 beforeAll(() => { dir = mkdtempSync(join(tmpdir(), "edj-")); });
@@ -255,6 +255,74 @@ describe("renumberEntries", () => {
     ]);
     damageChain(dbPath, 1, "two-heads");
     expect(() => renumberEntries(dbPath, 1)).toThrow(/head/);
+    rmSync(d, { recursive: true, force: true });
+  });
+});
+
+describe("Engine's Track triggers in the fixture", () => {
+  const read = (p: string, id: number) => {
+    const db = new DatabaseSync(`file:${p}?mode=ro`, { readOnly: true });
+    const r = db
+      .prepare("SELECT genre, lastEditTime, originDatabaseUuid AS ou, originTrackId AS ot, typeof(originTrackId) AS ott FROM Track WHERE id = ?")
+      .get(id) as { genre: string; lastEditTime: number; ou: string | null; ot: number | string | null; ott: string };
+    db.close();
+    return r;
+  };
+
+  it("restamps lastEditTime when a tagged column changes, and not when lastEditTime itself does", () => {
+    // Measured on a real library: trigger_after_update_only_Track_timestamp
+    // lists genre, comment, label, year and rating among its OF columns and
+    // does not list lastEditTime -- so the sentinel write below cannot fire it.
+    const d = mkdtempSync(join(tmpdir(), "trg-"));
+    const p = makeLibrary(d, { tracks: 3 });
+    stampEditTimes(p);
+    expect(read(p, 1).lastEditTime).toBe(1);
+
+    const w = new DatabaseSync(p);
+    w.prepare("UPDATE Track SET genre = 'Techno' WHERE id = 1").run();
+    w.close();
+    expect(read(p, 1).lastEditTime).toBeGreaterThan(1);
+    expect(read(p, 2).lastEditTime).toBe(1);
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  it("rewrites an empty origin on any update, which is the harm the edit tool must not cause", () => {
+    const d = mkdtempSync(join(tmpdir(), "trg-"));
+    const p = makeLibrary(d, { tracks: 3, uuid: "fx-uuid" });
+    setEmptyOrigin(p, 2, "empty-uuid");
+    expect(read(p, 2).ou).toBe("");
+
+    const w = new DatabaseSync(p);
+    w.prepare("UPDATE Track SET genre = 'House' WHERE id = 2").run();
+    w.close();
+    expect(read(p, 2).ou).toBe("fx-uuid");
+    expect(read(p, 2).ot).toBe(2);
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  it("leaves a TEXT '' originTrackId alone, because in SQLite '' = 0 is false", () => {
+    const d = mkdtempSync(join(tmpdir(), "trg-"));
+    const p = makeLibrary(d, { tracks: 3, uuid: "fx-uuid" });
+    setEmptyOrigin(p, 3, "text-empty-id");
+    expect(read(p, 3).ott).toBe("text");
+
+    const w = new DatabaseSync(p);
+    w.prepare("UPDATE Track SET genre = 'House' WHERE id = 3").run();
+    w.close();
+    expect(read(p, 3).ott).toBe("text");
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  it("keeps every empty-origin shape in place, even across stampEditTimes", () => {
+    const d = mkdtempSync(join(tmpdir(), "trg-"));
+    const p = makeLibrary(d, { tracks: 4 });
+    setEmptyOrigin(p, 1, "null-id");
+    setEmptyOrigin(p, 2, "zero-id");
+    setEmptyOrigin(p, 3, "empty-uuid");
+    stampEditTimes(p);
+    expect(read(p, 1).ot).toBeNull();
+    expect(read(p, 2).ot).toBe(0);
+    expect(read(p, 3).ou).toBe("");
     rmSync(d, { recursive: true, force: true });
   });
 });

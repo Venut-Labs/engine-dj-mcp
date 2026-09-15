@@ -1,7 +1,8 @@
 // src/store/write.ts
 //
-// The only code in this project that writes to a user's Engine library, and
-// it runs only when the server was started with --allow-writes.
+// Writes to a user's Engine library, together with src/store/track-metadata.ts
+// (which reuses withWriteTransaction, mapWriteError and rollback from here).
+// Both run only when the server was started with --allow-writes.
 //
 // The read path is deliberately not reused. Queries run in a forked child
 // whose connection is opened readOnly: true, and that guarantee is the
@@ -97,7 +98,8 @@ export interface OriginRef {
  *
  * These two strings are part of the tool's contract; see src/errors.ts.
  */
-const NOT_COMMITTED = "not_committed";
+/** Exported for src/store/track-metadata*.ts; the string is part of the tool contract. */
+export const NOT_COMMITTED = "not_committed";
 const COMMITTED_UNVERIFIED = "committed_unverified";
 
 /**
@@ -360,7 +362,8 @@ function gateChain(db: DatabaseSync, listId: number): ChainCheck {
  * db.close() in the finally block ends any transaction still open, and SQLite
  * discards an uncommitted one on close.
  */
-function rollback(db: DatabaseSync): void {
+/** Exported for src/store/track-metadata.ts. */
+export function rollback(db: DatabaseSync): void {
   try {
     db.exec("ROLLBACK");
   } catch {
@@ -393,7 +396,8 @@ export function sameOrder(a: OriginRef[], b: OriginRef[]): boolean {
  * `Writing "X" failed`, which reads as a half-write even when the failure was
  * "file is not a database" and not one byte was attempted.
  */
-function mapWriteError(e: unknown, subject: string, mdbPath: string): EngineError {
+/** Exported for src/store/track-metadata.ts. */
+export function mapWriteError(e: unknown, subject: string, mdbPath: string): EngineError {
   const msg = (e as Error).message ?? String(e);
   const isUniqueViolation = /UNIQUE constraint failed/i.test(msg);
   // The constraint's *name* never appears in the message SQLite raises --
@@ -538,11 +542,20 @@ function classifyWriteFailure(
  * that check for callers, so reusing it here means a body never has to wrap
  * its result to disambiguate the two.
  */
-async function withWriteTransaction<T extends object>(
+/** Exported for src/store/track-metadata.ts. */
+export async function withWriteTransaction<T extends object>(
   mdbPath: string,
   uuid: string,
   subject: string,
-  opts: { backupDir: string },
+  opts: {
+    backupDir: string;
+    /**
+     * Test seam only. Runs after the snapshot and before the write connection
+     * opens -- the window in which Engine DJ can still change a row this call
+     * already pre-checked. No production caller passes it.
+     */
+    beforeLock?: () => void;
+  },
   body: (db: DatabaseSync) => T | EngineError,
 ): Promise<(T & { library: LibraryRef; backup_path: string }) | EngineError> {
   // Snapshot here, before the write connection is even opened, not after
@@ -565,6 +578,7 @@ async function withWriteTransaction<T extends object>(
   // still a pre-commit failure, so the discriminator applies here too.
   if (typeof snapshot !== "string") return { ...snapshot, detail: NOT_COMMITTED };
   const backupPath = snapshot;
+  opts.beforeLock?.();
 
   let db: DatabaseSync | undefined;
   let open = false;

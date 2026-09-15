@@ -43,6 +43,27 @@ const CUE_SET = cueFrame(
 );
 const NO_CUE_SET = cueFrame(Array.from({ length: CUE_SLOTS }, () => emptyCue));
 
+// Engine's two triggers on Track, copied verbatim from a real 3.0.2 library.
+// Kept as constants because setEmptyOrigin and stampEditTimes have to drop
+// and recreate the second one.
+const TRACK_TIMESTAMP_TRIGGER = `CREATE TRIGGER trigger_after_update_only_Track_timestamp
+  AFTER UPDATE OF length, bpm, year, filename, bitrate, bpmAnalyzed, albumArtId,
+  title, artist, album, genre, comment, label, composer, remixer, key, rating,
+  albumArt, fileType, isAnalyzed, isBeatgridLocked, explicitLyrics
+  ON Track FOR EACH ROW
+  BEGIN
+    UPDATE Track SET lastEditTime = strftime('%s') WHERE ROWID = NEW.ROWID;
+  END`;
+
+const TRACK_FIX_ORIGIN_TRIGGER = `CREATE TRIGGER trigger_after_update_Track_fix_origin
+  AFTER UPDATE ON Track
+  WHEN IFNULL(NEW.originTrackId, 0) = 0 OR IFNULL(NEW.originDatabaseUuid, '') = ''
+  BEGIN
+    UPDATE Track SET originTrackId = NEW.id,
+      originDatabaseUuid = (SELECT uuid FROM Information)
+    WHERE track.id = NEW.id;
+  END`;
+
 /** Deterministic PRNG so fixtures are reproducible across runs. */
 function rng(seed: number) {
   let s = seed;
@@ -126,6 +147,12 @@ export function makeLibrary(
       UPDATE PlaylistEntity SET nextEntityId = OLD.nextEntityId
       WHERE nextEntityId = OLD.id AND listId = OLD.listId;
     END`);
+  // Engine's Track triggers. The first is how lastEditTime moves; the second
+  // rewrites an empty origin on ANY update, which is what the track-metadata
+  // edit refuses to trigger (spec §3.3). Both fire only on UPDATE, so the
+  // inserts below are unaffected.
+  db.exec(TRACK_TIMESTAMP_TRIGGER);
+  db.exec(TRACK_FIX_ORIGIN_TRIGGER);
   // Engine's own PlaylistPath view, copied verbatim from a real 3.0.2
   // library. Nothing in src/ reads it — it is here precisely so a test can
   // demonstrate *why* nothing reads it: its `position` column is the obvious
@@ -408,4 +435,43 @@ export function renumberEntries(dbPath: string, listId: number): void {
   } finally {
     db.close();
   }
+}
+
+/**
+ * Set every Track.lastEditTime to a sentinel. lastEditTime is not among the
+ * timestamp trigger's OF columns, so this does not restamp; the fix-origin
+ * trigger has no OF list and would fire, so it is dropped for the duration.
+ * Tests compare against the sentinel because the real stamp has one-second
+ * precision, and preparing a row with UPDATE stamps it with "now" too.
+ */
+export function stampEditTimes(dbPath: string, value = 1): void {
+  const db = new DatabaseSync(dbPath);
+  db.exec("DROP TRIGGER trigger_after_update_Track_fix_origin");
+  db.prepare("UPDATE Track SET lastEditTime = ?").run(value);
+  db.exec(TRACK_FIX_ORIGIN_TRIGGER);
+  db.close();
+}
+
+/**
+ * Give one track an empty origin that stays empty. With the fix-origin
+ * trigger in place the write would be undone instantly, so the trigger is
+ * dropped around it. "text-empty-id" stores TEXT '' in originTrackId, which
+ * the trigger's WHEN does NOT treat as empty ('' = 0 is false in SQLite).
+ */
+export function setEmptyOrigin(
+  dbPath: string,
+  trackId: number,
+  shape: "null-id" | "zero-id" | "empty-uuid" | "text-empty-id",
+): void {
+  const db = new DatabaseSync(dbPath);
+  db.exec("DROP TRIGGER trigger_after_update_Track_fix_origin");
+  const sql = {
+    "null-id": "UPDATE Track SET originTrackId = NULL WHERE id = ?",
+    "zero-id": "UPDATE Track SET originTrackId = 0 WHERE id = ?",
+    "empty-uuid": "UPDATE Track SET originDatabaseUuid = '' WHERE id = ?",
+    "text-empty-id": "UPDATE Track SET originTrackId = '' WHERE id = ?",
+  }[shape];
+  db.prepare(sql).run(trackId);
+  db.exec(TRACK_FIX_ORIGIN_TRIGGER);
+  db.close();
 }
