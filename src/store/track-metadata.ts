@@ -146,7 +146,11 @@ export async function updateTrackMetadata(
     for (const w of plan.writes) {
       // Column names come from the FieldName union, never from caller text.
       const assignments = w.fields.map((f) => `${f} = ?`).join(", ");
-      db.prepare(`UPDATE Track SET ${assignments} WHERE id = ?`).run(...w.fields.map((f) => w.set[f] ?? null), w.id);
+      // Set as Engine sets it on its own tag edits (spec §3.9, measured).
+      db.prepare(`UPDATE Track SET ${assignments}, isMetadataOfPackedTrackChanged = 1 WHERE id = ?`).run(
+        ...w.fields.map((f) => w.set[f] ?? null),
+        w.id,
+      );
     }
 
     const after = readRows(db, plan.writes.map((w) => w.id));

@@ -395,8 +395,8 @@ it contains when a genre is renamed, though none of its own rows were touched.
 playlist edit does (see [An undo covers one library](#an-undo-covers-one-library)):
 measured once, a tag edit made on the USB library was not copied to the
 computer's library on a fresh Engine DJ launch. The other direction has not
-been measured for tags, and whether Engine's explicit sync carries these
-edits has not been measured either.
+been measured for tags. Edited tracks are marked for sync the way Engine marks
+its own tag edits, so an explicit sync carries them; this was measured on 2026-09-15.
 
 ### Refusals every write tool shares
 
