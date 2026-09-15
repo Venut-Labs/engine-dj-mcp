@@ -97,7 +97,8 @@ export interface OriginRef {
  *
  * These two strings are part of the tool's contract; see src/errors.ts.
  */
-const NOT_COMMITTED = "not_committed";
+/** Exported for src/store/track-metadata*.ts; the string is part of the tool contract. */
+export const NOT_COMMITTED = "not_committed";
 const COMMITTED_UNVERIFIED = "committed_unverified";
 
 /**

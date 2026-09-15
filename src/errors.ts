@@ -39,6 +39,14 @@ export const ERROR_CODES = [
   // specific: ask which drive, then retry with `library` set. Only writes
   // raise it; see library-select.ts for why reads still choose.
   "ambiguous_library",
+  // update_track_metadata (spec §7.2). stale_value: an `expect` no longer
+  // matches what is in the library. track_not_editable: this track, or one
+  // field of it, cannot be edited without harm -- an empty origin the Track
+  // trigger would rewrite, or a stored value this tool could not restore.
+  // Not unknown_track: the track exists, and telling a model it does not sends
+  // it back to search for a track it will find again.
+  "stale_value",
+  "track_not_editable",
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];
@@ -67,6 +75,12 @@ export interface EngineError {
    * taken.
    */
   backup_path?: string;
+  /**
+   * Set only on stale_value: every `expect` that no longer matched, capped at
+   * 20 entries (the message carries the total). Structured so a caller can
+   * re-read exactly those tracks instead of parsing prose.
+   */
+  mismatches?: { id: number; field: string; expected: string | number | null; actual: string | number | null }[];
 }
 
 export function err(
