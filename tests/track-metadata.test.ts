@@ -269,3 +269,25 @@ describe("updateTrackMetadata leaves alone what it was not asked to change", () 
     expect(read(dbPath, 1).lastEditTime).toBeGreaterThan(1);
   });
 });
+
+describe("the packed-track flag", () => {
+  const flag = (dbPath: string, id: number) => {
+    const db = new DatabaseSync(`file:${dbPath}?mode=ro`, { readOnly: true });
+    const v = (db.prepare("SELECT isMetadataOfPackedTrackChanged AS f FROM Track WHERE id = ?").get(id) as any).f;
+    db.close();
+    return v;
+  };
+
+  it("is set on every track this call writes, as Engine sets it on its own tag edits", async () => {
+    // Measured on the date recorded in spec §3.9: a comment edit in Engine DJ on the computer's collection
+    // set isMetadataOfPackedTrackChanged = 1 (spec §3.9). Without it an
+    // explicit sync would not know to carry this edit to the drive.
+    const { dbPath, backupDir } = setup();
+    const w = new DatabaseSync(dbPath);
+    w.exec("UPDATE Track SET isMetadataOfPackedTrackChanged = 0");
+    w.close();
+    ok(await updateTrackMetadata(dbPath, UUID, { updates: [{ id: 1, genre: "House" }, { id: 4, genre: "Minimal" }] }, { backupDir }));
+    expect(flag(dbPath, 1)).toBe(1);
+    expect(flag(dbPath, 4), "unchanged track, not written").toBe(0);
+  });
+});
