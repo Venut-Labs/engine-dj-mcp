@@ -128,3 +128,169 @@ export function validateUpdates(updates: TrackUpdate[]): EngineError | undefined
     { detail: NOT_COMMITTED },
   );
 }
+
+export type StoredValue = string | number | null;
+
+/** One track as read from the library, already classified (see src/store/track-metadata.ts). */
+export interface CurrentRow {
+  id: number;
+  genre: string | null;
+  comment: string | null;
+  label: string | null;
+  year: number | null;
+  rating: number | null;
+  /** Columns whose stored value this tool could not put back (spec §5.3). */
+  inexpressible: FieldName[];
+  /** The fix-origin trigger's own WHEN, evaluated by SQLite (spec §3.3). */
+  originEmpty: boolean;
+}
+
+export interface RowWrite {
+  id: number;
+  set: Partial<Record<FieldName, StoredValue>>;
+  fields: FieldName[];
+}
+
+export interface Plan {
+  writes: RowWrite[];
+  unchanged: number[];
+  undo: TrackUpdate[];
+}
+
+type Mismatch = NonNullable<EngineError["mismatches"]>[number];
+
+/** The value a field will hold once written. `""` is NULL; stars are Engine's 0-100. */
+export function targetOf(u: TrackUpdate, f: FieldName): StoredValue {
+  if (f === "rating") return u.rating_raw !== undefined ? u.rating_raw : u.rating_stars! * 20;
+  if (f === "year") return u.year!;
+  const v = u[f]!;
+  return v === "" ? null : v;
+}
+
+/**
+ * Spec §5.1: NULL and '' are one empty for text, NULL and 0 for numbers.
+ * Otherwise exact -- no Unicode folding, because hiding a real difference is
+ * worse than reporting a confusing one (describeValue spells those out).
+ * Done in JS: in SQL, NULL = '' is neither true nor false.
+ */
+export function sameStored(f: FieldName, a: StoredValue, b: StoredValue): boolean {
+  if (f === "year" || f === "rating") return (a ?? 0) === (b ?? 0);
+  return (a ?? "") === (b ?? "");
+}
+
+const codePoints = (s: string) =>
+  [...s].map((c) => "U+" + c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")).join(" ");
+
+function describeMismatch(m: Mismatch): string {
+  const show = (v: StoredValue) => (v === null ? "empty" : JSON.stringify(v));
+  let line = `track ${m.id} ${m.field}: expected ${show(m.expected)}, found ${show(m.actual)}`;
+  if (
+    typeof m.expected === "string" && typeof m.actual === "string" &&
+    m.expected !== m.actual && m.expected.normalize("NFC") === m.actual.normalize("NFC")
+  ) {
+    line += ` (same text in a different Unicode form: expected ${codePoints(m.expected)}, found ${codePoints(m.actual)})`;
+  }
+  return line;
+}
+
+/**
+ * Decide, for rows already read, what each update writes. Order matters and
+ * follows spec §5.2 and §6: a row already at its target is unchanged before
+ * anything else is asked of it -- expect included, since expect guards writes
+ * and this row is not written. Refusals are collected across all rows and
+ * reported by class: unknown ids first, then tracks that cannot be edited,
+ * then stale expectations.
+ */
+export function planUpdates(updates: TrackUpdate[], rows: ReadonlyMap<number, CurrentRow>): Plan | EngineError {
+  const plan: Plan = { writes: [], unchanged: [], undo: [] };
+  const unknown: number[] = [];
+  const notEditable: string[] = [];
+  const mismatches: Mismatch[] = [];
+
+  for (const u of updates) {
+    const current = rows.get(u.id);
+    if (!current) {
+      unknown.push(u.id);
+      continue;
+    }
+
+    // An inexpressible field is read as null, so comparing it would call a stored
+    // 999 "already 0 stars". It always counts as different, which routes it to
+    // the track_not_editable refusal below instead of a false "unchanged".
+    const differs = writtenFields(u).filter(
+      (f) => current.inexpressible.includes(f) || !sameStored(f, current[f], targetOf(u, f)),
+    );
+    if (differs.length === 0) {
+      plan.unchanged.push(u.id);
+      continue;
+    }
+
+    if (current.originEmpty) {
+      notEditable.push(
+        `track ${u.id}: its origin is empty, and Engine's own trigger rewrites an empty origin on any ` +
+          `update, which would detach it from playlist entries on other drives; edit it in Engine DJ instead`,
+      );
+    }
+    for (const f of differs) {
+      if (current.inexpressible.includes(f)) {
+        notEditable.push(`track ${u.id}: ${f} holds a stored value this tool could not put back`);
+      }
+    }
+
+    const expect = u.expect ?? {};
+    for (const key of Object.keys(expect) as (keyof TrackExpect)[]) {
+      const expected = expect[key];
+      if (expected === undefined) continue;
+      const field: FieldName = key === "rating_raw" ? "rating" : key;
+      const want: StoredValue = field === "year" || field === "rating" ? (expected as number) : (expected as string) || null;
+      if (!sameStored(field, current[field], want)) {
+        mismatches.push({ id: u.id, field: key, expected, actual: current[field] });
+      }
+    }
+
+    const write: RowWrite = { id: u.id, set: {}, fields: differs };
+    const back: TrackUpdate = { id: u.id, expect: {} };
+    for (const f of differs) {
+      const now = targetOf(u, f);
+      write.set[f] = now;
+      const was = current[f];
+      if (f === "rating") {
+        back.rating_raw = (was as number | null) ?? 0;
+        back.expect!.rating_raw = (now as number | null) ?? 0;
+      } else if (f === "year") {
+        back.year = (was as number | null) ?? 0;
+        back.expect!.year = (now as number | null) ?? 0;
+      } else {
+        back[f] = (was as string | null) ?? "";
+        back.expect![f] = (now as string | null) ?? "";
+      }
+    }
+    plan.writes.push(write);
+    plan.undo.push(back);
+  }
+
+  if (unknown.length > 0) {
+    return err(
+      "unknown_track",
+      `${unknown.length} track id${unknown.length > 1 ? "s are" : " is"} not in this library, nothing was written: ` +
+        listProblems(unknown.map(String)),
+      { detail: NOT_COMMITTED },
+    );
+  }
+  if (notEditable.length > 0) {
+    return err(
+      "track_not_editable",
+      `${notEditable.length} edit${notEditable.length > 1 ? "s" : ""} cannot be made, nothing was written: ${listProblems(notEditable)}`,
+      { detail: NOT_COMMITTED },
+    );
+  }
+  if (mismatches.length > 0) {
+    return err(
+      "stale_value",
+      `${mismatches.length} expected value${mismatches.length > 1 ? "s" : ""} no longer match, nothing was written; ` +
+        `re-read those tracks and retry: ${listProblems(mismatches.map(describeMismatch))}`,
+      { detail: NOT_COMMITTED, mismatches: mismatches.slice(0, 20) },
+    );
+  }
+  return plan;
+}

@@ -1,7 +1,7 @@
 // tests/track-metadata-plan.test.ts
 import { describe, it, expect } from "vitest";
 import { err, isEngineError } from "../src/errors.js";
-import { validateUpdates, writtenFields, listProblems, type TrackUpdate } from "../src/store/track-metadata-plan.js";
+import { validateUpdates, writtenFields, listProblems, planUpdates, sameStored, type TrackUpdate, type CurrentRow, type Plan } from "../src/store/track-metadata-plan.js";
 
 const refused = (updates: TrackUpdate[]) => {
   const e = validateUpdates(updates);
@@ -101,5 +101,147 @@ describe("listProblems", () => {
     expect(text).toContain("p19");
     expect(text).not.toContain("p20");
     expect(text).toMatch(/and 5 more$/);
+  });
+});
+
+const row = (over: Partial<CurrentRow> & { id: number }): CurrentRow => ({
+  genre: "Techno", comment: null, label: null, year: 2020, rating: 0,
+  inexpressible: [], originEmpty: false, ...over,
+});
+const rowsOf = (...rs: CurrentRow[]) => new Map(rs.map((r) => [r.id, r]));
+const plan = (updates: TrackUpdate[], ...rs: CurrentRow[]) => {
+  const p = planUpdates(updates, rowsOf(...rs));
+  if (isEngineError(p)) throw new Error(`unexpected refusal: ${p.error} ${p.message}`);
+  return p as Plan;
+};
+const refusal = (updates: TrackUpdate[], ...rs: CurrentRow[]) => {
+  const p = planUpdates(updates, rowsOf(...rs));
+  expect(isEngineError(p), "expected a refusal").toBe(true);
+  expect((p as any).detail).toBe("not_committed");
+  return p as any;
+};
+
+describe("sameStored", () => {
+  it("treats NULL and '' as one empty for text, NULL and 0 for numbers, and nothing else", () => {
+    expect(sameStored("comment", null, "")).toBe(true);
+    expect(sameStored("year", null, 0)).toBe(true);
+    expect(sameStored("rating", null, 0)).toBe(true);
+    // Exact otherwise: no Unicode folding, or a real difference would be hidden.
+    expect(sameStored("genre", "Électronique".normalize("NFC"), "Électronique".normalize("NFD"))).toBe(false);
+  });
+});
+
+describe("planUpdates", () => {
+  it("writes only the fields that differ", () => {
+    const p = plan([{ id: 1, genre: "House", year: 2020 }], row({ id: 1 }));
+    expect(p.writes).toEqual([{ id: 1, set: { genre: "House" }, fields: ["genre"] }]);
+    expect(p.unchanged).toEqual([]);
+  });
+
+  it("leaves a track already at its target alone, whatever expect says", () => {
+    // Spec §5.2: expect guards writes, and this row is not written. So a
+    // repeated call, or an undo someone already applied by hand, is a no-op.
+    const p = plan([{ id: 1, genre: "Techno", expect: { genre: "Something else" } }], row({ id: 1 }));
+    expect(p.writes).toEqual([]);
+    expect(p.unchanged).toEqual([1]);
+    expect(p.undo).toEqual([]);
+  });
+
+  it("writes an empty string as NULL, and counts '' as already empty", () => {
+    expect(plan([{ id: 1, genre: "" }], row({ id: 1 })).writes[0]!.set).toEqual({ genre: null });
+    expect(plan([{ id: 1, comment: "" }], row({ id: 1, comment: null })).unchanged).toEqual([1]);
+  });
+
+  it("counts year 0 against NULL as unchanged", () => {
+    expect(plan([{ id: 1, year: 0 }], row({ id: 1, year: null })).unchanged).toEqual([1]);
+  });
+
+  it("stores stars in Engine's units", () => {
+    expect(plan([{ id: 1, rating_stars: 4 }], row({ id: 1 })).writes[0]!.set).toEqual({ rating: 80 });
+  });
+
+  it("builds an undo from the previous values, naming only the fields that changed", () => {
+    const p = plan(
+      [{ id: 1, genre: "House", comment: "sick", rating_stars: 4, year: 2020 }],
+      row({ id: 1, genre: "Techno", comment: null, rating: 55, year: 2020 }),
+    );
+    expect(p.undo).toEqual([
+      {
+        id: 1,
+        genre: "Techno",
+        comment: "",
+        rating_raw: 55,
+        expect: { genre: "House", comment: "sick", rating_raw: 80 },
+      },
+    ]);
+  });
+
+  it("produces an undo that plans back to exactly the previous row", () => {
+    const before = row({ id: 1, genre: "Techno", comment: "old", label: null, year: 20240905, rating: 196 });
+    const edit = plan([{ id: 1, genre: "House", comment: "", year: 2024, rating_stars: 5 }], before);
+    const after: CurrentRow = { ...before, ...edit.writes[0]!.set } as CurrentRow;
+    expect(validateUpdates(edit.undo)).toBeUndefined();
+    const back = plan(edit.undo, after);
+    const restored: CurrentRow = { ...after, ...back.writes[0]!.set } as CurrentRow;
+    for (const f of ["genre", "comment", "label", "year", "rating"] as const) {
+      expect(sameStored(f, restored[f], before[f]), f).toBe(true);
+    }
+  });
+
+  it("refuses unknown ids, listing all of them", () => {
+    const e = refusal([{ id: 1, genre: "a" }, { id: 8, genre: "a" }, { id: 9, genre: "a" }], row({ id: 1 }));
+    expect(e.error).toBe("unknown_track");
+    expect(e.message).toMatch(/8/);
+    expect(e.message).toMatch(/9/);
+  });
+
+  it("refuses to write a track with an empty origin, but not to find it already in place", () => {
+    const e = refusal([{ id: 1, genre: "House" }], row({ id: 1, originEmpty: true }));
+    expect(e.error).toBe("track_not_editable");
+    expect(e.message).toMatch(/track 1/);
+    expect(plan([{ id: 1, genre: "Techno" }], row({ id: 1, originEmpty: true })).unchanged).toEqual([1]);
+  });
+
+  it("refuses a field whose stored value it could not restore, and still edits the others", () => {
+    const e = refusal([{ id: 1, rating_stars: 3 }], row({ id: 1, inexpressible: ["rating"] }));
+    expect(e.error).toBe("track_not_editable");
+    expect(plan([{ id: 1, genre: "House" }], row({ id: 1, inexpressible: ["rating"] })).writes).toHaveLength(1);
+  });
+
+  it("never calls an inexpressible stored value already at target", () => {
+    // Read as null, a stored 999 would otherwise compare equal to 0 stars.
+    const e = refusal([{ id: 1, rating_stars: 0 }], row({ id: 1, rating: null, inexpressible: ["rating"] }));
+    expect(e.error).toBe("track_not_editable");
+  });
+
+  it("reports every expect mismatch, structured, capped at twenty", () => {
+    const rows = Array.from({ length: 25 }, (_, i) => row({ id: i + 1, genre: "Techno" }));
+    const updates = rows.map((r) => ({ id: r.id, genre: "House", expect: { genre: "Minimal" } }));
+    const e = refusal(updates, ...rows);
+    expect(e.error).toBe("stale_value");
+    expect(e.mismatches).toHaveLength(20);
+    expect(e.mismatches[0]).toEqual({ id: 1, field: "genre", expected: "Minimal", actual: "Techno" });
+    expect(e.message).toMatch(/^25 expected values no longer match/);
+  });
+
+  it("spells out code points when two values differ only in Unicode form", () => {
+    const e = refusal(
+      [{ id: 1, genre: "Electronic", expect: { genre: "Électronique".normalize("NFC") } }],
+      row({ id: 1, genre: "Électronique".normalize("NFD") }),
+    );
+    expect(e.message).toMatch(/U\+0301/);
+  });
+
+  it("compares expect.rating_raw exactly, not rounded to stars", () => {
+    const e = refusal([{ id: 1, rating_stars: 4, expect: { rating_raw: 60 } }], row({ id: 1, rating: 55 }));
+    expect(e.error).toBe("stale_value");
+  });
+
+  it("reports unknown tracks before anything else", () => {
+    const e = refusal(
+      [{ id: 1, genre: "a", expect: { genre: "wrong" } }, { id: 2, genre: "a" }],
+      row({ id: 1 }),
+    );
+    expect(e.error).toBe("unknown_track");
   });
 });
