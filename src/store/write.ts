@@ -361,7 +361,8 @@ function gateChain(db: DatabaseSync, listId: number): ChainCheck {
  * db.close() in the finally block ends any transaction still open, and SQLite
  * discards an uncommitted one on close.
  */
-function rollback(db: DatabaseSync): void {
+/** Exported for src/store/track-metadata.ts. */
+export function rollback(db: DatabaseSync): void {
   try {
     db.exec("ROLLBACK");
   } catch {
@@ -394,7 +395,8 @@ export function sameOrder(a: OriginRef[], b: OriginRef[]): boolean {
  * `Writing "X" failed`, which reads as a half-write even when the failure was
  * "file is not a database" and not one byte was attempted.
  */
-function mapWriteError(e: unknown, subject: string, mdbPath: string): EngineError {
+/** Exported for src/store/track-metadata.ts. */
+export function mapWriteError(e: unknown, subject: string, mdbPath: string): EngineError {
   const msg = (e as Error).message ?? String(e);
   const isUniqueViolation = /UNIQUE constraint failed/i.test(msg);
   // The constraint's *name* never appears in the message SQLite raises --
@@ -539,7 +541,8 @@ function classifyWriteFailure(
  * that check for callers, so reusing it here means a body never has to wrap
  * its result to disambiguate the two.
  */
-async function withWriteTransaction<T extends object>(
+/** Exported for src/store/track-metadata.ts. */
+export async function withWriteTransaction<T extends object>(
   mdbPath: string,
   uuid: string,
   subject: string,
