@@ -1,6 +1,6 @@
 // tests/write-tool.test.ts
 import { describe, it, expect, afterEach } from "vitest";
-import { mkdtempSync, rmSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -183,6 +183,9 @@ describe("playlist edit tools", () => {
     expect(hint("add_tracks_to_playlist")).toBe(false);
     expect(hint("remove_tracks_from_playlist")).toBe(true);
     expect(hint("reorder_playlist")).toBe(true);
+    expect(hint("update_track_metadata")).toBe(true);
+    // Spec §7.4: a repeat of the same call changes nothing (§5.2).
+    expect(tools.find((t) => t.name === "update_track_metadata")!.annotations?.idempotentHint).toBe(true);
     await client.close();
     rmSync(dir, { recursive: true, force: true });
   });
@@ -295,6 +298,90 @@ describe("playlist edit tools", () => {
     // "Old" (id 1), not named by this call, must be untouched.
     expect(trackOrder(dbPath, 1)).toEqual([1]);
 
+    await client.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("update_track_metadata over MCP", () => {
+  const call = async (client: any, args: Record<string, unknown>) =>
+    client.callTool({ name: "update_track_metadata", arguments: args });
+
+  it("is not offered without --allow-writes", async () => {
+    const { dir } = lib();
+    const { client } = await connectedClient([dir], join(dir, "sc"));
+    const names = (await client.listTools()).tools.map((t) => t.name);
+    expect(names).not.toContain("update_track_metadata");
+    await client.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("edits, and its undo replays verbatim into the same library", async () => {
+    const { dir, dbPath } = lib();
+    const { client } = await connectedClient([dir], join(dir, "sc"), { allowWrites: true, backupBaseDir: join(dir, "b") });
+    const genre = () => {
+      const db = new DatabaseSync(`file:${dbPath}?mode=ro`, { readOnly: true });
+      const g = (db.prepare("SELECT genre FROM Track WHERE id = 1").get() as any).genre;
+      db.close();
+      return g;
+    };
+    const before = genre();
+    const r = (await call(client, { updates: [{ id: 1, genre: "Zzz Test Genre" }] })).structuredContent as any;
+    expect(r.error).toBeUndefined();
+    expect(genre()).toBe("Zzz Test Genre");
+    const step = r.undo[0];
+    expect(step.arguments.library).toBe(dbPath);
+    const back = (await client.callTool({ name: step.tool, arguments: step.arguments })).structuredContent as any;
+    expect(back.error).toBeUndefined();
+    expect(genre()).toBe(before);
+    await client.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("leaves schema violations to zod, which answers without a structured error", async () => {
+    // Spec §7.1: types and the 200 cap live in the schema, as for every write tool.
+    const { dir } = lib();
+    const { client } = await connectedClient([dir], join(dir, "sc"), { allowWrites: true, backupBaseDir: join(dir, "b") });
+    const tooMany = Array.from({ length: 201 }, (_, i) => ({ id: i + 1, genre: "x" }));
+    for (const args of [{ updates: tooMany }, { updates: [{ id: 1, rating: 4 }] }]) {
+      const r = await call(client, args);
+      expect(r.isError).toBe(true);
+      expect(r.structuredContent).toBeUndefined();
+    }
+    await client.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("returns store refusals as structured errors with not_committed", async () => {
+    const { dir } = lib();
+    const { client } = await connectedClient([dir], join(dir, "sc"), { allowWrites: true, backupBaseDir: join(dir, "b") });
+    const r = (await call(client, { updates: [{ id: 1, rating_raw: 4 }] })).structuredContent as any;
+    expect(r.error).toBe("invalid_argument");
+    expect(r.detail).toBe("not_committed");
+    await client.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("does not build the search index, which it does not use", async () => {
+    // Spec §6.2: addressing by id needs no index, and building one before a
+    // write makes it stale the moment the write commits.
+    const { dir } = lib();
+    const sc = join(dir, "sc");
+    const { client } = await connectedClient([dir], sc, { allowWrites: true, backupBaseDir: join(dir, "b") });
+    const r = (await call(client, { updates: [{ id: 1, genre: "Zzz" }] })).structuredContent as any;
+    expect(r.error).toBeUndefined();
+    expect(existsSync(join(sc, "tool-uuid"))).toBe(false);
+    await client.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("refuses an unsupported library it would otherwise have written", async () => {
+    // Without ensureFresh nothing else checks the schema on this path.
+    const dir = mkdtempSync(join(tmpdir(), "wt-"));
+    makeLibrary(dir, { tracks: 4, schema: [2, 18, 0] });
+    const { client } = await connectedClient([dir], join(dir, "sc"), { allowWrites: true, backupBaseDir: join(dir, "b") });
+    const r = (await call(client, { updates: [{ id: 1, genre: "x" }] })).structuredContent as any;
+    expect(r.error).toBe("unsupported_schema");
     await client.close();
     rmSync(dir, { recursive: true, force: true });
   });
