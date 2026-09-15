@@ -847,9 +847,13 @@ export async function createServer(
           'fields to change; "" clears a text field; rating_stars is 0-5 (Engine stores 0-100). Up to ' +
           "200 tracks per call, all or nothing. A track already holding the requested values is left " +
           "alone and counted in `unchanged`; `changed` lists which fields changed on which tracks. " +
-          "Refusals name every offending track: unknown_track, track_not_editable (the track cannot be " +
-          "edited without harm -- say so to the user and leave it; do not search for it again), " +
-          "stale_value (an expect no longer matched; re-read and retry), invalid_argument. " +
+          "Each refusal names every offending track of its kind -- unknown_track, track_not_editable (the " +
+          "track cannot be edited without harm -- say so to the user and leave it; do not search for it " +
+          "again), stale_value, invalid_argument -- and kinds are reported one at a time, in that order: " +
+          "fix the one reported first and retry to see the next, if any. stale_value means the track " +
+          "changed after the values in `expect` were read; tell the user which tracks and fields changed. " +
+          "Do NOT rebuild `expect` from a fresh read to force the write -- that would silently overwrite " +
+          "an edit the DJ made since, without their consent. " +
           "Search results may keep showing the old values while Engine DJ holds the library open; " +
           "refresh_index cannot help until Engine lets go. " +
           TRACK_UNDO_NOTE +

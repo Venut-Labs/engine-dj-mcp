@@ -1,7 +1,8 @@
 // src/store/write.ts
 //
-// The only code in this project that writes to a user's Engine library, and
-// it runs only when the server was started with --allow-writes.
+// Writes to a user's Engine library, together with src/store/track-metadata.ts
+// (which reuses withWriteTransaction, mapWriteError and rollback from here).
+// Both run only when the server was started with --allow-writes.
 //
 // The read path is deliberately not reused. Queries run in a forked child
 // whose connection is opened readOnly: true, and that guarantee is the

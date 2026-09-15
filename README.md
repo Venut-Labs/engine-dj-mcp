@@ -210,7 +210,7 @@ server checks staleness itself before answering.
 
 ### `create_playlist`
 
-The first of the four tools that write, none of which is registered at all
+The first of the five tools that write, none of which is registered at all
 unless the server was started with `--allow-writes`.
 
 Creates one new top-level playlist from track ids — `track_ids` sets both
@@ -352,8 +352,9 @@ not see these edits either way.
 A track that already holds the requested values is not written, so repeating
 a call changes nothing; it is counted in `unchanged`. The result carries
 `updated`, `unchanged`, `changed` — which fields changed on which tracks —
-`undo`, `undo_complete` (always `true`), `library`, and `backup_path` when
-anything was written.
+`undo`, `undo_complete` (always `true`), `library`, and `backup_path` whenever
+the write transaction ran — which can include `updated: 0`, if the tracks had
+already changed to the requested values by the time the write lock was taken.
 
 **Undo.** `undo` is one `update_track_metadata` call that restores the
 previous values of exactly the fields that changed, and names the library.
@@ -370,9 +371,13 @@ over several calls, replay the undos in reverse order.
 Its own refusals: `unknown_track`; `track_not_editable` — a track whose origin
 is empty (Engine's trigger rewrites an empty origin on any update, which would
 detach it from playlist entries on other drives), or a field holding a value
-this tool could not put back, such as a rating outside 0–255; `stale_value`,
-which lists up to 20 mismatches in a structured `mismatches` field; the prose
-message carries the total count; and `invalid_argument`. Plus the ones
+this tool could not put back, such as a rating outside 0–255; `stale_value` —
+the track changed after the values in `expect` were read (up to 20 mismatches
+come back in a structured `mismatches` field, with the total count in the
+prose message); and `invalid_argument`. On `stale_value`, tell the user which
+tracks and fields changed — do not rebuild `expect` from a fresh read to force
+the write without the user's consent, or it silently overwrites the edit the
+DJ made since. Plus the ones
 [every write tool shares](#refusals-every-write-tool-shares), except
 `index_stale` and the query errors: this tool addresses tracks by id and never
 touches the search index.
@@ -385,6 +390,12 @@ database.
 
 **Smart playlists.** A smart playlist whose rules match on genre changes what
 it contains when a genre is renamed, though none of its own rows were touched.
+
+**Two connected libraries.** Do not assume a tag edit propagates the way a
+playlist edit does (see [An undo covers one library](#an-undo-covers-one-library)):
+measured once, a fresh Engine DJ launch did not copy a tag edit between
+connected libraries in either direction. Whether Engine's explicit sync
+carries these edits has not been measured.
 
 ### Refusals every write tool shares
 
@@ -490,9 +501,10 @@ changes genre, comment, label, year and rating on the tracks named — see its
 section above — and nothing else: no playlist, cue, beatgrid, title, artist,
 album, path or file is touched.
 
-Every edit returns `undo` — the exact tool call that reverses it, expressed
-against the positions the edit itself produced — and `undo_complete`, saying
-whether replaying it puts the playlist back exactly as it was. Replaying
+Every edit returns `undo` — the exact tool call that reverses it — and
+`undo_complete`; for the playlist tools, `undo` is expressed against the
+positions the edit itself produced, and `undo_complete` says whether
+replaying it puts the playlist back exactly as it was. Replaying
 `undo` is the right way back from an edit; restoring `backup_path` is not,
 because it reverts the **whole library** to before this session's first
 write, discarding every play count, import, cue and beatgrid change Engine
@@ -594,9 +606,9 @@ cleared the next time that library is snapshotted.
 **To undo a playlist you created, delete it in Engine DJ.** Engine's own
 delete trigger repairs the playlist chain and cascades the entries away,
 which is exactly what removing it should do and is not something restoring
-a snapshot does better. **To undo an edit to an existing playlist, replay
-the `undo` the edit returned instead** — it names the precise
-`add_tracks_to_playlist`, `remove_tracks_from_playlist` or
+a snapshot does better. **For the playlist tools, to undo an edit to an
+existing playlist, replay the `undo` the edit returned instead** — it names
+the precise `add_tracks_to_playlist`, `remove_tracks_from_playlist` or
 `reorder_playlist` call that puts the playlist back exactly as it was,
 without touching anything else Engine DJ has recorded since.
 
