@@ -371,8 +371,8 @@ Its own refusals: `unknown_track`; `track_not_editable` — a track whose origin
 is empty (Engine's trigger rewrites an empty origin on any update, which would
 detach it from playlist entries on other drives), or a field holding a value
 this tool could not put back, such as a rating outside 0–255; `stale_value`,
-listing every `expect` that no longer matched in a structured `mismatches`
-field; and `invalid_argument`. Plus the ones
+which lists up to 20 mismatches in a structured `mismatches` field; the prose
+message carries the total count; and `invalid_argument`. Plus the ones
 [every write tool shares](#refusals-every-write-tool-shares), except
 `index_stale` and the query errors: this tool addresses tracks by id and never
 touches the search index.
@@ -480,12 +480,15 @@ With the flag, five tools appear. `create_playlist` adds a new playlist and
 nothing else. `add_tracks_to_playlist`, `remove_tracks_from_playlist` and
 `reorder_playlist` go further: with the flag, an **existing** playlist can
 now be changed, not only created — its tracks added to, removed from, or put
-in a different order. `update_track_metadata` changes tags on tracks themselves — see its section above. What each one touches is the named playlist's own
-entries, plus exactly two rows elsewhere: that playlist's own row, whose
-`lastEditTime` every edit stamps so Engine sees the change, and — for
-`create_playlist` only — the previous last playlist's link, made by Engine's
-own insert trigger. No other playlist is renamed, emptied or deleted, and no
-track, cue or beatgrid is touched by any of the five.
+in a different order. What these four playlist tools touch is the named
+playlist's own entries, plus exactly two rows elsewhere: that playlist's own
+row, whose `lastEditTime` every edit stamps so Engine sees the change, and —
+for `create_playlist` only — the previous last playlist's link, made by
+Engine's own insert trigger. No other playlist is renamed, emptied or deleted,
+and no track, cue or beatgrid is touched by these four. `update_track_metadata`
+changes genre, comment, label, year and rating on the tracks named — see its
+section above — and nothing else: no playlist, cue, beatgrid, title, artist,
+album, path or file is touched.
 
 Every edit returns `undo` — the exact tool call that reverses it, expressed
 against the positions the edit itself produced — and `undo_complete`, saying

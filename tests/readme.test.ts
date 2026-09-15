@@ -38,5 +38,6 @@ describe("README", () => {
     expect(readme).toMatch(/not to the audio files' tags/);
     expect(readme).toMatch(/not `lastEditTime`/);
     expect(readme).toMatch(/five tools appear/);
+    expect(readme).toMatch(/no track, cue or beatgrid is touched by these four/);
   });
 });
