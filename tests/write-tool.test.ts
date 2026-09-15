@@ -343,7 +343,14 @@ describe("update_track_metadata over MCP", () => {
     const { dir } = lib();
     const { client } = await connectedClient([dir], join(dir, "sc"), { allowWrites: true, backupBaseDir: join(dir, "b") });
     const tooMany = Array.from({ length: 201 }, (_, i) => ({ id: i + 1, genre: "x" }));
-    for (const args of [{ updates: tooMany }, { updates: [{ id: 1, rating: 4 }] }]) {
+    for (const args of [
+      { updates: tooMany },
+      { updates: [{ id: 1, rating: 4 }] },
+      // `Expect` must be .strict(): without it, zod silently strips an
+      // unrecognised key such as `rating` (the store field is `rating_raw`)
+      // instead of rejecting the call.
+      { updates: [{ id: 1, genre: "x", expect: { rating: 0 } }] },
+    ]) {
       const r = await call(client, args);
       expect(r.isError).toBe(true);
       expect(r.structuredContent).toBeUndefined();
@@ -373,6 +380,42 @@ describe("update_track_metadata over MCP", () => {
     expect(existsSync(join(sc, "tool-uuid"))).toBe(false);
     await client.close();
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("refuses ambiguously with two supported libraries connected, and writes to neither", async () => {
+    // Guards against the write handler resolving the library with
+    // selectLibrary (which defaults an omitted `library` to the biggest
+    // library) instead of selectForWrite (which refuses). Two different
+    // track counts, so a wrong-disk pick would be a defect this test catches.
+    const rootA = mkdtempSync(join(tmpdir(), "wt-amb-a-"));
+    const rootB = mkdtempSync(join(tmpdir(), "wt-amb-b-"));
+    const dbA = makeLibrary(rootA, { tracks: 8, uuid: "amb-uuid-a" });
+    const dbB = makeLibrary(rootB, { tracks: 9, uuid: "amb-uuid-b" });
+    const backupBaseDir = join(rootA, "backups");
+    const { client } = await connectedClient([rootA, rootB], join(rootA, "sc"), {
+      allowWrites: true,
+      backupBaseDir,
+    });
+
+    const genreOf = (p: string) => {
+      const db = new DatabaseSync(p, { readOnly: true });
+      const g = (db.prepare("SELECT genre FROM Track WHERE id = 1").get() as any).genre;
+      db.close();
+      return g;
+    };
+    const beforeA = genreOf(dbA);
+    const beforeB = genreOf(dbB);
+
+    const r = (await call(client, { updates: [{ id: 1, genre: "Ambiguous" }] })).structuredContent as any;
+    expect(r.error).toBe("ambiguous_library");
+    expect(r.detail).toBe("not_committed");
+    expect(genreOf(dbA)).toBe(beforeA);
+    expect(genreOf(dbB)).toBe(beforeB);
+    expect(existsSync(backupBaseDir)).toBe(false);
+
+    await client.close();
+    rmSync(rootA, { recursive: true, force: true });
+    rmSync(rootB, { recursive: true, force: true });
   });
 
   it("refuses an unsupported library it would otherwise have written", async () => {
