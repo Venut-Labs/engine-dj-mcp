@@ -115,6 +115,16 @@ export function validateUpdates(updates: TrackUpdate[]): EngineError | undefined
     }
     for (const f of TEXT_FIELDS) {
       const v = u[f];
+      // A lone surrogate passes every other check here, reaches SQLite, and
+      // comes back mangled -- caught downstream as library_unreadable
+      // "did not read back as written" instead of the invalid_argument this
+      // is. Checked on both the new value and its expect counterpart, and
+      // regardless of whether this is a restore: MAX_TEXT is waived for a
+      // restore (spec §5.3), but a value that is not valid Unicode text at
+      // all is never something this tool could have written or read back.
+      if (v !== undefined && !v.isWellFormed()) problems.push(`${at}: ${f} is not valid Unicode text`);
+      const ev = expect[f];
+      if (ev !== undefined && !ev.isWellFormed()) problems.push(`${at}: ${f} is not valid Unicode text`);
       if (v !== undefined && expect[f] === undefined && v.length > MAX_TEXT) {
         problems.push(`${at}: ${f} is longer than ${MAX_TEXT} characters`);
       }
@@ -242,6 +252,11 @@ export function planUpdates(updates: TrackUpdate[], rows: ReadonlyMap<number, Cu
       const expected = expect[key];
       if (expected === undefined) continue;
       const field: FieldName = key === "rating_raw" ? "rating" : key;
+      // Spec §5.2 (field-level): expect guards writes, so an expect on a
+      // field this row will not write is skipped. Otherwise undoing a
+      // "genre + comment" edit would refuse the whole row because genre was
+      // already put back by hand, though comment still needs restoring.
+      if (!differs.includes(field)) continue;
       const want: StoredValue = field === "year" || field === "rating" ? (expected as number) : (expected as string) || null;
       if (!sameStored(field, current[field], want)) {
         mismatches.push({ id: u.id, field: key, expected, actual: current[field] });
@@ -287,9 +302,11 @@ export function planUpdates(updates: TrackUpdate[], rows: ReadonlyMap<number, Cu
   if (mismatches.length > 0) {
     return err(
       "stale_value",
-      `${mismatches.length} expected value${mismatches.length > 1 ? "s" : ""} no longer match, nothing was written; ` +
-        `re-read those tracks and retry: ${listProblems(mismatches.map(describeMismatch))}`,
-      { detail: NOT_COMMITTED, mismatches: mismatches.slice(0, 20) },
+      `${mismatches.length} expected value${mismatches.length > 1 ? "s" : ""} no longer match, nothing was written. ` +
+        `The track changed after the values in expect were read -- tell the user which tracks and fields changed. ` +
+        `Do NOT rebuild expect from a fresh read to force the write without the user's consent: ` +
+        `${listProblems(mismatches.map(describeMismatch))}`,
+      { detail: NOT_COMMITTED, mismatches: mismatches.slice(0, LIST_LIMIT) },
     );
   }
   return plan;

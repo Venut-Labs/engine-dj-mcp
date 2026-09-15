@@ -119,6 +119,21 @@ describe("updateTrackMetadata", () => {
     expect(read(dbPath, 4)).toMatchObject({ year: 20240905, comment: "x".repeat(1500), rating: 196 });
   });
 
+  it("replays an undo whose one field was already put back by hand, and still restores the rest", async () => {
+    // Spec §5.2 (field-level, Ruling R7): expect guards writes, so a stale
+    // expect on a field this row will not write must not refuse the fields
+    // that still need restoring.
+    const { dbPath, backupDir } = setup();
+    const r = ok(
+      await updateTrackMetadata(dbPath, UUID, { updates: [{ id: 1, genre: "House", comment: "new" }] }, { backupDir }),
+    );
+    const w = new DatabaseSync(dbPath);
+    w.prepare("UPDATE Track SET genre = 'Techno' WHERE id = 1").run();
+    w.close();
+    ok(await updateTrackMetadata(dbPath, UUID, { updates: r.undo[0].arguments.updates }, { backupDir }));
+    expect(read(dbPath, 1)).toMatchObject({ genre: "Techno", comment: "https://t.me/LosslessRobot" });
+  });
+
   it("refuses to edit a field holding a value it could not put back, and edits the rest", async () => {
     const { dbPath, backupDir } = setup();
     const w = new DatabaseSync(dbPath);

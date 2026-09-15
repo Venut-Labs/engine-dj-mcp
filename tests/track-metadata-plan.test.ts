@@ -93,6 +93,22 @@ describe("validateUpdates", () => {
     expect(m).toMatch(/track 3:/);
     expect(m).toMatch(/^3 problems/);
   });
+
+  it("does not let an expect on a different field lift the year range check", () => {
+    // The range check for `year` looks only at `expect.year`; an expect on
+    // some other field must not be read as covering it too.
+    expect(refused([{ id: 1, year: 20240, genre: "x", expect: { genre: "y" } }]))
+      .toMatch(/year must be 0 \(unknown\) or 1000-2200/);
+  });
+
+  it("refuses a lone surrogate as invalid Unicode text, in a value or in expect", () => {
+    // Passes every other check here and reaches SQLite, which mangles it --
+    // caught downstream as library_unreadable "did not read back as
+    // written" instead of the invalid_argument this is.
+    expect(refused([{ id: 1, genre: "a\uD800b" }])).toMatch(/track 1: genre is not valid Unicode text/);
+    expect(refused([{ id: 1, genre: "a", expect: { genre: "a\uD800b" } }]))
+      .toMatch(/track 1: genre is not valid Unicode text/);
+  });
 });
 
 describe("listProblems", () => {
@@ -235,6 +251,17 @@ describe("planUpdates", () => {
   it("compares expect.rating_raw exactly, not rounded to stars", () => {
     const e = refusal([{ id: 1, rating_stars: 4, expect: { rating_raw: 60 } }], row({ id: 1, rating: 55 }));
     expect(e.error).toBe("stale_value");
+  });
+
+  it("skips a stale expect on a field this update will not write, letting the other field's write through", () => {
+    // Spec §5.2 (field-level, Ruling R7): expect guards writes. genre is
+    // already at its target ("Techno") and so stays unwritten -- its stale
+    // expect ("House") must not refuse the comment write.
+    const p = plan(
+      [{ id: 1, genre: "Techno", comment: "restored", expect: { genre: "House", comment: "new" } }],
+      row({ id: 1, genre: "Techno", comment: "new" }),
+    );
+    expect(p.writes).toEqual([{ id: 1, set: { comment: "restored" }, fields: ["comment"] }]);
   });
 
   it("reports unknown tracks before anything else", () => {
