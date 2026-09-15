@@ -337,6 +337,55 @@ Reordering to the order a playlist is already in is accepted and rewrites no
 entry: it still stamps the playlist's `lastEditTime`, and still costs this
 session's snapshot if nothing had been written yet.
 
+### `update_track_metadata`
+
+Changes genre, comment, label, year or rating on tracks — the values Engine
+DJ shows in its columns. It writes to Engine's database, **not to the audio files' tags**. Engine itself writes a comment into the file when you edit it
+there, but not a genre or a rating, so other software reading the tags will
+not see these edits either way.
+
+| Argument | |
+| --- | --- |
+| `updates` | Up to 200 entries, each `{ id, genre?, comment?, label?, year?, rating_stars? }`. Only the named fields change. `""` clears a text field; `year: 0` means unknown, as Engine stores it; `rating_stars` is 0–5. |
+| `library` | Required when more than one library is connected — see [Choosing a library](#choosing-a-library). |
+
+A track that already holds the requested values is not written, so repeating
+a call changes nothing; it is counted in `unchanged`. The result carries
+`updated`, `unchanged`, `changed` — which fields changed on which tracks —
+`undo`, `undo_complete` (always `true`), `library`, and `backup_path` when
+anything was written.
+
+**Undo.** `undo` is one `update_track_metadata` call that restores the
+previous values of exactly the fields that changed, and names the library.
+It restores values, not `lastEditTime`: Engine's own trigger stamps every
+edit, the undo included. Each entry carries `expect` set to what this call
+wrote, so an undo replayed after someone edited the track again is refused as
+`stale_value` instead of overwriting that edit. `rating_raw` and `expect`
+exist for this; an ordinary edit needs neither.
+
+Keep the undo from the first response. Repeating a call that already went
+through finds nothing to change and returns an empty undo. For work spread
+over several calls, replay the undos in reverse order.
+
+Its own refusals: `unknown_track`; `track_not_editable` — a track whose origin
+is empty (Engine's trigger rewrites an empty origin on any update, which would
+detach it from playlist entries on other drives), or a field holding a value
+this tool could not put back, such as a rating outside 0–255; `stale_value`,
+listing every `expect` that no longer matched in a structured `mismatches`
+field; and `invalid_argument`. Plus the ones
+[every write tool shares](#refusals-every-write-tool-shares), except
+`index_stale` and the query errors: this tool addresses tracks by id and never
+touches the search index.
+
+**Searching right after an edit.** Genre, comment and label are in the search
+index, which is rebuilt on the next read. While Engine DJ holds the library
+open it cannot be rebuilt, so a search can keep showing the old values, and
+`refresh_index` cannot help until Engine lets go. The edit itself is in the
+database.
+
+**Smart playlists.** A smart playlist whose rules match on genre changes what
+it contains when a genre is renamed, though none of its own rows were touched.
+
 ### Refusals every write tool shares
 
 These come from what happens before the write itself — choosing the library,
@@ -427,16 +476,16 @@ created inside your `Engine Library` folder. The search index lives in
 Without `--allow-writes` the server has no tool that can write, and the
 paragraph above holds exactly as written: SQLite itself refuses.
 
-With the flag, four tools appear. `create_playlist` adds a new playlist and
+With the flag, five tools appear. `create_playlist` adds a new playlist and
 nothing else. `add_tracks_to_playlist`, `remove_tracks_from_playlist` and
 `reorder_playlist` go further: with the flag, an **existing** playlist can
 now be changed, not only created — its tracks added to, removed from, or put
-in a different order. What each one touches is the named playlist's own
+in a different order. `update_track_metadata` changes tags on tracks themselves — see its section above. What each one touches is the named playlist's own
 entries, plus exactly two rows elsewhere: that playlist's own row, whose
 `lastEditTime` every edit stamps so Engine sees the change, and — for
 `create_playlist` only — the previous last playlist's link, made by Engine's
 own insert trigger. No other playlist is renamed, emptied or deleted, and no
-track, cue or beatgrid is touched by any of the four.
+track, cue or beatgrid is touched by any of the five.
 
 Every edit returns `undo` — the exact tool call that reverses it, expressed
 against the positions the edit itself produced — and `undo_complete`, saying

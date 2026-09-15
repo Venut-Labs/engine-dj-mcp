@@ -961,6 +961,13 @@ other.
   unchanged. To compare names regardless of case in any script, use
   \`fold(text)\` -- one Unicode normalization form, lower-cased by Unicode
   rules. It runs per row, like every function here.
+- \`Track\` carries two Engine triggers. \`trigger_after_update_only_Track_timestamp\`
+  sets \`lastEditTime\` (epoch seconds) whenever genre, comment, label, year,
+  rating or a dozen other columns are updated -- even to the same value.
+  \`trigger_after_update_Track_fix_origin\` fires on ANY update and rewrites an
+  empty \`(originDatabaseUuid, originTrackId)\` to this library's uuid and the
+  track's own id; in SQLite \`'' = 0\` is false, so a TEXT '' originTrackId does
+  not count as empty.
 - A track's natural key across drives is \`(originDatabaseUuid, originTrackId)\`.
 - \`PerformanceData\`'s blob columns are binary and cannot be read with SQL.
   Engine writes \`quickCues\`, \`loops\`, \`beatData\` and

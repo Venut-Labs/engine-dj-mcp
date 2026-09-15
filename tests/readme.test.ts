@@ -30,4 +30,13 @@ describe("README", () => {
     expect(readme).not.toMatch(/write normally succeeds with Engine running/);
     expect(readme).toMatch(/Quit Engine DJ before writing/);
   });
+
+  it("documents update_track_metadata, its own refusals, and what its undo does not restore", () => {
+    expect(readme).toMatch(/### `update_track_metadata`/);
+    expect(readme).toContain("`track_not_editable`");
+    expect(readme).toContain("`stale_value`");
+    expect(readme).toMatch(/not to the audio files' tags/);
+    expect(readme).toMatch(/not `lastEditTime`/);
+    expect(readme).toMatch(/five tools appear/);
+  });
 });
