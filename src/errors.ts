@@ -78,7 +78,10 @@ export interface EngineError {
   /**
    * Set only on stale_value: every `expect` that no longer matched, capped at
    * 20 entries (the message carries the total). Structured so a caller can
-   * re-read exactly those tracks instead of parsing prose.
+   * tell the user precisely which tracks and fields changed instead of
+   * parsing prose -- not so it can re-read and retry: the track changed
+   * after `expect` was read, and overwriting that silently, without the
+   * user's consent, is exactly what stale_value refuses.
    */
   mismatches?: { id: number; field: string; expected: string | number | null; actual: string | number | null }[];
 }

@@ -107,7 +107,16 @@ describe("validateUpdates", () => {
     // written" instead of the invalid_argument this is.
     expect(refused([{ id: 1, genre: "a\uD800b" }])).toMatch(/track 1: genre is not valid Unicode text/);
     expect(refused([{ id: 1, genre: "a", expect: { genre: "a\uD800b" } }]))
-      .toMatch(/track 1: genre is not valid Unicode text/);
+      .toMatch(/track 1: expect\.genre is not valid Unicode text/);
+  });
+
+  it("distinguishes a malformed value from a malformed expect on the same field, so neither line hides the other", () => {
+    // P2: without the "expect." prefix, a malformed value and a malformed
+    // expect for the same field pushed the identical string twice, and a
+    // caller (or a test) could not tell the two problems apart.
+    const m = refused([{ id: 1, genre: "a\uD800b", expect: { genre: "c\uD800d" } }]);
+    expect(m).toMatch(/track 1: genre is not valid Unicode text/);
+    expect(m).toMatch(/track 1: expect\.genre is not valid Unicode text/);
   });
 });
 
@@ -262,6 +271,21 @@ describe("planUpdates", () => {
       row({ id: 1, genre: "Techno", comment: "new" }),
     );
     expect(p.writes).toEqual([{ id: 1, set: { comment: "restored" }, fields: ["comment"] }]);
+  });
+
+  it("still enforces expect on a field the update DOES write, even though another field in the same call is already at target", () => {
+    // R10: the per-field expect guard (spec §5.2, Ruling R7) must be checked
+    // field by field -- genre is unwritten here (already "Techno") and its
+    // stale expect is rightly skipped, but comment IS written and its stale
+    // expect must still refuse. A too-broad guard that skips the whole row
+    // whenever any written field already matches its target would let this
+    // stale comment overwrite "DJ-edit" unnoticed.
+    const e = refusal(
+      [{ id: 1, genre: "Techno", comment: "restored", expect: { genre: "House", comment: "new" } }],
+      row({ id: 1, genre: "Techno", comment: "DJ-edit" }),
+    );
+    expect(e.error).toBe("stale_value");
+    expect(e.mismatches).toEqual([{ id: 1, field: "comment", expected: "new", actual: "DJ-edit" }]);
   });
 
   it("reports unknown tracks before anything else", () => {

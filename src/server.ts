@@ -128,9 +128,10 @@ const WRITE_LIBRARY_NOTE =
 
 /**
  * Not UNDO_SCOPE_NOTE: that one says Engine copies *playlist* changes between
- * libraries, which was measured. For track tags a fresh Engine launch was
- * measured copying nothing in either direction (spec §3.9), so repeating the
- * playlist claim here would state a guess as fact.
+ * libraries, which was measured. For track tags, a fresh Engine launch was
+ * measured NOT copying a tag edit made on the USB library to the computer's
+ * library (spec §3.9); the other direction has not been measured for tags,
+ * so repeating the playlist claim here would state a guess as fact.
  */
 const TRACK_UNDO_NOTE =
   "`undo` reverses this edit in ONE library: the one the result's `library` field names, and each " +
@@ -847,10 +848,11 @@ export async function createServer(
           'fields to change; "" clears a text field; rating_stars is 0-5 (Engine stores 0-100). Up to ' +
           "200 tracks per call, all or nothing. A track already holding the requested values is left " +
           "alone and counted in `unchanged`; `changed` lists which fields changed on which tracks. " +
-          "Each refusal names every offending track of its kind -- unknown_track, track_not_editable (the " +
-          "track cannot be edited without harm -- say so to the user and leave it; do not search for it " +
-          "again), stale_value, invalid_argument -- and kinds are reported one at a time, in that order: " +
-          "fix the one reported first and retry to see the next, if any. stale_value means the track " +
+          "Each refusal names every offending track of its kind -- invalid_argument, unknown_track, " +
+          "track_not_editable (the track cannot be edited without harm -- say so to the user and leave it; " +
+          "do not search for it again), stale_value -- and kinds are reported one at a time, in that order: " +
+          "fix the one reported first and retry to see the next, if any -- except stale_value, which is not " +
+          "something to just retry: see below. stale_value means the track " +
           "changed after the values in `expect` were read; tell the user which tracks and fields changed. " +
           "Do NOT rebuild `expect` from a fresh read to force the write -- that would silently overwrite " +
           "an edit the DJ made since, without their consent. " +

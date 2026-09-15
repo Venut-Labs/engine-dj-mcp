@@ -124,7 +124,7 @@ export function validateUpdates(updates: TrackUpdate[]): EngineError | undefined
       // all is never something this tool could have written or read back.
       if (v !== undefined && !v.isWellFormed()) problems.push(`${at}: ${f} is not valid Unicode text`);
       const ev = expect[f];
-      if (ev !== undefined && !ev.isWellFormed()) problems.push(`${at}: ${f} is not valid Unicode text`);
+      if (ev !== undefined && !ev.isWellFormed()) problems.push(`${at}: expect.${f} is not valid Unicode text`);
       if (v !== undefined && expect[f] === undefined && v.length > MAX_TEXT) {
         problems.push(`${at}: ${f} is longer than ${MAX_TEXT} characters`);
       }

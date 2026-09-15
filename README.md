@@ -393,9 +393,10 @@ it contains when a genre is renamed, though none of its own rows were touched.
 
 **Two connected libraries.** Do not assume a tag edit propagates the way a
 playlist edit does (see [An undo covers one library](#an-undo-covers-one-library)):
-measured once, a fresh Engine DJ launch did not copy a tag edit between
-connected libraries in either direction. Whether Engine's explicit sync
-carries these edits has not been measured.
+measured once, a tag edit made on the USB library was not copied to the
+computer's library on a fresh Engine DJ launch. The other direction has not
+been measured for tags, and whether Engine's explicit sync carries these
+edits has not been measured either.
 
 ### Refusals every write tool shares
 
